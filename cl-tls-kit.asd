@@ -13,7 +13,8 @@
   :serial t
   :components ((:file "package") (:file "asn1") (:file "pem")
                (:file "hostname") (:file "x509") (:file "trust-store")
-               (:file "verify"))
+               (:file "verify") (:file "key-schedule") (:file "record")
+               (:file "handshake") (:file "client"))
   :in-order-to ((test-op (test-op "cl-tls-kit/test"))))
 
 (asdf:defsystem "cl-tls-kit/test"
@@ -21,7 +22,10 @@
   :depends-on ("cl-tls-kit")
   :pathname "t"
   :serial t
-  :components ((:file "package") (:file "tests") (:file "runner"))
+  :components ((:file "package") (:file "tests")
+               (:file "key-schedule-tests") (:file "record-tests")
+               (:file "handshake-tests") (:file "client-tests")
+               (:file "runner"))
   :perform (asdf:test-op (op c)
              (declare (ignore op c))
              (uiop:symbol-call "CL-TLS-KIT/TEST" "RUN-TESTS")))

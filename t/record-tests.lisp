@@ -1,0 +1,58 @@
+(in-package #:cl-tls-kit/test)
+
+(defun record-test-check (condition message)
+  (unless condition (error "Record test failed: ~A" message)))
+
+(defun run-record-tests ()
+  (let* ((payload #(1 2 3))
+         (plain (make-tls-plaintext 23 payload))
+         (encoded (encode-tls-plaintext plain))
+         (iv (make-array 12 :element-type '(unsigned-byte 8) :initial-element 0))
+         (nonce (tls-record-nonce iv 1))
+         (aad (tls-record-additional-data 23 9)))
+    (record-test-check (= (length encoded) 8) "TLSPlaintext header and fragment")
+    (record-test-check (equalp (tls-plaintext-fragment (decode-tls-plaintext encoded)) payload)
+                       "TLSPlaintext round trip")
+    (record-test-check (= (aref nonce 11) 1) "sequence XOR IV")
+    (record-test-check (equalp aad #(23 3 3 0 9)) "additional_data")
+    (let ((seen-aad nil))
+      (multiple-value-bind (wire next)
+          (encrypt-tls-record plain :key iv 0
+                              (lambda (key nonce input additional-data)
+                                (declare (ignore key nonce))
+                                (setf seen-aad additional-data)
+                                (concatenate '(vector (unsigned-byte 8))
+                                             input #(170 85)))
+                              :padding-length 2 :tag-length 2)
+        (record-test-check (= next 1) "sequence increments after encryption")
+        (record-test-check (equalp seen-aad #(23 3 3 0 8))
+                           "provider receives TLSCiphertext additional_data")
+        (multiple-value-bind (decoded decrypt-next)
+            (decrypt-tls-record
+             wire :key iv 0
+             (lambda (key nonce ciphertext additional-data)
+               (declare (ignore key nonce additional-data))
+               (subseq ciphertext 0 (- (length ciphertext) 2))))
+          (record-test-check (= decrypt-next 1) "sequence increments after decryption")
+          (record-test-check (equalp (tls-plaintext-fragment decoded) payload)
+                             "encrypted padding is removed")
+          (record-test-check (= (tls-plaintext-content-type decoded) 23)
+                             "inner content type is restored"))))
+    (record-test-check
+     (handler-case (progn (make-tls-plaintext 23 (make-array 16385 :element-type '(unsigned-byte 8))) nil)
+       (tls-record-overflow () t))
+     "2^14 plaintext limit")
+    (record-test-check
+     (handler-case (progn (decode-tls-plaintext #(23 3 3 0 1)) nil)
+       (tls-invalid-record () t))
+     "truncated fragment")
+    (record-test-check (tls-key-update-p
+                        (make-tls-plaintext 22 #(24 0 0 1 0)))
+                       "KeyUpdate format")
+    (record-test-check (tls-close-notify-p
+                        (make-tls-plaintext 21 #(1 0)))
+                       "close_notify format")
+    (record-test-check (not (tls-close-notify-p
+                             (make-tls-plaintext 21 #(2 0))))
+                       "reject fatal close_notify shape")
+    t))
