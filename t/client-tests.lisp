@@ -1,7 +1,7 @@
 (in-package #:cl-tls-kit/test)
 
 (defun run-client-tests ()
-  (let* ((reads 0) (writes nil) (events nil) (secrets nil)
+  (let* ((reads 0) (writes nil) (events nil) (secrets nil) (close-calls 0)
         (provider (lambda (client input)
                     (declare (ignore client))
                     (push input events)
@@ -11,7 +11,12 @@
     (let ((client (tls-kit::make-tls-client
                    :transport-read (lambda (client) (declare (ignore client)) (incf reads) #(1 2))
                    :transport-write (lambda (client bytes) (declare (ignore client)) (push bytes writes))
-                   :provider (list :handshake provider)
+                   :provider (list :handshake provider
+                                   :close-notify
+                                   (lambda (client)
+                                     (declare (ignore client))
+                                     (incf close-calls)
+                                     #(1 0)))
                    :record-protect (lambda (client bytes) (declare (ignore client)) (vector 9 (aref bytes 0)))
                    :record-unprotect (lambda (client bytes) (declare (ignore client)) (aref bytes 0))
                    :quic-message-callback (lambda (client message) (declare (ignore client)) (push message events))
@@ -34,7 +39,13 @@
       (tls-kit::tls-client-emit-quic-message client :crypto)
       (tls-kit::tls-client-emit-quic-secret client :handshake :write #(3))
       (check (= reads 1) "transport read called once")
-      (check (equalp (first secrets) '(:handshake :write #(3))) "QUIC secret callback boundary")))
+      (check (equalp (first secrets) '(:handshake :write #(3))) "QUIC secret callback boundary")
+      (tls-kit::tls-client-close client)
+      (check (eq (tls-kit::tls-client-state client) :closed) "close transitions state")
+      (check (= close-calls 1) "provider creates close_notify once")
+      (check (equalp (first writes) #(1 0)) "close_notify crosses the transport boundary")
+      (tls-kit::tls-client-close client)
+      (check (= close-calls 1) "repeated close does not resend close_notify")))
   (let ((client (tls-kit::make-tls-client)))
     (check (handler-case (progn (tls-kit::tls-client-check-server-random
                                 client #(0 0 0 0 0 0 0 68 79 87 78 71 82 68 1)) nil)

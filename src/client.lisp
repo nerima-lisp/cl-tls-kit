@@ -54,7 +54,9 @@
 TRANSPORT may be a property list containing :READ and :WRITE callbacks.  A
 read callback receives the client and returns an encoded record or NIL.  A
 write callback receives the client and encoded bytes.  Provider callbacks
-receive the client and, for HANDSHAKE, an optional input message."
+receive the client and, for HANDSHAKE, an optional input message.  A
+:CLOSE-NOTIFY provider callback receives the client and returns the encoded
+record to pass to the transport write callback."
   (let ((read (or transport-read (getf transport :read)))
         (write (or transport-write (getf transport :write))))
     (%make-tls-client :transport-read read :transport-write write
@@ -190,5 +192,14 @@ receive the client and, for HANDSHAKE, an optional input message."
 
 (defun tls-client-close (client)
   (unless (eq (tls-client-state client) :closed)
+    (let* ((provider (tls-client-provider client))
+           (callback (and (listp provider)
+                          (getf provider :close-notify))))
+      (when callback
+        (unless (tls-client-transport-write client)
+          (%client-fail client :close :missing-transport))
+        (let ((record (funcall callback client)))
+          (when record
+            (funcall (tls-client-transport-write client) client record)))))
     (setf (tls-client-state client) :closed))
   client)

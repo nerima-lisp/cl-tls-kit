@@ -60,6 +60,133 @@
   (unless (= pos (length bytes)) (%tls13-fail "trailing bytes"))
   bytes)
 
+;;; TLS 1.3 cipher suites (RFC 8446, section 9.1).  The hash names are
+;;; provider-neutral keywords; selecting or implementing the primitive is left
+;;; to the caller.
+(defconstant +tls13-cipher-suite-aes-128-gcm-sha256+ #x1301)
+(defconstant +tls13-cipher-suite-aes-256-gcm-sha384+ #x1302)
+(defconstant +tls13-cipher-suite-chacha20-poly1305-sha256+ #x1303)
+(defconstant +tls13-cipher-suite-aes-128-ccm-sha256+ #x1304)
+(defconstant +tls13-cipher-suite-aes-128-ccm-8-sha256+ #x1305)
+(defconstant +tls13-cipher-suite-aes-128-gcm-sha256-name+ :aes-128-gcm-sha256)
+(defconstant +tls13-cipher-suite-aes-256-gcm-sha384-name+ :aes-256-gcm-sha384)
+(defconstant +tls13-cipher-suite-chacha20-poly1305-sha256-name+ :chacha20-poly1305-sha256)
+(defconstant +tls13-cipher-suite-aes-128-ccm-sha256-name+ :aes-128-ccm-sha256)
+(defconstant +tls13-cipher-suite-aes-128-ccm-8-sha256-name+ :aes-128-ccm-8-sha256)
+(defconstant +tls13-cipher-suite-aes-128-gcm-sha256-hash+ :sha256)
+(defconstant +tls13-cipher-suite-aes-256-gcm-sha384-hash+ :sha384)
+(defconstant +tls13-cipher-suite-chacha20-poly1305-sha256-hash+ :sha256)
+(defconstant +tls13-cipher-suite-aes-128-ccm-sha256-hash+ :sha256)
+(defconstant +tls13-cipher-suite-aes-128-ccm-8-sha256-hash+ :sha256)
+(defconstant +tls13-cipher-suite-aes-128-gcm-sha256-key-length+ 16)
+(defconstant +tls13-cipher-suite-aes-256-gcm-sha384-key-length+ 32)
+(defconstant +tls13-cipher-suite-chacha20-poly1305-sha256-key-length+ 32)
+(defconstant +tls13-cipher-suite-aes-128-ccm-sha256-key-length+ 16)
+(defconstant +tls13-cipher-suite-aes-128-ccm-8-sha256-key-length+ 16)
+
+(defun tls13-cipher-suite-name (suite)
+  (case suite
+    (#x1301 +tls13-cipher-suite-aes-128-gcm-sha256-name+)
+    (#x1302 +tls13-cipher-suite-aes-256-gcm-sha384-name+)
+    (#x1303 +tls13-cipher-suite-chacha20-poly1305-sha256-name+)
+    (#x1304 +tls13-cipher-suite-aes-128-ccm-sha256-name+)
+    (#x1305 +tls13-cipher-suite-aes-128-ccm-8-sha256-name+)))
+(defun tls13-cipher-suite-hash (suite)
+  (case suite
+    (#x1301 +tls13-cipher-suite-aes-128-gcm-sha256-hash+)
+    (#x1302 +tls13-cipher-suite-aes-256-gcm-sha384-hash+)
+    (#x1303 +tls13-cipher-suite-chacha20-poly1305-sha256-hash+)
+    (#x1304 +tls13-cipher-suite-aes-128-ccm-sha256-hash+)
+    (#x1305 +tls13-cipher-suite-aes-128-ccm-8-sha256-hash+)))
+(defun tls13-cipher-suite-key-length (suite)
+  (case suite
+    (#x1301 +tls13-cipher-suite-aes-128-gcm-sha256-key-length+)
+    (#x1302 +tls13-cipher-suite-aes-256-gcm-sha384-key-length+)
+    (#x1303 +tls13-cipher-suite-chacha20-poly1305-sha256-key-length+)
+    (#x1304 +tls13-cipher-suite-aes-128-ccm-sha256-key-length+)
+    (#x1305 +tls13-cipher-suite-aes-128-ccm-8-sha256-key-length+)))
+
+(defconstant +tls13-extension-server-name+ 0)
+(defconstant +tls13-extension-application-layer-protocol-negotiation+ 16)
+
+(defun %tls13-extension-string-octets (value label)
+  (unless (stringp value) (%tls13-fail (format nil "~A must be a string" label)))
+  (let ((octets (make-array (length value) :element-type '(unsigned-byte 8))))
+    (dotimes (i (length value) octets)
+      (let ((code (char-code (char value i))))
+        (unless (<= code 127)
+          (%tls13-fail (format nil "~A must contain ASCII characters" label)))
+        (setf (aref octets i) code)))))
+(defun %tls13-octets-string (octets)
+  (coerce (map 'list #'code-char octets) 'string))
+
+(defun encode-sni-extension (hostname)
+  "Encode one DNS host_name entry for the server_name extension."
+  (let ((name (%tls13-extension-string-octets hostname "SNI hostname")))
+    (when (zerop (length name)) (%tls13-fail "SNI hostname cannot be empty"))
+    (%cat (%hs-u16 (+ 3 (length name))) #(0)
+          (%hs-u16 (length name)) name)))
+(defun decode-sni-extension (bytes)
+  "Decode a server_name extension and return its single DNS host name."
+  (let ((bytes (%tls13-octets bytes)))
+    (multiple-value-bind (names end) (%read-vector bytes 0 2 :minimum 3)
+      (multiple-value-bind (name-type p1) (%read-integer names 0 1)
+        (unless (= name-type 0) (%tls13-fail "SNI name is not host_name"))
+        (multiple-value-bind (name p2) (%read-vector names p1 2 :minimum 1)
+          (%finish names p2)
+          (%finish bytes end)
+          (%tls13-octets-string name))))))
+
+(defun encode-alpn-extension (protocols)
+  "Encode an ALPN extension from a non-empty list of protocol strings."
+  (unless (and (listp protocols) protocols)
+    (%tls13-fail "ALPN protocols must be a non-empty list"))
+  (let ((names (mapcar (lambda (protocol)
+                         (let ((octets (%tls13-extension-string-octets protocol "ALPN protocol")))
+                           (when (or (zerop (length octets)) (> (length octets) 255))
+                             (%tls13-fail "ALPN protocol length is out of range"))
+                           (%cat (%hs-u8 (length octets)) octets)))
+                       protocols)))
+    (%encode-vector (apply #'%cat names) 2 :minimum 2)))
+(defun decode-alpn-extension (bytes)
+  "Decode an ALPN extension and return protocol names in wire order."
+  (let ((bytes (%tls13-octets bytes)))
+    (multiple-value-bind (names end) (%read-vector bytes 0 2 :minimum 2)
+      (let ((cursor 0) (protocols '()))
+        (loop while (< cursor (length names)) do
+          (multiple-value-bind (protocol next) (%read-vector names cursor 1 :minimum 1)
+            (push (%tls13-octets-string protocol) protocols)
+            (setf cursor next)))
+        (%finish bytes end)
+        (nreverse protocols)))))
+
+(export '(+tls13-cipher-suite-aes-128-gcm-sha256+
+          +tls13-cipher-suite-aes-256-gcm-sha384+
+          +tls13-cipher-suite-chacha20-poly1305-sha256+
+          +tls13-cipher-suite-aes-128-ccm-sha256+
+          +tls13-cipher-suite-aes-128-ccm-8-sha256+
+          +tls13-cipher-suite-aes-128-gcm-sha256-name+
+          +tls13-cipher-suite-aes-256-gcm-sha384-name+
+          +tls13-cipher-suite-chacha20-poly1305-sha256-name+
+          +tls13-cipher-suite-aes-128-ccm-sha256-name+
+          +tls13-cipher-suite-aes-128-ccm-8-sha256-name+
+          +tls13-cipher-suite-aes-128-gcm-sha256-hash+
+          +tls13-cipher-suite-aes-256-gcm-sha384-hash+
+          +tls13-cipher-suite-chacha20-poly1305-sha256-hash+
+          +tls13-cipher-suite-aes-128-ccm-sha256-hash+
+          +tls13-cipher-suite-aes-128-ccm-8-sha256-hash+
+          +tls13-cipher-suite-aes-128-gcm-sha256-key-length+
+          +tls13-cipher-suite-aes-256-gcm-sha384-key-length+
+          +tls13-cipher-suite-chacha20-poly1305-sha256-key-length+
+          +tls13-cipher-suite-aes-128-ccm-sha256-key-length+
+          +tls13-cipher-suite-aes-128-ccm-8-sha256-key-length+
+          tls13-cipher-suite-name tls13-cipher-suite-hash
+          tls13-cipher-suite-key-length
+          +tls13-extension-server-name+
+          +tls13-extension-application-layer-protocol-negotiation+
+          encode-sni-extension decode-sni-extension
+          encode-alpn-extension decode-alpn-extension))
+
 (defstruct (tls-extension (:constructor make-tls-extension (type data)))
   (type 0) (data #()))
 (defun %extension (type data)

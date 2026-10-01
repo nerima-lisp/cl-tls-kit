@@ -36,6 +36,29 @@
       devShells = forEachSystem (system: pkgs: {
         default = pkgs.mkShell { packages = [ pkgs.sbcl cl-weave.packages.${system}.default ]; };
       });
+      checks = forEachSystem (system: pkgs: {
+        default = pkgs.stdenvNoCC.mkDerivation {
+          pname = "cl-tls-kit-tests";
+          version = "0.1.0";
+          src = self;
+          nativeBuildInputs = [ pkgs.sbcl ];
+          dontConfigure = true;
+          dontBuild = true;
+          doCheck = true;
+          checkPhase = ''
+            runHook preCheck
+            export CL_SOURCE_REGISTRY="$PWD//"
+            ${pkgs.sbcl}/bin/sbcl --noinform --non-interactive \
+              --eval '(require :asdf)' \
+              --eval '(asdf:test-system "cl-tls-kit")'
+            runHook postCheck
+          '';
+          installPhase = ''
+            mkdir -p "$out"
+            touch "$out/passed"
+          '';
+        };
+      });
       apps = forEachSystem (system: pkgs:
         let test = pkgs.writeShellApplication {
           name = "cl-tls-kit-test";
