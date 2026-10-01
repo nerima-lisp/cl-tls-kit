@@ -23,7 +23,8 @@
    #:tls13-crypto-provider #:make-cl-crypto-kit-provider
    #:tls13-hkdf-extract #:tls13-hkdf-expand-label #:tls13-derive-secret
    #:tls13-early-secret #:tls13-handshake-secret #:tls13-master-secret
-   #:tls13-traffic-key-and-iv #:tls13-finished-key #:tls13-resumption-secret
+   #:tls13-traffic-key-and-iv #:tls13-finished-key
+   #:tls13-compute-finished-verify-data #:tls13-resumption-secret
    #:tls13-traffic-secret
    #:tls-record-error #:tls-record-error-reason #:tls-record-overflow
    #:tls-invalid-record #:tls-sequence-overflow #:tls-aead-error
@@ -70,7 +71,16 @@
    #:tls-client-emit-quic-message #:tls-client-emit-quic-secret
    #:tls-client-check-server-random #:tls-client-error
    #:tls-client-state-error #:unexpected-message #:tls12-downgrade-sentinel
-   #:tls-client-verification-error))
+   #:tls-client-verification-error
+   #:tls13-verification-error #:tls13-verification-error-reason
+   #:tls13-verification-error-message #:tls13-invalid-verification-input
+   #:tls13-signature-scheme-error #:tls13-signature-scheme-not-offered
+   #:tls13-signature-algorithm-mismatch #:tls13-verification-provider-error
+   #:tls13-bad-signature #:tls13-finished-mismatch
+   #:tls13-signature-scheme-name #:tls13-client-hello-signature-algorithms
+   #:tls13-signature-scheme-offered-p #:tls13-validate-certificate-verify-algorithm
+   #:tls13-certificate-verify-signature-input #:tls13-constant-time-equal-p
+   #:tls13-verify-finished #:tls13-verify-certificate-verify))
 
 (defpackage #:cl-tls-kit.x509
   (:use #:cl #:cl-tls-kit)

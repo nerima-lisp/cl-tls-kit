@@ -1,0 +1,62 @@
+(in-package #:cl-tls-kit/test)
+
+(unless (fboundp 'check)
+  (defun check (condition message)
+    (unless condition (error "Verification test failed: ~A" message))))
+
+(defun run-verification-tests ()
+  (let* ((random (make-array 32 :element-type '(unsigned-byte 8) :initial-element 1))
+         (hello (make-tls13-client-hello #x0303 random #() #( #x1301)
+                                         (list (make-tls-extension 13 #(0 4 #x08 #x04 #x04 #x03)))))
+         (hash (make-array 32 :element-type '(unsigned-byte 8) :initial-element #xaa))
+         (signature #(1 2 3))
+         (calls nil))
+    (check (= (length (cl-tls-kit::tls13-client-hello-signature-algorithms hello)) 2)
+           "signature_algorithms is decoded")
+    (check (equalp (cl-tls-kit::tls13-certificate-verify-signature-input :server hash)
+                   (concatenate '(vector (unsigned-byte 8))
+                                (make-array 64 :element-type '(unsigned-byte 8)
+                                            :initial-element #x20)
+                                #(84 76 83 32 49 46 51 44 32 115 101 114 118 101 114
+                                  32 67 101 114 116 105 102 105 99 97 116 101 86 101
+                                  114 105 102 121)
+                                #(0)
+                                hash))
+           "CertificateVerify input is RFC 8446 context plus transcript hash")
+    (let ((signed-input (cl-tls-kit::tls13-certificate-verify-signature-input :server hash)))
+      (check (= (aref signed-input (+ 64 (length "TLS 1.3, server CertificateVerify"))) 0)
+             "CertificateVerify input includes the zero separator"))
+    (check (handler-case
+               (progn (cl-tls-kit::tls13-validate-certificate-verify-algorithm hello #x0807) nil)
+             (cl-tls-kit::tls13-signature-scheme-not-offered () t))
+           "unoffered scheme has a reason-specific condition")
+    (check (handler-case
+               (progn (cl-tls-kit::tls13-verify-certificate-verify
+                       hello :server :key #x0804 signature hash nil)
+                      nil)
+             (cl-tls-kit::tls13-verification-provider-error (condition)
+               (eq (cl-tls-kit::tls13-verification-error-reason condition)
+                   :missing-verify-signature)))
+           "missing provider is rejected at the boundary")
+    (check (handler-case
+               (progn (cl-tls-kit::tls13-verify-certificate-verify
+                       hello :server :key #x0804 #() hash nil)
+                      nil)
+             (cl-tls-kit::tls13-invalid-verification-input () t))
+           "empty CertificateVerify signature is rejected before provider use")
+    (check (cl-tls-kit::tls13-verify-certificate-verify
+            hello :server :key #x0804 signature hash
+            (lambda (key scheme input received)
+              (push (list key scheme input received) calls)
+              t))
+           "provider boundary accepts a valid mock result")
+    (check (= (length calls) 1) "provider is called once")
+    (check (equalp (third (first calls))
+                   (cl-tls-kit::tls13-certificate-verify-signature-input :server hash))
+           "provider receives the exact CertificateVerify input")
+    (check (cl-tls-kit::tls13-verify-finished #(1 2 3) #(1 2 3))
+           "matching Finished data succeeds")
+    (check (handler-case (progn (cl-tls-kit::tls13-verify-finished #(1 2 3) #(1 2 4)) nil)
+             (cl-tls-kit::tls13-finished-mismatch () t))
+           "mismatching Finished data has a reason-specific condition")
+    t))

@@ -1,0 +1,67 @@
+(in-package #:cl-tls-kit/test)
+
+(defun run-quic-boundary-tests ()
+  (let ((crypto '()) (secrets '()) (transport '()))
+    (let ((boundary
+            (make-quic-tls-boundary
+             :role :client :transport-parameters #(1 2 3)
+             :on-crypto (lambda (boundary level bytes)
+                          (declare (ignore boundary)) (push (list level bytes) crypto))
+             :on-secret (lambda (boundary level direction secret)
+                          (declare (ignore boundary)) (push (list level direction secret) secrets))
+             :on-transport-parameters (lambda (boundary bytes)
+                                        (declare (ignore boundary)) (push bytes transport)))))
+      (let* ((hello (make-tls13-client-hello
+                     #x0303 (make-array 32 :element-type '(unsigned-byte 8) :initial-element 1)
+                     #() #( #x1301 #x1302) nil))
+             (wire (quic-tls-boundary-send-client-hello boundary :initial hello)))
+        (check (= (aref wire 0) 1) "QUIC carries a TLS handshake header")
+        (check (equalp (first (first crypto)) :initial) "ClientHello uses Initial CRYPTO")
+        (check (equalp (quic-tls-boundary-feed
+                        (make-quic-tls-boundary :role :server
+                                                :on-transport-parameters
+                                                (lambda (boundary bytes)
+                                                  (declare (ignore boundary))
+                                                  (push bytes transport)))
+                        :initial (subseq wire 0 7)) nil)
+               "partial CRYPTO input is retained")
+        (let ((server (make-quic-tls-boundary :role :server
+                                               :on-transport-parameters
+                                               (lambda (boundary bytes)
+                                                 (declare (ignore boundary))
+                                                 (push bytes transport)))))
+          (quic-tls-boundary-feed server :initial wire)
+          (check (equalp (quic-tls-boundary-received-transport-parameters server) #(1 2 3))
+                 "transport parameters cross the TLS extension boundary")))
+      (quic-tls-boundary-emit-secret boundary :handshake :write #(9 8))
+      (check (equalp (first secrets) '(:handshake :write #(9 8)))
+             "secret callback retains encryption level and direction")
+      (check (equalp (quic-tls-boundary-send-close-notify boundary :1-rtt) #(1 0))
+             "close_notify is raw QUIC CRYPTO alert data")
+      (check (quic-tls-boundary-close-notify-p #(1 0)) "close_notify classifier")
+      (check (quic-tls-boundary-alert-p #(2 40)) "fatal alert classifier")
+      (let ((update (quic-tls-boundary-send-key-update boundary :1-rtt 1)))
+        (check (quic-tls-boundary-key-update-p update) "KeyUpdate remains a handshake message"))))
+  (let* ((transcript-hash (lambda (bytes) (vector (length bytes) #xaa)))
+         (boundary (make-quic-tls-boundary :role :server :hash-function transcript-hash))
+         (hello (make-tls13-client-hello
+                 #x0303 (make-array 32 :element-type '(unsigned-byte 8) :initial-element 2)
+                 #() #( #x1301 #x1302) nil)))
+    (let* ((hello-wire (quic-tls-boundary-send-client-hello boundary :initial hello))
+           (hrr (quic-tls-boundary-send-hrr boundary #x001d #(7 7))))
+      (check (= (aref hrr 0) 2) "HRR is encoded as ServerHello handshake")
+      (check (= (length (second (quic-tls-boundary-transcript boundary))) 6)
+             "HRR transcript starts with message_hash replacement")
+      (check (equalp (quic-tls-boundary-cookie boundary) #(7 7)) "HRR cookie is retained")
+      (check (= (quic-tls-boundary-selected-group boundary) #x001d)
+             "HRR key_share selection is retained")
+      (let ((client (make-quic-tls-boundary :role :client
+                                            :hash-function transcript-hash)))
+        (quic-tls-boundary-feed client :initial
+                                hello-wire)
+        (quic-tls-boundary-feed client :initial hrr)
+        (check (= (length (second (quic-tls-boundary-transcript client))) 6)
+               "HRR receive path replaces the client transcript")
+        (check (= (quic-tls-boundary-selected-group client) #x001d)
+               "HRR receive path selects the requested key_share"))))
+  t)

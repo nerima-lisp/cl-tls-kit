@@ -298,6 +298,7 @@
 (defun tls13-certificate-verify-input (role transcript)
   (%cat (make-array 64 :initial-element #x20 :element-type '(unsigned-byte 8))
         (%ascii-octets (tls13-certificate-verify-context role))
+        #(0)
         (%tls13-octets transcript)))
 
 (defstruct (tls13-state (:constructor make-tls13-state (role &optional (phase :start)))) role phase)

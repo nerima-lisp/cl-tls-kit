@@ -26,6 +26,7 @@
                          #(84 76 83 32 49 46 51 44 32 99 108 105 101 110 116
                            32 67 101 114 116 105 102 105 99 97 116 101 86 101 114
                            105 102 121)
+                         #(0)
                          #(#x01)))
            "CertificateVerify context input")
     (let* ((server (make-tls13-server-hello

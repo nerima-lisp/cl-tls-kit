@@ -12,11 +12,12 @@
 
 (defstruct (tls13-crypto-provider
             (:constructor %make-tls13-crypto-provider
-                (hkdf-extract hkdf-expand digest-length digest)))
+                (hkdf-extract hkdf-expand digest-length &optional digest hmac)))
   hkdf-extract
   hkdf-expand
   digest-length
-  digest)
+  digest
+  hmac)
 
 (defun %tls13-error (control &rest args)
   (error 'tls13-key-schedule-error :message (apply #'format nil control args)))
@@ -71,7 +72,8 @@ dependency and does not refer to an uninterned package at read time."
        (operation "HKDF-EXTRACT")
        (operation "HKDF-EXPAND")
        (operation "DIGEST-LENGTH")
-       (operation "DIGEST")))))
+       (operation "DIGEST")
+       (operation "HMAC")))))
 
 (defun %provider (provider)
   (unless (typep provider 'tls13-crypto-provider)
@@ -142,7 +144,7 @@ dependency and does not refer to an uninterned package at read time."
   "Derive the handshake secret from the early secret and (EC)DHE secret."
   (tls13-hkdf-extract provider hash
                        (tls13-hkdf-expand-label provider hash early-secret "derived"
-                                                (make-array 0 :element-type '(unsigned-byte 8))
+                                                (tls13-empty-hash provider hash)
                                                 (funcall (tls13-crypto-provider-digest-length provider) hash))
                        dhe-secret))
 
@@ -150,7 +152,7 @@ dependency and does not refer to an uninterned package at read time."
   "Derive the master secret from the handshake secret."
   (tls13-hkdf-extract provider hash
                        (tls13-hkdf-expand-label provider hash handshake-secret "derived"
-                                                (make-array 0 :element-type '(unsigned-byte 8))
+                                                (tls13-empty-hash provider hash)
                                                 (funcall (tls13-crypto-provider-digest-length provider) hash))
                        (make-array 0 :element-type '(unsigned-byte 8))))
 
@@ -165,6 +167,17 @@ dependency and does not refer to an uninterned package at read time."
   (tls13-hkdf-expand-label provider hash base-key "finished"
                            (make-array 0 :element-type '(unsigned-byte 8))
                            (funcall (tls13-crypto-provider-digest-length provider) hash)))
+
+(defun tls13-compute-finished-verify-data (provider hash finished-key transcript-hash)
+  "Compute Finished verify_data through the provider HMAC boundary."
+  (%provider provider)
+  (%require-octets transcript-hash "TRANSCRIPT-HASH")
+  (let ((hmac (tls13-crypto-provider-hmac provider)))
+    (unless (functionp hmac)
+      (%tls13-error "Crypto provider HMAC operation is unavailable"))
+    (let ((result (funcall hmac hash finished-key transcript-hash)))
+      (%require-octets result "Finished verify_data")
+      result)))
 
 (defun tls13-resumption-secret (provider hash master-secret transcript-hash)
   (tls13-derive-secret provider hash master-secret "res master" transcript-hash))

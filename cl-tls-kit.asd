@@ -14,7 +14,8 @@
   :components ((:file "package") (:file "asn1") (:file "pem")
                (:file "hostname") (:file "x509") (:file "trust-store")
                (:file "verify") (:file "key-schedule") (:file "record")
-               (:file "handshake") (:file "client"))
+               (:file "handshake") (:file "verification")
+               (:file "quic-boundary") (:file "rfc8448") (:file "client"))
   :in-order-to ((test-op (test-op "cl-tls-kit/test"))))
 
 (asdf:defsystem "cl-tls-kit/test"
@@ -25,6 +26,8 @@
   :components ((:file "package") (:file "tests")
                (:file "key-schedule-tests") (:file "record-tests")
                (:file "handshake-tests") (:file "client-tests")
+               (:file "verification-tests") (:file "quic-boundary-tests")
+               (:file "rfc8448-tests")
                (:file "runner"))
   :perform (asdf:test-op (op c)
              (declare (ignore op c))
