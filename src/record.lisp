@@ -211,6 +211,57 @@ number of zero octets added after the inner content type."
         (values (make-tls-plaintext type (subseq plain 0 end))
                 (%next-sequence sequence-number))))))
 
+(defun encrypt-tls13-record (plaintext provider algorithm key iv sequence-number
+                             &key (padding-length 0) (tag-length 16))
+  "Encrypt a record with a TLS13 crypto provider's AEAD-SEAL operation."
+  (unless (and (typep provider 'tls13-crypto-provider)
+               (functionp (tls13-crypto-provider-aead-seal provider)))
+    (%record-fail 'tls-aead-error "provider has no AEAD-SEAL operation"))
+  (encrypt-tls-record plaintext key iv sequence-number
+                      (lambda (record-key nonce input aad)
+                        (tls13-aead-seal provider algorithm record-key nonce input aad))
+                      :padding-length padding-length :tag-length tag-length))
+
+(defun decrypt-tls13-record (wire provider algorithm key iv sequence-number
+                             &key (tag-length 16))
+  "Decrypt a record with a TLS13 crypto provider's AEAD-OPEN operation."
+  (declare (ignore tag-length))
+  (unless (and (typep provider 'tls13-crypto-provider)
+               (functionp (tls13-crypto-provider-aead-open provider)))
+    (%record-fail 'tls-aead-error "provider has no AEAD-OPEN operation"))
+  (decrypt-tls-record wire key iv sequence-number
+                      (lambda (record-key nonce input aad)
+                        (tls13-aead-open provider algorithm record-key nonce input aad))))
+
+(defun encrypt-tls13-traffic-record (plaintext state &key (padding-length 0)
+                                     (tag-length 16))
+  "Encrypt using STATE and advance its sequence number after success."
+  (check-type state tls13-traffic-state)
+  (multiple-value-bind (wire next)
+      (encrypt-tls13-record plaintext
+                            (tls13-traffic-state-provider state)
+                            (tls13-traffic-state-algorithm state)
+                            (tls13-traffic-state-key state)
+                            (tls13-traffic-state-iv state)
+                            (tls13-traffic-state-sequence-number state)
+                            :padding-length padding-length :tag-length tag-length)
+    (setf (tls13-traffic-state-sequence-number state) next)
+    (values wire state)))
+
+(defun decrypt-tls13-traffic-record (wire state &key (tag-length 16))
+  "Decrypt using STATE and advance its sequence number after success."
+  (check-type state tls13-traffic-state)
+  (multiple-value-bind (plaintext next)
+      (decrypt-tls13-record wire
+                            (tls13-traffic-state-provider state)
+                            (tls13-traffic-state-algorithm state)
+                            (tls13-traffic-state-key state)
+                            (tls13-traffic-state-iv state)
+                            (tls13-traffic-state-sequence-number state)
+                            :tag-length tag-length)
+    (setf (tls13-traffic-state-sequence-number state) next)
+    (values plaintext state)))
+
 (defun tls-key-update-p (plaintext)
   "Recognize the exact TLS 1.3 KeyUpdate handshake message."
   (and (typep plaintext 'tls-plaintext)
@@ -240,4 +291,6 @@ number of zero octets added after the inner content type."
           tls-ciphertext-legacy-version tls-ciphertext-fragment
           encode-tls-ciphertext decode-tls-ciphertext tls-record-nonce
           tls-record-additional-data encrypt-tls-record decrypt-tls-record
+          encrypt-tls13-record decrypt-tls13-record
+          encrypt-tls13-traffic-record decrypt-tls13-traffic-record
           tls-key-update-p tls-close-notify-p))

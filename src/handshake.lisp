@@ -108,6 +108,10 @@
 
 (defconstant +tls13-extension-server-name+ 0)
 (defconstant +tls13-extension-application-layer-protocol-negotiation+ 16)
+(defconstant +tls13-extension-supported-groups+ 10)
+(defconstant +tls13-extension-signature-algorithms+ 13)
+(defconstant +tls13-extension-supported-versions+ 43)
+(defconstant +tls13-extension-key-share+ 51)
 
 (defun %tls13-extension-string-octets (value label)
   (unless (stringp value) (%tls13-fail (format nil "~A must be a string" label)))
@@ -184,11 +188,49 @@
           tls13-cipher-suite-key-length
           +tls13-extension-server-name+
           +tls13-extension-application-layer-protocol-negotiation+
+          +tls13-extension-supported-groups+
+          +tls13-extension-signature-algorithms+
+          +tls13-extension-supported-versions+
+          +tls13-extension-key-share+
           encode-sni-extension decode-sni-extension
           encode-alpn-extension decode-alpn-extension))
 
 (defstruct (tls-extension (:constructor make-tls-extension (type data)))
   (type 0) (data #()))
+
+(defun encode-key-share-extension (shares)
+  "Encode TLS 1.3 key_share entries.  SHARE is ((GROUP . KEY-EXCHANGE) ...)."
+  (unless (and (listp shares) shares) (%tls13-fail "key_share must not be empty"))
+  (%encode-vector
+   (apply #'%cat
+          (mapcar (lambda (share)
+                    (let ((group (car share)) (key (cdr share)))
+                      (unless (typep group '(integer 0 65535))
+                        (%tls13-fail "key_share group is out of range"))
+                      (%cat (%hs-u16 group) (%encode-vector (%tls13-octets key) 2))))
+                  shares)) 2))
+
+(defun decode-key-share-extension (bytes)
+  "Decode a ClientHello key_share vector into ((GROUP . KEY-EXCHANGE) ...)."
+  (multiple-value-bind (raw end) (%read-vector (%tls13-octets bytes) 0 2)
+    (%finish bytes end)
+    (let ((cursor 0) (result '()))
+      (loop while (< cursor (length raw)) do
+        (multiple-value-bind (group p1) (%read-integer raw cursor 2)
+          (multiple-value-bind (key p2) (%read-vector raw p1 2 :minimum 1)
+            (push (cons group key) result)
+            (setf cursor p2))))
+      (nreverse result))))
+
+(defun encode-key-share-server-extension (group key-exchange)
+  (%cat (%hs-u16 group) (%encode-vector (%tls13-octets key-exchange) 2)))
+
+(defun decode-key-share-server-extension (bytes)
+  (let ((bytes (%tls13-octets bytes)))
+    (multiple-value-bind (group p1) (%read-integer bytes 0 2)
+      (multiple-value-bind (key p2) (%read-vector bytes p1 2 :minimum 1)
+        (%finish bytes p2)
+        (cons group key)))))
 (defun %extension (type data)
   (unless (typep type '(integer 0 65535)) (%tls13-fail "extension type out of range"))
   (make-tls-extension type (%tls13-octets data)))
@@ -428,7 +470,9 @@
         #(0)
         (%tls13-octets transcript)))
 
-(defstruct (tls13-state (:constructor make-tls13-state (role &optional (phase :start)))) role phase)
+(defstruct (tls13-state (:constructor make-tls13-state (role &optional (phase :start))))
+  role phase (transcript (make-array 0 :element-type '(unsigned-byte 8)))
+  (retry-requested nil) (key-update-count 0))
 (defun %allowed-next-p (role phase type)
   (declare (ignore role))
   (case phase
@@ -448,3 +492,30 @@
           (11 :certificate) (13 :certificate) (15 :certificate-verify)
           (20 :connected) (4 :connected) (24 :connected)))
   state)
+
+(defun tls13-state-add-transcript (state handshake-bytes)
+  "Append one complete encoded handshake message to STATE's transcript."
+  (let ((bytes (%tls13-octets handshake-bytes)))
+    (setf (tls13-state-transcript state)
+          (%cat (tls13-state-transcript state) bytes))))
+
+(defun tls13-state-handle-hello-retry-request (state hrr encoded-client-hello)
+  "Apply the TLS 1.3 HRR transcript marker and move back to ClientHello."
+  (declare (ignore hrr))
+  (unless (and (eq (tls13-state-role state) :client)
+               (eq (tls13-state-phase state) :server-hello))
+    (%tls13-fail "HelloRetryRequest is not valid in this state" 'tls13-state-error))
+  (setf (tls13-state-retry-requested state) t
+        (tls13-state-phase state) :client-hello)
+  (tls13-state-add-transcript state encoded-client-hello)
+  state)
+
+(export '(+tls13-extension-supported-groups+
+          +tls13-extension-signature-algorithms+
+          +tls13-extension-supported-versions+
+          +tls13-extension-key-share+
+          encode-key-share-extension decode-key-share-extension
+          encode-key-share-server-extension decode-key-share-server-extension
+          tls13-state-transcript tls13-state-retry-requested
+          tls13-state-key-update-count tls13-state-add-transcript
+          tls13-state-handle-hello-retry-request))

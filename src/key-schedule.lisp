@@ -12,12 +12,16 @@
 
 (defstruct (tls13-crypto-provider
             (:constructor %make-tls13-crypto-provider
-                (hkdf-extract hkdf-expand digest-length &optional digest hmac)))
+                (hkdf-extract hkdf-expand digest-length &optional digest hmac
+                 aead-seal aead-open constant-time-equal)))
   hkdf-extract
   hkdf-expand
   digest-length
   digest
-  hmac)
+  hmac
+  aead-seal
+  aead-open
+  constant-time-equal)
 
 (defun %tls13-error (control &rest args)
   (error 'tls13-key-schedule-error :message (apply #'format nil control args)))
@@ -58,6 +62,10 @@ The provider contract is:
   HKDF-EXPAND (hash prk info length) -> octet vector
   DIGEST-LENGTH (hash) -> positive integer
   DIGEST (hash octets) -> octet vector
+  HMAC (hash key octets) -> octet vector
+  AEAD-SEAL (algorithm key nonce plaintext aad) -> octet vector
+  AEAD-OPEN (algorithm key nonce ciphertext-and-tag aad) -> octet vector
+  CONSTANT-TIME-EQUAL (left right) -> generalized boolean
 The package is resolved at call time so this foundation keeps its weak crypto
 dependency and does not refer to an uninterned package at read time."
   (let ((package (find-package '#:crypto-kit)))
@@ -73,7 +81,10 @@ dependency and does not refer to an uninterned package at read time."
        (operation "HKDF-EXPAND")
        (operation "DIGEST-LENGTH")
        (operation "DIGEST")
-       (operation "HMAC")))))
+       (operation "HMAC")
+       (operation "AEAD-SEAL")
+       (operation "AEAD-OPEN")
+       (operation "CONSTANT-TIME-EQUAL")))))
 
 (defun %provider (provider)
   (unless (typep provider 'tls13-crypto-provider)
@@ -179,6 +190,42 @@ dependency and does not refer to an uninterned package at read time."
       (%require-octets result "Finished verify_data")
       result)))
 
+(defun tls13-provider-constant-time-equal-p (provider left right)
+  "Compare two octet vectors through the crypto provider."
+  (%provider provider)
+  (%require-octets left "LEFT")
+  (%require-octets right "RIGHT")
+  (let ((operation (tls13-crypto-provider-constant-time-equal provider)))
+    (unless (functionp operation)
+      (%tls13-error "Crypto provider constant-time comparison is unavailable"))
+    (not (null (funcall operation left right)))))
+
+(defun tls13-aead-seal (provider algorithm key nonce plaintext aad)
+  "Seal a TLS record payload through the provider's AEAD boundary."
+  (%provider provider)
+  (%require-octets key "KEY")
+  (%require-octets nonce "NONCE")
+  (%require-octets plaintext "PLAINTEXT")
+  (%require-octets aad "ADDITIONAL-DATA")
+  (let ((operation (tls13-crypto-provider-aead-seal provider)))
+    (unless (functionp operation)
+      (%tls13-error "Crypto provider AEAD-SEAL is unavailable"))
+    (%require-octets (funcall operation algorithm key nonce plaintext aad)
+                     "AEAD seal result")))
+
+(defun tls13-aead-open (provider algorithm key nonce ciphertext-and-tag aad)
+  "Open a TLS record payload through the provider's AEAD boundary."
+  (%provider provider)
+  (%require-octets key "KEY")
+  (%require-octets nonce "NONCE")
+  (%require-octets ciphertext-and-tag "CIPHERTEXT-AND-TAG")
+  (%require-octets aad "ADDITIONAL-DATA")
+  (let ((operation (tls13-crypto-provider-aead-open provider)))
+    (unless (functionp operation)
+      (%tls13-error "Crypto provider AEAD-OPEN is unavailable"))
+    (%require-octets (funcall operation algorithm key nonce ciphertext-and-tag aad)
+                     "AEAD open result")))
+
 (defun tls13-resumption-secret (provider hash master-secret transcript-hash)
   (tls13-derive-secret provider hash master-secret "res master" transcript-hash))
 
@@ -196,3 +243,43 @@ DIRECTION is :CLIENT or :SERVER. PHASE is :HANDSHAKE or :APPLICATION."
                              ((eq direction :client) "c ap traffic")
                              (t "s ap traffic"))
                        transcript-hash))
+
+(defstruct (tls13-traffic-state
+            (:constructor %make-tls13-traffic-state
+                (provider hash algorithm secret key iv sequence-number)))
+  provider hash algorithm secret key iv
+  (sequence-number 0 :type (unsigned-byte 64)))
+
+(defun make-tls13-traffic-state (provider hash algorithm secret key-length iv-length)
+  "Create a record-protection state with sequence number zero."
+  (%provider provider)
+  (%require-octets secret "SECRET")
+  (multiple-value-bind (key iv)
+      (tls13-traffic-key-and-iv provider hash secret key-length iv-length)
+    (%make-tls13-traffic-state provider hash algorithm secret key iv 0)))
+
+(defun tls13-update-traffic-secret (state)
+  "Apply TLS 1.3 KeyUpdate's traffic secret ratchet and reset its sequence."
+  (check-type state tls13-traffic-state)
+  (let* ((provider (tls13-traffic-state-provider state))
+         (hash (tls13-traffic-state-hash state))
+         (secret (tls13-hkdf-expand-label
+                  provider hash (tls13-traffic-state-secret state)
+                  "traffic upd" (make-array 0 :element-type '(unsigned-byte 8))
+                  (funcall (tls13-crypto-provider-digest-length provider) hash))))
+    (setf (tls13-traffic-state-secret state) secret)
+    (multiple-value-bind (key iv)
+        (tls13-traffic-key-and-iv provider hash secret
+                                   (length (tls13-traffic-state-key state))
+                                   (length (tls13-traffic-state-iv state)))
+      (setf (tls13-traffic-state-key state) key
+            (tls13-traffic-state-iv state) iv
+            (tls13-traffic-state-sequence-number state) 0))
+    state))
+
+(export '(tls13-aead-seal tls13-aead-open tls13-provider-constant-time-equal-p
+          tls13-traffic-state tls13-traffic-state-p make-tls13-traffic-state
+          tls13-traffic-state-provider tls13-traffic-state-hash
+          tls13-traffic-state-algorithm tls13-traffic-state-secret
+          tls13-traffic-state-key tls13-traffic-state-iv
+          tls13-traffic-state-sequence-number tls13-update-traffic-secret))

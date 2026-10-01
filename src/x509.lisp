@@ -8,7 +8,7 @@
 (defstruct der tag content raw)
 (defstruct x509-public-key type algorithm parameters data)
 (defstruct x509-certificate version serial-number issuer subject not-before not-after
-  public-key signature-algorithm extensions basic-constraints key-usage
+  public-key signature-algorithm tbs-certificate signature extensions basic-constraints key-usage
   extended-key-usage subject-alternative-name name-constraints)
 
 (defun %fail (format-control &rest args)
@@ -205,6 +205,11 @@
           (make-x509-certificate :version version :serial-number serial :issuer (%name issuer)
             :subject (%name subject) :not-before (%time (first v)) :not-after (%time (second v))
             :public-key (%spki spki) :signature-algorithm (multiple-value-bind (o) (%algorithm sigalg) o)
+            :tbs-certificate (der-raw tbs)
+            :signature (let ((value (der-content (third parts))))
+                         (if (and (plusp (length value)) (zerop (aref value 0)))
+                             (subseq value 1)
+                             (%fail "certificate signature has unused bits")))
             :extensions extensions :basic-constraints (and bc (%basic-constraints (getf bc :value)))
             :key-usage (and ku (%key-usage (getf ku :value)))
             :extended-key-usage (and eku (mapcar #'%oid (%children (getf eku :value))))

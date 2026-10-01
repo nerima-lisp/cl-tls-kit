@@ -58,6 +58,27 @@
             touch "$out/passed"
           '';
         };
+        tls13-openssl = pkgs.stdenvNoCC.mkDerivation {
+          pname = "cl-tls-kit-tls13-openssl-tests";
+          version = "0.1.0";
+          src = self;
+          nativeBuildInputs = [ pkgs.openssl pkgs.sbcl ];
+          dontConfigure = true;
+          dontBuild = true;
+          doCheck = true;
+          checkPhase = ''
+            runHook preCheck
+            export CL_SOURCE_REGISTRY="$PWD//:${cl-crypto-kit}//"
+            ${pkgs.sbcl}/bin/sbcl --noinform --non-interactive \
+              --load t/crypto-provider-check.lisp
+            sh t/openssl-tls13-check.sh
+            runHook postCheck
+          '';
+          installPhase = ''
+            mkdir -p "$out"
+            touch "$out/passed"
+          '';
+        };
       });
       apps = forEachSystem (system: pkgs:
         let test = pkgs.writeShellApplication {

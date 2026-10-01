@@ -42,7 +42,9 @@
   provider record-protect record-unprotect key-schedule
   verify-certificate alpn-offered alpn peer-certificate
   quic-message-callback quic-secret-callback
-  (state :new) expected-message)
+  (state :new) expected-message
+  (transcript (make-array 0 :element-type '(unsigned-byte 8)))
+  (hrr-seen nil) (key-update-count 0) close-notify-received)
 
 (defun make-tls-client (&key transport-read transport-write transport
                               provider record-protect record-unprotect
@@ -115,7 +117,48 @@ record to pass to the transport write callback."
   client)
 
 (defun %message-type (message)
-  (and (listp message) (getf message :type)))
+  (cond ((listp message) (getf message :type))
+        ((typep message 'tls13-server-hello) :server-hello)
+        ((typep message 'tls13-hello-retry-request) :hello-retry-request)
+        ((typep message 'tls13-encrypted-extensions) :encrypted-extensions)
+        ((typep message 'tls13-certificate) :certificate)
+        ((typep message 'tls13-certificate-verify) :certificate-verify)
+        ((typep message 'tls13-finished) :finished)
+        ((typep message 'tls13-key-update) :key-update)
+        (t nil)))
+
+(defun %client-message-number (type)
+  (case type (:client-hello 1) (:server-hello 2) (:encrypted-extensions 8)
+    (:certificate 11) (:certificate-request 13) (:certificate-verify 15)
+    (:finished 20) (:new-session-ticket 4) (:key-update 24)))
+
+(defun %client-transcript-add (client bytes)
+  (when bytes
+    (let ((bytes (%octet-vector bytes)))
+      (setf (tls-client-transcript client)
+            (concatenate '(vector (unsigned-byte 8))
+                         (tls-client-transcript client) bytes)))))
+
+(defun %client-advance-message (client type)
+  (let ((expected (tls-client-expected-message client)))
+    (when (and expected (not (eql type expected)))
+      ;; KeyUpdate and post-handshake tickets are legal after Finished.
+      (unless (and (eq (tls-client-state client) :connected)
+                   (member type '(:key-update :new-session-ticket)))
+        (error 'unexpected-message :client client :message type :expected expected)))
+    (case type
+      (:server-hello (setf (tls-client-expected-message client) :encrypted-extensions))
+      (:hello-retry-request
+       (when (tls-client-hrr-seen client) (%client-fail client :step :second-hrr))
+       (setf (tls-client-hrr-seen client) t
+             (tls-client-expected-message client) :server-hello))
+      (:encrypted-extensions (setf (tls-client-expected-message client) :certificate))
+      (:certificate (setf (tls-client-expected-message client) :certificate-verify))
+      (:certificate-verify (setf (tls-client-expected-message client) :finished))
+      (:finished (setf (tls-client-state client) :connected
+                       (tls-client-expected-message client) nil))
+      (:key-update (incf (tls-client-key-update-count client)))))
+  )
 
 (defun %verify-peer (client certificate)
   (when (tls-client-verify-certificate client)
@@ -127,6 +170,12 @@ record to pass to the transport write callback."
                :certificate certificate :cause cause)))))
 
 (defun %apply-provider-result (client result)
+  (when (and (listp result) (getf result :transcript))
+    (%client-transcript-add client (getf result :transcript)))
+  (when (and (listp result) (getf result :message))
+    (let ((type (%message-type (getf result :message))))
+      (%client-advance-message client type)
+      (when (getf result :wire) (%client-transcript-add client (getf result :wire)))))
   (when (and (listp result) (getf result :server-random))
     (tls-client-check-server-random client (getf result :server-random)
                                      :version (or (getf result :version) :tls-1.3)))
@@ -137,6 +186,14 @@ record to pass to the transport write callback."
     (setf (tls-client-alpn client) (getf result :alpn)))
   (when (and (listp result) (getf result :key-schedule-event))
     (%call-key-schedule client (getf result :key-schedule-event)))
+  (when (and (listp result) (getf result :outgoing))
+    (dolist (message (getf result :outgoing))
+      (let ((wire (if (and (consp message) (integerp (car message)))
+                      (encode-handshake (car message) (cdr message))
+                      message)))
+        (%client-transcript-add client wire)
+        (when (tls-client-transport-write client)
+          (funcall (tls-client-transport-write client) client wire)))))
   (when (and (listp result) (getf result :unexpected-message))
     (error 'unexpected-message :client client :message (getf result :unexpected-message)
            :expected (tls-client-expected-message client)))
@@ -151,10 +208,11 @@ record to pass to the transport write callback."
   "Pass one provider-defined handshake input through the client boundary."
   (unless (member (tls-client-state client) '(:handshake :awaiting-server))
     (%client-fail client :step :not-in-handshake))
-  (when (and input (tls-client-expected-message client)
-             (not (eql (%message-type input) (tls-client-expected-message client))))
-    (error 'unexpected-message :client client :message input
-           :expected (tls-client-expected-message client)))
+  (when input
+    (let ((type (%message-type input)))
+      (%client-advance-message client type)
+      (when (and (vectorp input) (>= (length input) 4))
+        (%client-transcript-add client input))))
   (let ((callback (%provider-callback client :handshake)))
     (unless callback (%client-fail client :step :missing-handshake-callback))
     (%apply-provider-result client (funcall callback client input))))
@@ -203,3 +261,13 @@ record to pass to the transport write callback."
             (funcall (tls-client-transport-write client) client record)))))
     (setf (tls-client-state client) :closed))
   client)
+
+(defun tls-client-key-update (client &optional (request 0))
+  "Send a post-handshake KeyUpdate through the provider boundary."
+  (unless (eq (tls-client-state client) :connected)
+    (%client-fail client :key-update :not-connected))
+  (unless (member request '(0 1)) (%client-fail client :key-update :invalid-request))
+  (let ((callback (%provider-callback client :key-update)))
+    (unless callback (%client-fail client :key-update :missing-callback))
+    (incf (tls-client-key-update-count client))
+    (%apply-provider-result client (funcall callback client request))))

@@ -123,6 +123,10 @@ Return the offered uint16 scheme identifiers in wire order."
   (cond ((functionp provider) provider)
         ((and (listp provider) (functionp (getf provider :verify-signature)))
          (getf provider :verify-signature))
+        ((let* ((package (or (find-package "CL-CRYPTO-KIT")
+                             (find-package "CRYPTO-KIT")))
+                (symbol (and package (find-symbol "VERIFY-SIGNATURE" package))))
+           (and symbol (fboundp symbol) symbol)))
         (t (%tls13-verification-fail 'tls13-verification-provider-error
                                      :missing-verify-signature
                                      "provider has no verify-signature operation"))))
@@ -131,9 +135,8 @@ Return the offered uint16 scheme identifiers in wire order."
     (client-hello role public-key scheme signature transcript-hash provider)
   "Verify a TLS 1.3 CertificateVerify message.
 
-The provider is called as (PUBLIC-KEY SCHEME INPUT SIGNATURE) and must return
-true for a valid signature.  Its result is not treated as an authenticated
-TLS result until this function has checked its type and value."
+The provider is called as (PUBLIC-KEY SCHEME INPUT SIGNATURE), or defaults to
+the loaded crypto provider, and must return true for a valid signature."
   (%tls13-verification-octets signature "CertificateVerify signature")
   (when (zerop (length signature))
     (%tls13-verification-fail 'tls13-invalid-verification-input :invalid-input
