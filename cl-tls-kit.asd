@@ -8,6 +8,7 @@
   ;; Cryptographic operations are intentionally not part of this foundation.
   ;; A future certificate/crypto layer may add ironclad and cl-base64 here.
   :depends-on ()
+  :weakly-depends-on ("cl-crypto-kit")
   :pathname "src"
   :serial t
   :components ((:file "package") (:file "asn1") (:file "pem")
