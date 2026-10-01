@@ -47,6 +47,9 @@
           doCheck = true;
           checkPhase = ''
             runHook preCheck
+            export HOME="$TMPDIR/home"
+            export XDG_CACHE_HOME="$TMPDIR/cache"
+            mkdir -p "$HOME" "$XDG_CACHE_HOME"
             export CL_SOURCE_REGISTRY="$PWD//"
             ${pkgs.sbcl}/bin/sbcl --noinform --non-interactive \
               --eval '(require :asdf)' \
@@ -68,6 +71,9 @@
           doCheck = true;
           checkPhase = ''
             runHook preCheck
+            export HOME="$TMPDIR/home"
+            export XDG_CACHE_HOME="$TMPDIR/cache"
+            mkdir -p "$HOME" "$XDG_CACHE_HOME"
             export CL_SOURCE_REGISTRY="$PWD//:${cl-crypto-kit}//"
             ${pkgs.sbcl}/bin/sbcl --noinform --non-interactive \
               --load t/crypto-provider-check.lisp
