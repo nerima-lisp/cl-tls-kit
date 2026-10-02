@@ -136,6 +136,9 @@
    #:tls13-verify-finished #:tls13-verify-certificate-verify
    #:tls13-client-driver #:tls13-client-driver-p #:make-tls13-client-driver
    #:tls13-client-driver-start #:tls13-client-driver-step
+   #:tls13-client-driver-connect #:tls13-client-driver-read-record
+   #:tls13-client-driver-write #:tls13-client-driver-close
+   #:tls13-client-driver-key-update #:make-tls13-client-driver-over-tcp
    #:tls13-client-driver-error #:tls13-client-driver-error-reason
    #:quic-tls-boundary-error #:quic-tls-boundary-decode-error
    #:make-quic-tls-boundary #:quic-tls-boundary-p

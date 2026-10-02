@@ -376,19 +376,26 @@ The KEY-SHARE value is supplied by the crypto/provider integration."
                    (aref body (1+ (* 2 i))) (ldb (byte 8 0) value)))
     (%encode-vector body 2 :minimum 2)))
 
+(defun %tls-client-read-exact (stream buffer)
+  (loop with position = 0
+        while (< position (length buffer))
+        for count = (read-sequence buffer stream :start position)
+        do (when (= count position)
+             (return-from %tls-client-read-exact nil))
+           (setf position count)
+        finally (return buffer)))
+
 (defun %tls-client-stream-record-reader (stream)
   (let ((header (make-array 5 :element-type '(unsigned-byte 8))))
-    (unless (= (read-sequence header stream) 5) (return-from %tls-client-stream-record-reader nil))
+    (unless (%tls-client-read-exact stream header)
+      (return-from %tls-client-stream-record-reader nil))
     (let* ((length (+ (ash (aref header 3) 8) (aref header 4)))
            (body (make-array length :element-type '(unsigned-byte 8))))
-      (unless (= (read-sequence body stream) length)
+      (unless (%tls-client-read-exact stream body)
         (error 'tls-client-error :client nil :reason :truncated-record))
       (concatenate '(vector (unsigned-byte 8)) header body))))
 
-(defun make-tls-client-over-tcp (host port &rest args &key &allow-other-keys)
-  "Open a blocking SBCL TCP stream and return a client using TLS records on it.
-This is the portable entry in this minimal implementation; non-SBCL images
-must provide TRANSPORT callbacks directly to MAKE-TLS-CLIENT."
+(defun %make-tls-client-tcp-transport (host port)
   (unless (find-package '#:sb-bsd-sockets)
     (require :sb-bsd-sockets))
   (let* ((socket (funcall (find-symbol "MAKE-INET-SOCKET" '#:sb-bsd-sockets)
@@ -399,15 +406,20 @@ must provide TRANSPORT callbacks directly to MAKE-TLS-CLIENT."
              (funcall (find-symbol "HOST-ENT-ADDRESS" '#:sb-bsd-sockets) address) port)
     (let ((stream (funcall (find-symbol "SOCKET-MAKE-STREAM" '#:sb-bsd-sockets) socket
                            :input t :output t :element-type '(unsigned-byte 8))))
-      (apply #'make-tls-client
-             :transport-read (lambda (client) (declare (ignore client))
-                              (%tls-client-stream-record-reader stream))
-             :transport-write (lambda (client bytes) (declare (ignore client))
-                                (write-sequence bytes stream) (finish-output stream))
-             :transport-close (lambda (client) (declare (ignore client))
-                                (close stream)
-                                (funcall (find-symbol "SOCKET-CLOSE" '#:sb-bsd-sockets) socket))
-             args))))
+      (list :read (lambda (client) (declare (ignore client))
+                    (%tls-client-stream-record-reader stream))
+            :write (lambda (client bytes) (declare (ignore client))
+                     (write-sequence bytes stream) (finish-output stream))
+            :close (lambda (client) (declare (ignore client))
+                     (close stream)
+                     (funcall (find-symbol "SOCKET-CLOSE" '#:sb-bsd-sockets) socket))))))
+
+(defun make-tls-client-over-tcp (host port &rest args &key &allow-other-keys)
+  "Open a blocking SBCL TCP stream and return a client using TLS records on it.
+This is the portable entry in this minimal implementation; non-SBCL images
+must provide TRANSPORT callbacks directly to MAKE-TLS-CLIENT."
+  (apply #'make-tls-client :transport (%make-tls-client-tcp-transport host port)
+         args))
 
 (defun tls-client-read (client)
   (unless (eq (tls-client-state client) :connected)
