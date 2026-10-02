@@ -38,7 +38,9 @@ families:
 - `tls13-*` for TLS 1.3 key schedule, handshake messages, verification, and
   state transitions.
 - `tls-client-*` and `make-tls-client-over-tcp` for the callback-based TLS 1.3
-  client boundary.
+  client boundary. The current release does not claim a provider-independent
+  full handshake driver; handshake, record, and key-schedule operations are
+  supplied through the provider callbacks.
 - TLS record and QUIC boundary constructors, encoders, decoders, and crypto
   callback interfaces.
 
