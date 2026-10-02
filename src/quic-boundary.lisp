@@ -114,21 +114,24 @@
                    (body (subseq wire 4)))
               (setf pending (subseq pending (+ 4 length)))
               (if (= type 2)
-                  (progn
-                    (%quic-replace-transcript-for-hrr boundary)
-                    (setf (quic-tls-boundary-hrr-seen-p boundary) t)
-                    (handler-case
-                        (let ((hrr (decode-handshake wire)))
-                          (when (typep hrr 'tls13-hello-retry-request)
-                            (setf (quic-tls-boundary-selected-group boundary)
-                                  (tls13-hello-retry-request-selected-group hrr))
-                            (let ((cookie (find 44 (tls13-hello-retry-request-extensions hrr)
-                                             :key #'tls-extension-type)))
-                              (setf (quic-tls-boundary-cookie boundary)
-                                    (and cookie (tls-extension-data cookie))))))
-                      (tls13-error () nil)))
-                (%quic-transcript-add boundary wire))
-              (when (= type 2) (%quic-transcript-add boundary wire))
+                  (let ((message (decode-handshake wire)))
+                    (if (typep message 'tls13-hello-retry-request)
+                        (progn
+                          (when (quic-tls-boundary-hrr-seen-p boundary)
+                            (error 'quic-tls-boundary-error
+                                   :message "duplicate HelloRetryRequest"))
+                          (%quic-replace-transcript-for-hrr boundary)
+                          (setf (quic-tls-boundary-hrr-seen-p boundary) t
+                                (quic-tls-boundary-selected-group boundary)
+                                (tls13-hello-retry-request-selected-group message))
+                          (let ((cookie (find 44
+                                              (tls13-hello-retry-request-extensions message)
+                                              :key #'tls-extension-type)))
+                            (setf (quic-tls-boundary-cookie boundary)
+                                  (and cookie (tls-extension-data cookie))))
+                          (%quic-transcript-add boundary wire))
+                        (%quic-transcript-add boundary wire)))
+                  (%quic-transcript-add boundary wire))
               (let ((parameters (%quic-transport-parameters-from-message type body)))
                 (when parameters
                   (setf (quic-tls-boundary-received-transport-parameters boundary) parameters)
