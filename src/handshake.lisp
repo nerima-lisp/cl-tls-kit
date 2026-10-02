@@ -322,7 +322,7 @@
   random)
 (defun %valid-session-id (id) (%tls13-octets id) (when (> (length id) 32) (%tls13-fail "session id too long")) id)
 (defun %cipher-suites (suites)
-  (unless (and (vectorp suites) (evenp (length suites))) (%tls13-fail "cipher suite vector is malformed"))
+  (unless (and (vectorp suites) (plusp (length suites))) (%tls13-fail "cipher suite vector is malformed"))
   (every (lambda (x) (typep x '(integer 0 65535))) suites) suites)
 (defun %encode-cipher-suites (suites)
   (%encode-vector (apply #'%cat (map 'list #'%hs-u16 suites)) 2 :minimum 2))

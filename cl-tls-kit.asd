@@ -27,6 +27,7 @@
   :components ((:file "package") (:file "tests")
                (:file "key-schedule-tests") (:file "record-tests")
                (:file "handshake-tests") (:file "client-tests")
+               (:file "client-driver-tests")
                (:file "verification-tests") (:file "quic-boundary-tests")
                (:file "rfc8448-tests")
                (:file "runner"))

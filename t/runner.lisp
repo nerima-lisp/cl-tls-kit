@@ -10,6 +10,7 @@
                     run-record-tests
                     run-handshake-tests
                     run-client-tests
+                    run-client-driver-tests
                     run-verification-tests
                     run-quic-boundary-tests))
       (unless (funcall test)

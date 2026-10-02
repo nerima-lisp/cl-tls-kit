@@ -1,0 +1,57 @@
+(in-package #:cl-tls-kit/test)
+
+(defun run-client-driver-tests ()
+  (let* ((sent nil)
+         (provider
+           (cl-tls-kit::%make-tls13-crypto-provider
+            (lambda (hash salt ikm)
+              (declare (ignore salt ikm))
+              (make-array (if (eq hash :sha384) 48 32)
+                          :element-type '(unsigned-byte 8)))
+            (lambda (hash secret info length)
+              (declare (ignore hash secret info))
+              (make-array length :element-type '(unsigned-byte 8)))
+            (lambda (hash) (if (eq hash :sha384) 48 32))
+            (lambda (hash bytes)
+              (declare (ignore bytes))
+              (make-array (if (eq hash :sha384) 48 32)
+                          :element-type '(unsigned-byte 8)))
+            (lambda (hash key bytes)
+              (declare (ignore hash key))
+              (make-array 32 :element-type '(unsigned-byte 8)))
+            (lambda (algorithm key nonce plaintext aad)
+              (declare (ignore algorithm key nonce aad))
+              (concatenate '(vector (unsigned-byte 8)) plaintext #(0 0 0 0 0 0 0 0
+                                                                    0 0 0 0 0 0 0 0)))
+            (lambda (algorithm key nonce ciphertext aad)
+              (declare (ignore algorithm key nonce aad))
+              (subseq ciphertext 0 (- (length ciphertext) 16)))
+            (lambda (left right) (equalp left right))))
+         (driver
+           (cl-tls-kit:make-tls13-client-driver
+            :provider provider
+            :key-exchange (list :generate
+                                (lambda (group)
+                                  (declare (ignore group))
+                                  (values (make-array 32 :element-type '(unsigned-byte 8))
+                                          (make-array 32 :element-type '(unsigned-byte 8))))
+                                :shared-secret
+                                (lambda (group private public)
+                                  (declare (ignore group private public))
+                                  (make-array 32 :element-type '(unsigned-byte 8))))
+            :hostname "example.test"
+            :alpn '("h2")
+            :on-send (lambda (ignored wire)
+                       (declare (ignore ignored))
+                       (push wire sent)))))
+    (cl-tls-kit:tls13-client-driver-start driver)
+    (check (= (length sent) 1) "driver emits ClientHello")
+    (let ((hello (decode-handshake (first sent))))
+      (check (typep hello 'tls13-client-hello) "driver emits a ClientHello message")
+      (check (find 0 (tls13-client-hello-extensions hello)
+                   :key #'tls-extension-type)
+             "driver includes SNI")
+      (check (find 51 (tls13-client-hello-extensions hello)
+                   :key #'tls-extension-type)
+             "driver includes key_share"))
+  t))
