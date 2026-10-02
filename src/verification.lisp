@@ -123,19 +123,23 @@ Return the offered uint16 scheme identifiers in wire order."
   (cond ((functionp provider) provider)
         ((and (listp provider) (functionp (getf provider :verify-signature)))
          (getf provider :verify-signature))
-        ((let* ((package (or (find-package "CL-CRYPTO-KIT")
-                             (find-package "CRYPTO-KIT")))
-                (symbol (and package (find-symbol "VERIFY-SIGNATURE" package))))
-           (and symbol (fboundp symbol) symbol)))
+        ((%crypto-verify-function))
         (t (%tls13-verification-fail 'tls13-verification-provider-error
                                      :missing-verify-signature
                                      "provider has no verify-signature operation"))))
+
+(defun %tls13-crypto-scheme (scheme)
+  (or (cdr (assoc scheme *tls13-signature-scheme-names*))
+      (%tls13-verification-fail 'tls13-signature-algorithm-mismatch
+                                :unsupported-signature-scheme
+                                "unsupported CertificateVerify signature scheme #x~4,'0X"
+                                scheme)))
 
 (defun tls13-verify-certificate-verify
     (client-hello role public-key scheme signature transcript-hash provider)
   "Verify a TLS 1.3 CertificateVerify message.
 
-The provider is called as (PUBLIC-KEY SCHEME INPUT SIGNATURE), or defaults to
+The provider is called as (SCHEME PUBLIC-KEY INPUT SIGNATURE), or defaults to
 the loaded crypto provider, and must return true for a valid signature."
   (%tls13-verification-octets signature "CertificateVerify signature")
   (when (zerop (length signature))
@@ -149,7 +153,8 @@ the loaded crypto provider, and must return true for a valid signature."
   (let* ((input (tls13-certificate-verify-signature-input role transcript-hash))
          (verify-signature (%tls13-verify-signature-provider provider))
          (result (handler-case
-                     (funcall verify-signature public-key scheme input signature)
+                     (funcall verify-signature (%tls13-crypto-scheme scheme)
+                              public-key input signature)
                    (tls13-verification-error (condition) (error condition))
                    (error (condition)
                      (%tls13-verification-fail 'tls13-verification-provider-error

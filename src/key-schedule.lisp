@@ -54,6 +54,15 @@
     (%tls13-error "Crypto provider operation ~A is not callable" name))
   function)
 
+(defun %tls13-hash-length (provider hash)
+  (let ((length (funcall (%tls13-callable
+                         (tls13-crypto-provider-digest-length provider)
+                         "DIGEST-LENGTH")
+                         hash)))
+    (unless (and (integerp length) (plusp length))
+      (%tls13-error "Crypto provider returned an invalid digest length"))
+    length))
+
 (defun make-cl-crypto-kit-provider ()
   "Return a provider backed by the currently loaded CL-CRYPTO-KIT package.
 
@@ -107,20 +116,30 @@ dependency and does not refer to an uninterned package at read time."
   (%provider provider)
   (%require-octets secret "SECRET")
   (%require-octets context "CONTEXT")
-  (unless (and (stringp label) (<= (length label) 249))
-    (%tls13-error "LABEL must be a string of at most 249 characters"))
-  (unless (and (integerp length) (<= 0 length #xffff))
+  (unless (<= (length context) 255)
+    (%tls13-error "CONTEXT must contain at most 255 octets"))
+  (unless (and (stringp label) (plusp (length label)) (<= (length label) 249)
+               (every (lambda (character) (<= (char-code character) #xff)) label))
+    (%tls13-error "LABEL must be a non-empty string of at most 249 octets"))
+  (unless (and (integerp length) (<= 0 length) (<= length #xffff))
     (%tls13-error "LENGTH must be an integer between 0 and 65535"))
   (let* ((full-label (concatenate 'string "tls13 " label))
          (label-octets (make-array (length full-label)
-                                   :element-type '(unsigned-byte 8)
-                                   :initial-contents (map 'list #'char-code full-label)))
-         (info (%concat-octets (%u16 length)
+                                   :element-type '(unsigned-byte 8)))
+         (info nil)
+         (result nil))
+    (dotimes (index (length full-label))
+      (let ((code (char-code (char full-label index))))
+        (unless (<= code 127)
+          (%tls13-error "LABEL must contain ASCII characters"))
+        (setf (aref label-octets index) code)))
+    (setf info (%concat-octets (%u16 length)
                                (%u8 (length label-octets)) label-octets
-                               (%u8 (length context)) context))
-         (result (funcall (%tls13-callable (tls13-crypto-provider-hkdf-expand provider)
-                                           "HKDF-EXPAND")
-                          hash secret info length)))
+                               (%u8 (length context)) context)
+          result (funcall (%tls13-callable
+                           (tls13-crypto-provider-hkdf-expand provider)
+                           "HKDF-EXPAND")
+                          hash secret info length))
     (%require-octets result "HKDF-Expand-Label result")
     (unless (= (length result) length)
       (%tls13-error "Crypto provider returned ~D bytes, expected ~D" (length result) length))
@@ -129,11 +148,7 @@ dependency and does not refer to an uninterned package at read time."
 (defun tls13-derive-secret (provider hash secret label transcript-hash)
   "Perform Derive-Secret (RFC 8446 section 7.1)."
   (%provider provider)
-  (let ((hash-length (funcall (%tls13-callable
-                               (tls13-crypto-provider-digest-length provider)
-                               "DIGEST-LENGTH") hash)))
-    (unless (and (integerp hash-length) (plusp hash-length))
-      (%tls13-error "Crypto provider returned an invalid digest length"))
+  (let ((hash-length (%tls13-hash-length provider hash)))
     (tls13-hkdf-expand-label provider hash secret label transcript-hash hash-length)))
 
 (defun tls13-empty-hash (provider hash)
@@ -147,7 +162,8 @@ dependency and does not refer to an uninterned package at read time."
 
 (defun tls13-early-secret (provider hash &optional psk)
   "Derive the early secret from PSK, or the all-zero PSK when omitted."
-  (let* ((hash-length (funcall (tls13-crypto-provider-digest-length provider) hash))
+  (%provider provider)
+  (let* ((hash-length (%tls13-hash-length provider hash))
          (psk (or psk (make-array hash-length :element-type '(unsigned-byte 8)))))
     (tls13-hkdf-extract provider hash (make-array hash-length :element-type '(unsigned-byte 8)) psk)))
 
@@ -156,7 +172,7 @@ dependency and does not refer to an uninterned package at read time."
   (tls13-hkdf-extract provider hash
                        (tls13-hkdf-expand-label provider hash early-secret "derived"
                                                 (tls13-empty-hash provider hash)
-                                                (funcall (tls13-crypto-provider-digest-length provider) hash))
+                                                (%tls13-hash-length provider hash))
                        dhe-secret))
 
 (defun tls13-master-secret (provider hash handshake-secret)
@@ -164,7 +180,7 @@ dependency and does not refer to an uninterned package at read time."
   (tls13-hkdf-extract provider hash
                        (tls13-hkdf-expand-label provider hash handshake-secret "derived"
                                                 (tls13-empty-hash provider hash)
-                                                (funcall (tls13-crypto-provider-digest-length provider) hash))
+                                                (%tls13-hash-length provider hash))
                        (make-array 0 :element-type '(unsigned-byte 8))))
 
 (defun tls13-traffic-key-and-iv (provider hash traffic-secret key-length iv-length)
@@ -177,7 +193,7 @@ dependency and does not refer to an uninterned package at read time."
 (defun tls13-finished-key (provider hash base-key)
   (tls13-hkdf-expand-label provider hash base-key "finished"
                            (make-array 0 :element-type '(unsigned-byte 8))
-                           (funcall (tls13-crypto-provider-digest-length provider) hash)))
+                       (%tls13-hash-length provider hash)))
 
 (defun tls13-compute-finished-verify-data (provider hash finished-key transcript-hash)
   "Compute Finished verify_data through the provider HMAC boundary."
@@ -266,13 +282,13 @@ DIRECTION is :CLIENT or :SERVER. PHASE is :HANDSHAKE or :APPLICATION."
          (secret (tls13-hkdf-expand-label
                   provider hash (tls13-traffic-state-secret state)
                   "traffic upd" (make-array 0 :element-type '(unsigned-byte 8))
-                  (funcall (tls13-crypto-provider-digest-length provider) hash))))
-    (setf (tls13-traffic-state-secret state) secret)
+                  (%tls13-hash-length provider hash))))
     (multiple-value-bind (key iv)
         (tls13-traffic-key-and-iv provider hash secret
                                    (length (tls13-traffic-state-key state))
                                    (length (tls13-traffic-state-iv state)))
-      (setf (tls13-traffic-state-key state) key
+      (setf (tls13-traffic-state-secret state) secret
+            (tls13-traffic-state-key state) key
             (tls13-traffic-state-iv state) iv
             (tls13-traffic-state-sequence-number state) 0))
     state))

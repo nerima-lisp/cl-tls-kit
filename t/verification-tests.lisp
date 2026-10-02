@@ -30,14 +30,15 @@
                (progn (cl-tls-kit::tls13-validate-certificate-verify-algorithm hello #x0807) nil)
              (cl-tls-kit::tls13-signature-scheme-not-offered () t))
            "unoffered scheme has a reason-specific condition")
-    (check (handler-case
-               (progn (cl-tls-kit::tls13-verify-certificate-verify
-                       hello :server :key #x0804 signature hash nil)
-                      nil)
-             (cl-tls-kit::tls13-verification-provider-error (condition)
-               (eq (cl-tls-kit::tls13-verification-error-reason condition)
-                   :missing-verify-signature)))
-           "missing provider is rejected at the boundary")
+    (unless (find-package '#:crypto-kit)
+      (check (handler-case
+                 (progn (cl-tls-kit::tls13-verify-certificate-verify
+                         hello :server :key #x0804 signature hash nil)
+                        nil)
+               (cl-tls-kit::tls13-verification-provider-error (condition)
+                 (eq (cl-tls-kit::tls13-verification-error-reason condition)
+                     :missing-verify-signature)))
+             "missing provider is rejected at the boundary"))
     (check (handler-case
                (progn (cl-tls-kit::tls13-verify-certificate-verify
                        hello :server :key #x0804 #() hash nil)

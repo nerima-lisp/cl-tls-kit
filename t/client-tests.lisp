@@ -63,4 +63,38 @@
     (check (handler-case (progn (tls-kit::tls-client-start client) nil)
              (tls-kit::tls-client-verification-error () t))
            "verification failure is a client condition"))
+  (let ((writes '()) (hellos 0)
+        (client nil))
+    (setf client
+          (tls-kit::make-tls-client
+           :hostname "example.test" :alpn-offered '("h2")
+           :transport-write (lambda (ignored bytes)
+                              (declare (ignore ignored)) (push bytes writes))
+           :provider
+           (list :client-hello
+                 (lambda (ignored)
+                   (declare (ignore ignored))
+                   (incf hellos)
+                   (tls-kit::tls-client-make-client-hello
+                    client :key-share
+                    (list (cons #x001d (make-array 32
+                                                    :element-type '(unsigned-byte 8)
+                                                    :initial-element hellos)))))
+                 :handshake
+                 (lambda (ignored input)
+                   (declare (ignore ignored input))
+                   '(:state :awaiting-input)))))
+    (tls-kit::tls-client-start client)
+    (check (= hellos 1) "start emits the first ClientHello")
+    (let* ((hrr (make-tls13-hello-retry-request
+                 #x0303 #x001d '()))
+           (hrr-body (encode-hello-retry-request hrr))
+           (hrr-wire (concatenate '(vector (unsigned-byte 8))
+                                  #(2 0 0 0) hrr-body)))
+      (setf (aref hrr-wire 1) (ldb (byte 8 16) (length hrr-body))
+            (aref hrr-wire 2) (ldb (byte 8 8) (length hrr-body))
+            (aref hrr-wire 3) (ldb (byte 8 0) (length hrr-body)))
+      (tls-kit::tls-client-step client hrr-wire)
+      (check (= hellos 2) "HRR emits exactly one replacement ClientHello")
+      (check (= (length writes) 2) "ClientHello and HRR retry cross transport")) )
   t)

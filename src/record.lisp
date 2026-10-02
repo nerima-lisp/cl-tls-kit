@@ -130,9 +130,11 @@
   (check-type ciphertext-length (integer 0 #xffff))
   (unless (%valid-content-type-p content-type)
     (%record-fail 'tls-invalid-record "invalid content type"))
-  (vector content-type #x03 #x03
-          (ldb (byte 8 8) ciphertext-length)
-          (ldb (byte 8 0) ciphertext-length)))
+  (make-array 5 :element-type '(unsigned-byte 8)
+              :initial-contents
+              (list content-type #x03 #x03
+                    (ldb (byte 8 8) ciphertext-length)
+                    (ldb (byte 8 0) ciphertext-length))))
 
 (defun tls-record-nonce (iv sequence-number)
   "Compute the TLS 1.3 nonce: left-zero-padded sequence XOR static IV."
@@ -153,6 +155,13 @@
       (%record-fail 'tls-sequence-overflow "record sequence number exhausted")
       (1+ sequence-number)))
 
+(defun %ensure-sequence-available (sequence-number)
+  (unless (typep sequence-number '(unsigned-byte 64))
+    (%record-fail 'tls-sequence-overflow "sequence number is not uint64"))
+  (when (= sequence-number (1- (expt 2 64)))
+    (%record-fail 'tls-sequence-overflow "record sequence number exhausted"))
+  sequence-number)
+
 (defun %provider-result (provider key nonce input aad operation)
   (unless (functionp provider)
     (%record-fail 'tls-aead-error (format nil "~A provider is not callable" operation)))
@@ -170,6 +179,7 @@ number of zero octets added after the inner content type."
   (check-type plaintext tls-plaintext)
   (check-type padding-length (integer 0 #xffff))
   (check-type tag-length (integer 0 #xffff))
+  (%ensure-sequence-available sequence-number)
   (let* ((content (%record-octets (tls-plaintext-fragment plaintext)))
          (inner (concatenate '(vector (unsigned-byte 8)) content
                              (vector (tls-plaintext-content-type plaintext))
@@ -192,24 +202,31 @@ number of zero octets added after the inner content type."
                                    +tls-record-version+ cipher))
             (%next-sequence sequence-number))))
 
-(defun decrypt-tls-record (wire key iv sequence-number aead-decrypt)
+(defun decrypt-tls-record (wire key iv sequence-number aead-decrypt
+                           &key (tag-length 16))
   "Decrypt wire TLSCiphertext and return TLSPlaintext plus the next sequence."
+  (check-type tag-length (integer 0 #xffff))
+  (%ensure-sequence-available sequence-number)
   (let* ((record (decode-tls-ciphertext wire))
          (cipher (tls-ciphertext-fragment record))
+         (cipher-length (length cipher))
          (aad (tls-record-additional-data (tls-ciphertext-content-type record)
-                                          (length cipher)))
-         (plain (%provider-result aead-decrypt key
-                                  (tls-record-nonce iv sequence-number)
-                                  cipher aad 'decryption)))
-    (when (zerop (length plain))
-      (%record-fail 'tls-invalid-record "empty TLSInnerPlaintext"))
-    (let ((end (1- (length plain))))
-      (loop while (and (> end 0) (zerop (aref plain end))) do (decf end))
-      (let ((type (aref plain end)))
-        (unless (%valid-content-type-p type)
-          (%record-fail 'tls-invalid-record "invalid inner content type"))
-        (values (make-tls-plaintext type (subseq plain 0 end))
-                (%next-sequence sequence-number))))))
+                                          cipher-length)))
+    (when (< cipher-length (1+ tag-length))
+      (%record-fail 'tls-invalid-record
+                    "ciphertext is shorter than the AEAD tag and content type"))
+    (let ((plain (%provider-result aead-decrypt key
+                                   (tls-record-nonce iv sequence-number)
+                                   cipher aad 'decryption)))
+      (when (zerop (length plain))
+        (%record-fail 'tls-invalid-record "empty TLSInnerPlaintext"))
+      (let ((end (1- (length plain))))
+        (loop while (and (> end 0) (zerop (aref plain end))) do (decf end))
+        (let ((type (aref plain end)))
+          (unless (%valid-content-type-p type)
+            (%record-fail 'tls-invalid-record "invalid inner content type"))
+          (values (make-tls-plaintext type (subseq plain 0 end))
+                  (%next-sequence sequence-number)))))))
 
 (defun encrypt-tls13-record (plaintext provider algorithm key iv sequence-number
                              &key (padding-length 0) (tag-length 16))
@@ -225,13 +242,13 @@ number of zero octets added after the inner content type."
 (defun decrypt-tls13-record (wire provider algorithm key iv sequence-number
                              &key (tag-length 16))
   "Decrypt a record with a TLS13 crypto provider's AEAD-OPEN operation."
-  (declare (ignore tag-length))
   (unless (and (typep provider 'tls13-crypto-provider)
                (functionp (tls13-crypto-provider-aead-open provider)))
     (%record-fail 'tls-aead-error "provider has no AEAD-OPEN operation"))
   (decrypt-tls-record wire key iv sequence-number
                       (lambda (record-key nonce input aad)
-                        (tls13-aead-open provider algorithm record-key nonce input aad))))
+                        (tls13-aead-open provider algorithm record-key nonce input aad))
+                      :tag-length tag-length))
 
 (defun encrypt-tls13-traffic-record (plaintext state &key (padding-length 0)
                                      (tag-length 16))

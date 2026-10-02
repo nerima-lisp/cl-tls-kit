@@ -44,6 +44,10 @@
     (:client-finished-verify-data
      . "a8ec436d677634ae525ac1fcebe11a039ec17694fac6e98527b642f2edd5ce61")))
 
+(defparameter *rfc8448-client-finished-wire*
+  (rfc8448-%hex
+   "14000020a8ec436d677634ae525ac1fcebe11a039ec17694fac6e98527b642f2edd5ce61"))
+
 (defun rfc8448-%fixture (name)
   (let ((value (cdr (assoc name *rfc8448-simple-1rtt-client-fixture*))))
     (if (and (stringp value) (every (lambda (character)
@@ -117,8 +121,9 @@ is absent."
       (rfc8448-%check
        (cl-tls-kit:tls13-finished-key provider hash client-handshake-secret)
        (rfc8448-%fixture :client-finished-key) :client-finished-key)
-      ;; The trace's final Finished uses the transcript hash after the full
-      ;; handshake; this fixture currently supplies only the intermediate
-      ;; hashes, so the provider HMAC boundary is tested separately.
-      (format t "RFC 8448 Simple 1-RTT: PASS (Finished transcript assertion pending)~%")
+      (let ((finished (cl-tls-kit:decode-handshake *rfc8448-client-finished-wire*)))
+        (rfc8448-%check (cl-tls-kit:tls13-finished-verify-data finished)
+                        (rfc8448-%fixture :client-finished-verify-data)
+                        :client-finished-wire))
+      (format t "RFC 8448 Simple 1-RTT: PASS~%")
       t)))

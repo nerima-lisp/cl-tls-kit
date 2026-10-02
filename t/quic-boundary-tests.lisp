@@ -25,7 +25,7 @@
                                                   (push bytes transport)))
                         :initial (subseq wire 0 7)) nil)
                "partial CRYPTO input is retained")
-        (let ((server (make-quic-tls-boundary :role :server
+      (let ((server (make-quic-tls-boundary :role :server
                                                :on-transport-parameters
                                                (lambda (boundary bytes)
                                                  (declare (ignore boundary))
@@ -33,6 +33,17 @@
           (quic-tls-boundary-feed server :initial wire)
           (check (equalp (quic-tls-boundary-received-transport-parameters server) #(1 2 3))
                  "transport parameters cross the TLS extension boundary")))
+      (let* ((offset-wire (quic-tls-boundary-send
+                           (make-quic-tls-boundary :role :client)
+                           :initial 20 #(1 2 3)))
+             (server (make-quic-tls-boundary :role :server)))
+        (check (null (quic-tls-boundary-feed-crypto server :initial 5
+                                                     (subseq offset-wire 5)))
+               "out-of-order CRYPTO data waits for offset zero")
+        (let ((messages (quic-tls-boundary-feed-crypto server :initial 0
+                                                        (subseq offset-wire 0 5))))
+          (check (= (length messages) 1)
+                 "offset-aware CRYPTO data is reassembled")))
       (quic-tls-boundary-emit-secret boundary :handshake :write #(9 8))
       (check (equalp (first secrets) '(:handshake :write #(9 8)))
              "secret callback retains encryption level and direction")
@@ -62,6 +73,13 @@
         (quic-tls-boundary-feed client :initial hrr)
         (check (= (length (second (quic-tls-boundary-transcript client))) 6)
                "HRR receive path replaces the client transcript")
-        (check (= (quic-tls-boundary-selected-group client) #x001d)
+      (check (= (quic-tls-boundary-selected-group client) #x001d)
                "HRR receive path selects the requested key_share"))))
+  (let* ((body #(0 6 0 57 0 2 9 8))
+         (wire (concatenate '(vector (unsigned-byte 8)) #(8 0 0 8) body))
+         (boundary (make-quic-tls-boundary :role :client)))
+    (quic-tls-boundary-feed boundary :handshake wire)
+    (check (equalp (quic-tls-boundary-received-transport-parameters boundary)
+                   #(9 8))
+           "server EncryptedExtensions carries transport_parameters 0x0039"))
   t)

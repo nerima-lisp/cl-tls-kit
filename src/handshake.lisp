@@ -126,7 +126,7 @@
 
 (defun encode-sni-extension (hostname)
   "Encode one DNS host_name entry for the server_name extension."
-  (let ((name (%tls13-extension-string-octets hostname "SNI hostname")))
+  (let ((name (%tls13-extension-string-octets (normalize-hostname hostname) "SNI hostname")))
     (when (zerop (length name)) (%tls13-fail "SNI hostname cannot be empty"))
     (%cat (%hs-u16 (+ 3 (length name))) #(0)
           (%hs-u16 (length name)) name)))
@@ -152,6 +152,7 @@
                            (%cat (%hs-u8 (length octets)) octets)))
                        protocols)))
     (%encode-vector (apply #'%cat names) 2 :minimum 2)))
+
 (defun decode-alpn-extension (bytes)
   "Decode an ALPN extension and return protocol names in wire order."
   (let ((bytes (%tls13-octets bytes)))
@@ -163,6 +164,33 @@
             (setf cursor next)))
         (%finish bytes end)
         (nreverse protocols)))))
+
+(defun make-tls13-client-hello-extensions (hostname alpn protocols
+                                            &key (supported-groups #(29))
+                                              (signature-algorithms #(2052)))
+  "Build the SNI, ALPN, and key negotiation extensions for a ClientHello."
+  (declare (ignore protocols))
+  (let ((extensions
+          (list
+           (make-tls-extension +tls13-extension-supported-versions+ #(2 3 4))
+           (make-tls-extension +tls13-extension-supported-groups+
+                               (%encode-vector
+                                (apply #'%cat (map 'list #'%hs-u16 supported-groups)) 2))
+           (make-tls-extension +tls13-extension-signature-algorithms+
+                               (%encode-vector
+                                (apply #'%cat (map 'list #'%hs-u16 signature-algorithms)) 2))
+           (make-tls-extension +tls13-extension-key-share+
+                               (encode-key-share-extension
+                                (list (cons 29 (make-array 32
+                                                             :element-type '(unsigned-byte 8)
+                                                             :initial-element 0))))))))
+    (when hostname
+      (push (make-tls-extension +tls13-extension-server-name+
+                                (encode-sni-extension hostname)) extensions))
+    (when alpn
+      (push (make-tls-extension +tls13-extension-application-layer-protocol-negotiation+
+                                (encode-alpn-extension alpn)) extensions))
+    (nreverse extensions)))
 
 (export '(+tls13-cipher-suite-aes-128-gcm-sha256+
           +tls13-cipher-suite-aes-256-gcm-sha384+
@@ -362,7 +390,8 @@
    (make-tls13-server-hello (tls13-hello-retry-request-legacy-version hrr)
                             *tls13-hrr-random* #() 0
                             (cons (make-tls-extension 51 (%hs-u16 (tls13-hello-retry-request-selected-group hrr)))
-                                  (tls13-hello-retry-request-extensions hrr)))))
+                                  (remove 51 (tls13-hello-retry-request-extensions hrr)
+                                          :key #'tls-extension-type)))))
 
 (defun encode-encrypted-extensions (message) (%encode-extensions (tls13-encrypted-extensions-extensions message)))
 (defun decode-encrypted-extensions (bytes)
@@ -470,9 +499,10 @@
         #(0)
         (%tls13-octets transcript)))
 
-(defstruct (tls13-state (:constructor make-tls13-state (role &optional (phase :start))))
+(defstruct (tls13-state (:constructor make-tls13-state
+                                      (role &optional (phase :start) hash-function)))
   role phase (transcript (make-array 0 :element-type '(unsigned-byte 8)))
-  (retry-requested nil) (key-update-count 0))
+  (retry-requested nil) (key-update-count 0) transcript-hash-function hash-function)
 (defun %allowed-next-p (role phase type)
   (declare (ignore role))
   (case phase
@@ -493,6 +523,32 @@
           (20 :connected) (4 :connected) (24 :connected)))
   state)
 
+(defun tls13-state-advance-message (state message)
+  "Advance STATE using a decoded handshake MESSAGE.
+
+Unlike the numeric compatibility entry point, this recognizes a
+HelloRetryRequest as the special ServerHello it is on the wire."
+  (cond
+    ((typep message 'tls13-hello-retry-request)
+     (tls13-state-handle-hello-retry-request state message nil))
+    ((typep message 'tls13-server-hello)
+     (tls13-state-advance state 2))
+    ((typep message 'tls13-encrypted-extensions)
+     (tls13-state-advance state 8))
+    ((typep message 'tls13-certificate)
+     (tls13-state-advance state 11))
+    ((typep message 'tls13-certificate-request)
+     (tls13-state-advance state 13))
+    ((typep message 'tls13-certificate-verify)
+     (tls13-state-advance state 15))
+    ((typep message 'tls13-finished)
+     (tls13-state-advance state 20))
+    ((typep message 'tls13-new-session-ticket)
+     (tls13-state-advance state 4))
+    ((typep message 'tls13-key-update)
+     (tls13-state-advance state 24))
+    (t (%tls13-fail "unsupported handshake message" 'tls13-state-error))))
+
 (defun tls13-state-add-transcript (state handshake-bytes)
   "Append one complete encoded handshake message to STATE's transcript."
   (let ((bytes (%tls13-octets handshake-bytes)))
@@ -500,14 +556,26 @@
           (%cat (tls13-state-transcript state) bytes))))
 
 (defun tls13-state-handle-hello-retry-request (state hrr encoded-client-hello)
-  "Apply the TLS 1.3 HRR transcript marker and move back to ClientHello."
-  (declare (ignore hrr))
+  "Apply the TLS 1.3 HRR transcript marker and move back to ClientHello.
+
+The caller supplies the first ClientHello.  The transcript becomes
+message_hash(ClientHello) || HRR, as required by RFC 8446 section 4.4.1."
   (unless (and (eq (tls13-state-role state) :client)
                (eq (tls13-state-phase state) :server-hello))
     (%tls13-fail "HelloRetryRequest is not valid in this state" 'tls13-state-error))
+  (unless (tls13-state-retry-requested state)
+    (when (and (zerop (length (tls13-state-transcript state))) encoded-client-hello)
+      (tls13-state-add-transcript state encoded-client-hello))
+    (let* ((hash-function (tls13-state-transcript-hash-function state))
+           (hash (if hash-function
+                     (funcall hash-function (tls13-state-transcript state))
+                     (tls13-state-transcript state)))
+           (marker (concatenate '(vector (unsigned-byte 8))
+                                #(254 0 0 32) hash)))
+      (setf (tls13-state-transcript state) marker)))
   (setf (tls13-state-retry-requested state) t
         (tls13-state-phase state) :client-hello)
-  (tls13-state-add-transcript state encoded-client-hello)
+  (tls13-state-add-transcript state (encode-handshake 2 hrr))
   state)
 
 (export '(+tls13-extension-supported-groups+
@@ -518,4 +586,6 @@
           encode-key-share-server-extension decode-key-share-server-extension
           tls13-state-transcript tls13-state-retry-requested
           tls13-state-key-update-count tls13-state-add-transcript
-          tls13-state-handle-hello-retry-request))
+          tls13-state-handle-hello-retry-request tls13-state-advance-message))
+
+(export '(make-tls13-client-hello-extensions))

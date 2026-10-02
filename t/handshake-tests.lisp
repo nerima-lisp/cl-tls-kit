@@ -104,6 +104,29 @@
       (check (eq (tls13-state-phase state) :server-hello)
              "state accepts ServerHello")
       (check (handler-case (progn (tls13-state-advance state 1) nil)
-               (tls13-state-error () t))
+             (tls13-state-error () t))
              "state rejects an unexpected message"))
+    (let* ((client (make-tls-client :hostname "Example.TEST"
+                                    :alpn-offered '("h2" "http/1.1")))
+           (hello (tls-client-make-client-hello
+                   client :key-share (list (cons #x001d (make-array 32
+                                                                      :element-type '(unsigned-byte 8)
+                                                                      :initial-element 9))))))
+      (check (string= (decode-sni-extension
+                       (tls-extension-data
+                        (find +tls13-extension-server-name+
+                              (tls13-client-hello-extensions hello)
+                              :key #'tls-extension-type)))
+                      "example.test")
+             "ClientHello carries normalized SNI")
+      (check (equal (decode-alpn-extension
+                     (tls-extension-data
+                      (find +tls13-extension-application-layer-protocol-negotiation+
+                            (tls13-client-hello-extensions hello)
+                            :key #'tls-extension-type)))
+                    '("h2" "http/1.1"))
+             "ClientHello carries ALPN")
+      (check (typep (decode-client-hello (encode-client-hello hello))
+                    'tls13-client-hello)
+             "ClientHello with SNI and ALPN is wire-valid"))
     t))

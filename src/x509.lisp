@@ -135,7 +135,7 @@
 
 (defun %general-names (sequence)
   (mapcar (lambda (name)
-            (cons (case (der-tag name)
+            (list (case (der-tag name)
                     (#x81 :rfc822) (#x82 :dns) (#x86 :uri) (#x87 :ip)
                     (#xa4 :directory-name) (t :other))
                   (if (= (der-tag name) #x87)
@@ -161,11 +161,11 @@
          (let ((curve (and params (%oid (make-der :tag #x06 :content params :raw nil)))))
            (unless (member curve '("1.2.840.10045.3.1.7" "1.3.132.0.34") :test #'string=)
              (%fail "unsupported EC curve ~A" curve))
-           (make-x509-public-key :type :ec :algorithm oid :parameters curve
-                                 :data (der-content bits))))
+         (make-x509-public-key :type :ec :algorithm oid :parameters curve
+                                 :data (subseq (der-content bits) 1))))
         ((string= oid "1.3.101.112")
          (make-x509-public-key :type :ed25519 :algorithm oid :parameters params
-                               :data (der-content bits)))
+                               :data (subseq (der-content bits) 1)))
         (t (%fail "unsupported public-key algorithm ~A" oid))))))
 
 (defun %extension (d)
@@ -184,6 +184,27 @@
       (multiple-value-bind (oid critical value) (%extension ext)
         (push (cons oid (list :critical critical :value value)) result)))
     (nreverse result)))
+
+(defun %general-subtrees (sequence)
+  (mapcar (lambda (subtree)
+            (let ((base (first (%children subtree))))
+              (case (der-tag base)
+                (#x82 (list :dns (%string base)))
+                (#x87 (list :ip (der-content base)))
+                (t (list :unsupported base)))))
+          (%children sequence)))
+
+(defun %name-constraints (sequence)
+  (let ((permitted nil) (excluded nil))
+    (dolist (field (%children sequence))
+      (case (der-tag field)
+        (#xa0 (setf permitted (%general-subtrees (make-der :tag #x30
+                                                           :content (der-content field)
+                                                           :raw nil))))
+        (#xa1 (setf excluded (%general-subtrees (make-der :tag #x30
+                                                          :content (der-content field)
+                                                          :raw nil))))))
+    (list :permitted-subtrees permitted :excluded-subtrees excluded)))
 
 (defun %find-ext (extensions oid)
   (cdr (assoc oid extensions :test #'string=)))
@@ -214,7 +235,7 @@
             :key-usage (and ku (%key-usage (getf ku :value)))
             :extended-key-usage (and eku (mapcar #'%oid (%children (getf eku :value))))
             :subject-alternative-name (and san (%general-names (getf san :value)))
-            :name-constraints (and nc (getf nc :value))))))))
+            :name-constraints (and nc (%name-constraints (getf nc :value)))))))))
 
 (defun parse-certificate-der (der) (%parse-certificate (%octets der)))
 (defun parse-x509-certificate (input) (parse-certificate-der input))

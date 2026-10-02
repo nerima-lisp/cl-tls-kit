@@ -3,6 +3,16 @@
 (defun record-test-check (condition message)
   (unless condition (error "Record test failed: ~A" message)))
 
+(defun %record-provider ()
+  (and (find-package '#:crypto-kit)
+       (make-cl-crypto-kit-provider)))
+
+(defun %record-tamper (wire)
+  (let ((copy (copy-seq wire)))
+    (setf (aref copy (1- (length copy)))
+          (logxor (aref copy (1- (length copy))) 1))
+    copy))
+
 (defun run-record-tests ()
   (let* ((payload #(1 2 3))
          (plain (make-tls-plaintext 23 payload))
@@ -32,7 +42,8 @@
              wire :key iv 0
              (lambda (key nonce ciphertext additional-data)
                (declare (ignore key nonce additional-data))
-               (subseq ciphertext 0 (- (length ciphertext) 2))))
+               (subseq ciphertext 0 (- (length ciphertext) 2)))
+             :tag-length 2)
           (record-test-check (= decrypt-next 1) "sequence increments after decryption")
           (record-test-check (equalp (tls-plaintext-fragment decoded) payload)
                              "encrypted padding is removed")
@@ -55,4 +66,55 @@
     (record-test-check (not (tls-close-notify-p
                              (make-tls-plaintext 21 #(2 0))))
                        "reject fatal close_notify shape")
+    (record-test-check (not (tls-close-notify-p
+                             (make-tls-plaintext 21 #(1 0 0))))
+                       "reject padded close_notify shape")
+    (let ((provider (%record-provider)))
+      (when provider
+        (dolist (algorithm '(:aes-128-gcm :chacha20-poly1305))
+          (let* ((key-length (if (eq algorithm :chacha20-poly1305) 32 16))
+                 (secret (make-array 32 :element-type '(unsigned-byte 8)
+                                     :initial-element #x5a))
+                 (sender (cl-tls-kit::make-tls13-traffic-state provider :sha256 algorithm
+                                                              secret key-length 12))
+                 (receiver (cl-tls-kit::make-tls13-traffic-state provider :sha256 algorithm
+                                                                secret key-length 12))
+                 (plain (make-tls-plaintext 23 #(9 8 7 6))))
+            (multiple-value-bind (wire ignored)
+                (cl-tls-kit::encrypt-tls13-traffic-record plain sender)
+              (declare (ignore ignored))
+              (multiple-value-bind (decoded ignored)
+                  (cl-tls-kit::decrypt-tls13-traffic-record wire receiver)
+                (declare (ignore ignored))
+                (record-test-check (equalp (tls-plaintext-fragment decoded)
+                                           #(9 8 7 6))
+                                   "real AEAD round trip"))
+              (record-test-check
+               (handler-case
+                   (progn (cl-tls-kit::decrypt-tls13-traffic-record (%record-tamper wire) receiver)
+                          nil)
+                 (tls-aead-error () t)
+                 (tls-invalid-record () t))
+               "real AEAD rejects tampering")
+              (record-test-check (= (cl-tls-kit::tls13-traffic-state-sequence-number receiver) 1)
+                                 "failed authentication does not advance sequence")
+              (cl-tls-kit::tls13-update-traffic-secret sender)
+              (cl-tls-kit::tls13-update-traffic-secret receiver)
+              (record-test-check
+               (handler-case
+                   (progn (cl-tls-kit::decrypt-tls13-traffic-record wire receiver) nil)
+                 (tls-aead-error () t)
+                 (tls-invalid-record () t))
+               "updated traffic keys reject old ciphertext")
+              (multiple-value-bind (updated-wire ignored)
+                  (cl-tls-kit::encrypt-tls13-traffic-record plain sender)
+                (declare (ignore ignored))
+                (multiple-value-bind (decoded ignored)
+                    (cl-tls-kit::decrypt-tls13-traffic-record updated-wire receiver)
+                  (declare (ignore ignored))
+                  (record-test-check (equalp (tls-plaintext-fragment decoded)
+                                             #(9 8 7 6))
+                                     "updated traffic keys interoperate")
+                  (record-test-check (= (cl-tls-kit::tls13-traffic-state-sequence-number receiver) 1)
+                                     "KeyUpdate starts a fresh sequence"))))))))
     t))

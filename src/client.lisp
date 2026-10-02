@@ -39,17 +39,19 @@
 
 (defstruct (tls-client (:constructor %make-tls-client))
   transport-read transport-write
+  transport-close
   provider record-protect record-unprotect key-schedule
-  verify-certificate alpn-offered alpn peer-certificate
+  verify-certificate hostname alpn-offered alpn peer-certificate
+  client-hello (client-hello-count 0)
   quic-message-callback quic-secret-callback
   (state :new) expected-message
   (transcript (make-array 0 :element-type '(unsigned-byte 8)))
   (hrr-seen nil) (key-update-count 0) close-notify-received)
 
-(defun make-tls-client (&key transport-read transport-write transport
+(defun make-tls-client (&key transport-read transport-write transport transport-close
                               provider record-protect record-unprotect
                               key-schedule verify-certificate
-                              alpn-offered quic-message-callback
+                              hostname alpn-offered alpn quic-message-callback
                               quic-secret-callback)
   "Create a TLS 1.3 client boundary around callable provider operations.
 
@@ -62,11 +64,14 @@ record to pass to the transport write callback."
   (let ((read (or transport-read (getf transport :read)))
         (write (or transport-write (getf transport :write))))
     (%make-tls-client :transport-read read :transport-write write
+                      :transport-close (or transport-close (getf transport :close))
                       :provider provider :record-protect record-protect
                       :record-unprotect record-unprotect
                       :key-schedule key-schedule
                       :verify-certificate verify-certificate
+                      :hostname (and hostname (normalize-hostname hostname))
                       :alpn-offered (copy-list alpn-offered)
+                      :alpn alpn
                       :quic-message-callback quic-message-callback
                       :quic-secret-callback quic-secret-callback)))
 
@@ -112,6 +117,20 @@ record to pass to the transport write callback."
   (setf (tls-client-state client) :handshake
         (tls-client-expected-message client) :server-hello)
   (%call-key-schedule client :start)
+  (let ((hello-callback (%provider-callback client :client-hello)))
+    (when hello-callback
+      (let* ((hello-result (funcall hello-callback client))
+             (hello (if (and (listp hello-result) (getf hello-result :message))
+                        (getf hello-result :message)
+                        hello-result)))
+        (unless (typep hello 'tls13-client-hello)
+          (%client-fail client :start :invalid-client-hello))
+        (setf (tls-client-client-hello client) hello)
+        (incf (tls-client-client-hello-count client))
+        (let ((wire (encode-handshake 1 hello)))
+          (%client-transcript-add client wire)
+          (when (tls-client-transport-write client)
+            (funcall (tls-client-transport-write client) client wire))))))
   (let ((callback (%provider-callback client :handshake)))
     (when callback (%apply-provider-result client (funcall callback client :start))))
   client)
@@ -124,11 +143,13 @@ record to pass to the transport write callback."
         ((typep message 'tls13-certificate) :certificate)
         ((typep message 'tls13-certificate-verify) :certificate-verify)
         ((typep message 'tls13-finished) :finished)
+        ((typep message 'tls13-certificate-request) :certificate-request)
         ((typep message 'tls13-key-update) :key-update)
         (t nil)))
 
 (defun %client-message-number (type)
-  (case type (:client-hello 1) (:server-hello 2) (:encrypted-extensions 8)
+  (case type (:client-hello 1) (:server-hello 2) (:hello-retry-request 2)
+    (:encrypted-extensions 8)
     (:certificate 11) (:certificate-request 13) (:certificate-verify 15)
     (:finished 20) (:new-session-ticket 4) (:key-update 24)))
 
@@ -139,12 +160,27 @@ record to pass to the transport write callback."
             (concatenate '(vector (unsigned-byte 8))
                          (tls-client-transcript client) bytes)))))
 
+(defun %client-hrr-transcript (client hrr-wire)
+  "Replace the initial ClientHello transcript with RFC 8446 message_hash."
+  (let* ((provider (tls-client-provider client))
+         (digest (and (listp provider) (getf provider :digest)))
+         (hash (if digest
+                   (funcall digest :sha256 (tls-client-transcript client))
+                   (tls-client-transcript client))))
+    (setf (tls-client-transcript client)
+          (concatenate '(vector (unsigned-byte 8))
+                       #(254 0 0 32) hash hrr-wire))))
+
 (defun %client-advance-message (client type)
   (let ((expected (tls-client-expected-message client)))
     (when (and expected (not (eql type expected)))
       ;; KeyUpdate and post-handshake tickets are legal after Finished.
-      (unless (and (eq (tls-client-state client) :connected)
-                   (member type '(:key-update :new-session-ticket)))
+      (unless (or (and (eq expected :server-hello)
+                    (eq type :hello-retry-request))
+                  (and (eq expected :certificate)
+                       (eq type :certificate-request))
+                  (and (eq (tls-client-state client) :connected)
+                       (member type '(:key-update :new-session-ticket))))
         (error 'unexpected-message :client client :message type :expected expected)))
     (case type
       (:server-hello (setf (tls-client-expected-message client) :encrypted-extensions))
@@ -153,6 +189,7 @@ record to pass to the transport write callback."
        (setf (tls-client-hrr-seen client) t
              (tls-client-expected-message client) :server-hello))
       (:encrypted-extensions (setf (tls-client-expected-message client) :certificate))
+      (:certificate-request nil)
       (:certificate (setf (tls-client-expected-message client) :certificate-verify))
       (:certificate-verify (setf (tls-client-expected-message client) :finished))
       (:finished (setf (tls-client-state client) :connected
@@ -209,13 +246,135 @@ record to pass to the transport write callback."
   (unless (member (tls-client-state client) '(:handshake :awaiting-server))
     (%client-fail client :step :not-in-handshake))
   (when input
+    (when (and (vectorp input) (>= (length input) 4))
+      (setf input (decode-handshake input)))
     (let ((type (%message-type input)))
+      (unless type
+        (%client-fail client :step :unsupported-message))
       (%client-advance-message client type)
-      (when (and (vectorp input) (>= (length input) 4))
-        (%client-transcript-add client input))))
+      (when (typep input 'tls13-hello-retry-request)
+        (setf (tls-client-expected-message client) :server-hello))
+      (when (typep input 'tls13-server-hello)
+        (tls-client-check-server-random client
+                                         (tls13-server-hello-random input)))
+      (when (typep input 'tls13-certificate-request)
+        (setf (tls-client-expected-message client) :certificate))
+      (when (typep input 'tls13-encrypted-extensions)
+        (let ((extension (find +tls13-extension-application-layer-protocol-negotiation+
+                                (tls13-encrypted-extensions-extensions input)
+                                :key #'tls-extension-type)))
+          (when extension
+            (setf (tls-client-alpn client)
+                  (first (decode-alpn-extension (tls-extension-data extension)))))))
+      (when (and (not (listp input))
+                 (or (typep input 'tls13-server-hello)
+                (typep input 'tls13-hello-retry-request)
+                (typep input 'tls13-encrypted-extensions)
+                (typep input 'tls13-certificate)
+                (typep input 'tls13-certificate-request)
+                (typep input 'tls13-certificate-verify)
+                (typep input 'tls13-finished)
+                (typep input 'tls13-key-update)))
+        (let ((wire (if (typep input 'tls13-hello-retry-request)
+                        (let ((body (encode-hello-retry-request input)))
+                          (concatenate '(vector (unsigned-byte 8))
+                                       #(2 0 0 0) body))
+                        (encode-handshake (%client-message-number type) input))))
+          (when (typep input 'tls13-hello-retry-request)
+            (let ((length (- (length wire) 4)))
+              (setf (aref wire 1) (ldb (byte 8 16) length)
+                    (aref wire 2) (ldb (byte 8 8) length)
+                    (aref wire 3) (ldb (byte 8 0) length))))
+          (if (typep input 'tls13-hello-retry-request)
+              (%client-hrr-transcript client wire)
+              (%client-transcript-add client wire))))))
+    (when (typep input 'tls13-hello-retry-request)
+      (let ((hello-callback (%provider-callback client :client-hello)))
+        (unless hello-callback (%client-fail client :step :missing-retry-client-hello))
+        (let ((hello (funcall hello-callback client)))
+          (unless (typep hello 'tls13-client-hello)
+            (%client-fail client :step :invalid-retry-client-hello))
+          (setf (tls-client-client-hello client) hello)
+          (incf (tls-client-client-hello-count client))
+          (let ((wire (encode-handshake 1 hello)))
+            (%client-transcript-add client wire)
+            (when (tls-client-transport-write client)
+              (funcall (tls-client-transport-write client) client wire))))))
   (let ((callback (%provider-callback client :handshake)))
     (unless callback (%client-fail client :step :missing-handshake-callback))
     (%apply-provider-result client (funcall callback client input))))
+
+(defun tls-client-make-client-hello (client &key random session-id cipher-suites
+                                             supported-groups key-share
+                                             signature-algorithms)
+  "Build a TLS 1.3 ClientHello carrying the configured SNI and ALPN.
+The KEY-SHARE value is supplied by the crypto/provider integration."
+  (let ((extensions
+          (list (make-tls-extension +tls13-extension-supported-versions+ #(0 2 3 4))
+                (make-tls-extension +tls13-extension-supported-groups+
+                                     (%encode-vector
+                                      (apply #'%cat
+                                             (mapcar #'%hs-u16 (or supported-groups '(#x001d))))
+                                      2))
+                (make-tls-extension +tls13-extension-key-share+
+                                     (encode-key-share-extension
+                                      (or key-share (list (cons #x001d #()))))))))
+    (when (tls-client-hostname client)
+      (push (make-tls-extension +tls13-extension-server-name+
+                                (encode-sni-extension (tls-client-hostname client)))
+            extensions))
+    (when (tls-client-alpn-offered client)
+      (push (make-tls-extension +tls13-extension-application-layer-protocol-negotiation+
+                                (encode-alpn-extension (tls-client-alpn-offered client)))
+            extensions))
+    (when signature-algorithms
+      (push (make-tls-extension +tls13-extension-signature-algorithms+
+                                (%client-u16-list signature-algorithms)) extensions))
+    (make-tls13-client-hello #x0303
+                             (or random (make-array 32 :element-type '(unsigned-byte 8)
+                                                     :initial-element 0))
+                             (or session-id #())
+                             (or cipher-suites #( #x1301 #x1303))
+                             (nreverse extensions))))
+
+(defun %client-u16-list (values)
+  (let ((body (make-array (* 2 (length values)) :element-type '(unsigned-byte 8))))
+    (loop for value in values for i from 0
+          do (setf (aref body (* 2 i)) (ldb (byte 8 8) value)
+                   (aref body (1+ (* 2 i))) (ldb (byte 8 0) value)))
+    (%encode-vector body 2 :minimum 2)))
+
+(defun %tls-client-stream-record-reader (stream)
+  (let ((header (make-array 5 :element-type '(unsigned-byte 8))))
+    (unless (= (read-sequence header stream) 5) (return-from %tls-client-stream-record-reader nil))
+    (let* ((length (+ (ash (aref header 3) 8) (aref header 4)))
+           (body (make-array length :element-type '(unsigned-byte 8))))
+      (unless (= (read-sequence body stream) length) (%client-fail nil :read :truncated-record))
+      (concatenate '(vector (unsigned-byte 8)) header body))))
+
+(defun make-tls-client-over-tcp (host port &rest args &key &allow-other-keys)
+  "Open a blocking SBCL TCP stream and return a client using TLS records on it.
+This is the portable entry in this minimal implementation; non-SBCL images
+must provide TRANSPORT callbacks directly to MAKE-TLS-CLIENT."
+  (unless (find-package '#:sb-bsd-sockets)
+    (require :sb-bsd-sockets))
+  (let* ((socket (funcall (find-symbol "MAKE-INET-SOCKET" '#:sb-bsd-sockets)
+                          :stream :tcp))
+         (address (funcall (find-symbol "NAME-SERVICE-GET-HOST-BY-NAME" '#:sb-bsd-sockets) host))
+         (connect (find-symbol "SOCKET-CONNECT" '#:sb-bsd-sockets)))
+    (funcall connect socket
+             (funcall (find-symbol "HOST-ENT-ADDRESS" '#:sb-bsd-sockets) address) port)
+    (let ((stream (funcall (find-symbol "SOCKET-MAKE-STREAM" '#:sb-bsd-sockets) socket
+                           :input t :output t :element-type '(unsigned-byte 8))))
+      (apply #'make-tls-client
+             :transport-read (lambda (client) (declare (ignore client))
+                              (%tls-client-stream-record-reader stream))
+             :transport-write (lambda (client bytes) (declare (ignore client))
+                                (write-sequence bytes stream) (finish-output stream))
+             :transport-close (lambda (client) (declare (ignore client))
+                                (close stream)
+                                (funcall (find-symbol "SOCKET-CLOSE" '#:sb-bsd-sockets) socket))
+             args))))
 
 (defun tls-client-read (client)
   (unless (eq (tls-client-state client) :connected)
@@ -259,7 +418,9 @@ record to pass to the transport write callback."
         (let ((record (funcall callback client)))
           (when record
             (funcall (tls-client-transport-write client) client record)))))
-    (setf (tls-client-state client) :closed))
+    (setf (tls-client-state client) :closed)
+    (when (tls-client-transport-close client)
+      (funcall (tls-client-transport-close client) client)))
   client)
 
 (defun tls-client-key-update (client &optional (request 0))

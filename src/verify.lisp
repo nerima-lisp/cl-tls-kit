@@ -24,7 +24,8 @@
 
 (defun %field (object key &optional default)
   (cond ((hash-table-p object) (gethash key object default))
-        ((and (listp object) (or (null object) (keywordp (first object)))) (getf object key default))
+        ((and (listp object) (or (null object) (keywordp (first object))))
+         (getf object key default))
         ((listp object) (or (cdr (assoc key object)) default))
         ((typep object 'cl-tls-kit.x509:x509-certificate)
          (case key
@@ -41,6 +42,7 @@
            (:extended-key-usage (cl-tls-kit.x509:x509-certificate-extended-key-usage object))
            (:subject-alternative-names (cl-tls-kit.x509:x509-certificate-subject-alternative-name object))
            (:subject-alternative-name (cl-tls-kit.x509:x509-certificate-subject-alternative-name object))
+           (:name-constraints (cl-tls-kit.x509:x509-certificate-name-constraints object))
            (otherwise default)))
         (t default)))
 
@@ -49,11 +51,12 @@
         (not-after (%field certificate :not-after most-positive-fixnum)))
     (and (<= not-before now) (<= now not-after))))
 
+(defun %token (value)
+  (coerce (remove-if (lambda (character) (find character "-_ "))
+                     (string-downcase (string value))) 'string))
+
 (defun %has-p (value item)
-  (some (lambda (x)
-          (or (string-equal (string x) (string item))
-              (and (string-equal (string item) "server-auth")
-                   (string= (string x) "1.3.6.1.5.5.7.3.1")))) value))
+  (some (lambda (x) (string= (%token x) (%token item))) value))
 
 (defun %same-name-p (left right)
   (or (equalp left right)
@@ -62,19 +65,59 @@
                     (cl-tls-kit.x509:x509-name-string right)))))
 
 (defun %crypto-verify-function ()
-  (dolist (package-name '("CL-CRYPTO-KIT" "CRYPTO-KIT"))
-    (let* ((package (find-package package-name))
-           (symbol (and package (find-symbol "VERIFY-SIGNATURE" package))))
-      (when (and symbol (fboundp symbol)) (return-from %crypto-verify-function symbol))))
-  nil)
+  (let* ((package (or (find-package "CRYPTO-KIT")
+                      (find-package "CL-CRYPTO-KIT")))
+         (symbol (and package (find-symbol "VERIFY-SIGNATURE" package))))
+    (and symbol (fboundp symbol) symbol)))
+
+(defun %signature-scheme (certificate issuer)
+  (let ((algorithm (%field certificate :signature-algorithm)))
+    (if (keywordp algorithm)
+        algorithm
+        (cond
+          ((string= algorithm "1.2.840.113549.1.1.11") :rsa-pkcs1-sha256)
+          ((string= algorithm "1.2.840.113549.1.1.12") :rsa-pkcs1-sha384)
+          ((string= algorithm "1.2.840.113549.1.1.13") :rsa-pkcs1-sha512)
+          ((string= algorithm "1.2.840.113549.1.1.10") :rsa-pss-rsae-sha256)
+          ((string= algorithm "1.2.840.10045.4.3.2") :ecdsa-p256-sha256)
+          ((string= algorithm "1.2.840.10045.4.3.3") :ecdsa-p384-sha384)
+          ((string= algorithm "1.2.840.10045.4.3.4") :ecdsa-p521-sha512)
+          ((string= algorithm "1.3.101.112") :ed25519)
+          (t (error 'bad-signature :certificate certificate))))))
+
+(defun %crypto-public-key (key)
+  (if (not (typep key 'cl-tls-kit.x509:x509-public-key))
+      key
+      (let* ((package (find-package "CRYPTO-KIT"))
+             (constructor (and package
+                               (find-symbol
+                                (ecase (cl-tls-kit.x509:x509-public-key-type key)
+                                  (:rsa "MAKE-RSA-PUBLIC-KEY")
+                                  (:ec "MAKE-EC-PUBLIC-KEY")
+                                  (:ed25519 "MAKE-ED25519-PUBLIC-KEY"))
+                                package))))
+        (unless (and constructor (fboundp constructor))
+          (error 'certificate-signature-provider-unavailable :certificate key))
+        (case (cl-tls-kit.x509:x509-public-key-type key)
+          (:rsa (funcall constructor
+                         (cl-tls-kit.x509:x509-rsa-public-key-modulus key)
+                         (cl-tls-kit.x509:x509-rsa-public-key-exponent key)))
+          (:ec (funcall constructor
+                        (if (string= (cl-tls-kit.x509:x509-ec-public-key-curve key)
+                                     "1.3.132.0.34") :p384 :p256)
+                        (cl-tls-kit.x509:x509-ec-public-key-point key)))
+          (:ed25519 (funcall constructor
+                             (cl-tls-kit.x509:x509-ed25519-public-key-point key)))))))
 
 (defun %verify-signature (certificate issuer verify-signature)
   (let ((function (or verify-signature (%crypto-verify-function))))
-    (unless (and function (fboundp function))
+    (unless (and function (or (functionp function) (fboundp function)))
       (error 'certificate-signature-provider-unavailable :certificate certificate))
     (unless (handler-case
-                (funcall function (%field certificate :signature-algorithm)
-                         (%field issuer :public-key) (%field certificate :tbs-certificate)
+                (funcall function
+                         (%signature-scheme certificate issuer)
+                         (%crypto-public-key (%field issuer :public-key))
+                         (%field certificate :tbs-certificate)
                          (%field certificate :signature))
               (error () nil))
       (error 'bad-signature :certificate certificate))))
@@ -83,30 +126,79 @@
   (let ((constraints (%field certificate :basic-constraints nil)))
     (if (and constraints (listp constraints)) (getf constraints key default) default)))
 
+(defun %ip-octets-p (value)
+  (and (vectorp value) (= (array-rank value) 1)
+       (member (length value) '(4 16))
+       (every (lambda (octet) (typep octet '(unsigned-byte 8))) value)))
+
+(defun %constraint-match-p (entry san)
+  (let* ((kind (and (consp entry) (first entry)))
+         (constraint (and (consp entry) (second entry)))
+         (san-kind (and (consp san) (first san)))
+         (value (if (and (consp san) (consp (rest san))) (second san) san)))
+    (cond
+      ((and (eq kind :dns) (eq san-kind :dns) (stringp constraint) (stringp value))
+       (let* ((base (string-downcase constraint))
+              (name (string-downcase value))
+              (base (if (and (plusp (length base)) (char= (char base 0) #\.))
+                        (subseq base 1) base)))
+         (or (string= name base)
+             (and (> (length name) (length base))
+                  (string= name base :start1 (- (length name) (length base)))
+                  (char= (char name (- (length name) (length base) 1)) #\.)))))
+      ((and (eq kind :ip) (eq san-kind :ip)
+            (%ip-octets-p constraint) (%ip-octets-p value)
+            (= (length constraint) (* 2 (length value))))
+       (let ((address (subseq constraint 0 (length value)))
+             (mask (subseq constraint (length value))))
+         (every (lambda (a b m) (= (logand a m) (logand b m))) value address mask)))
+      (t nil))))
+
+(defun %check-name-constraints (certificate issuer)
+  (let* ((constraints (%field issuer :name-constraints nil))
+         (names (%field certificate :subject-alternative-names nil))
+         (permitted (and constraints (getf constraints :permitted-subtrees)))
+         (excluded (and constraints (getf constraints :excluded-subtrees))))
+    (when constraints
+      (when (some (lambda (entry) (some (lambda (san) (%constraint-match-p entry san)) names))
+                  excluded)
+        (error 'invalid-certificate-chain :certificate certificate))
+      (dolist (kind '(:dns :ip))
+        (let ((rules (remove-if-not (lambda (entry) (eq (first entry) kind)) permitted))
+              (values (remove-if-not (lambda (san) (eq (first san) kind)) names)))
+          (when (and rules (not (some (lambda (san)
+                                        (some (lambda (entry) (%constraint-match-p entry san)) rules))
+                                      values)))
+            (error 'invalid-certificate-chain :certificate certificate)))))))
+
 (defun %check-certificate (certificate issuer ca-depth now verify-signature)
-  (unless (%time-ok-p certificate now) (error 'certificate-expired :certificate certificate))
+  (unless (%time-ok-p certificate now)
+    (error 'certificate-expired :certificate certificate))
   (when issuer
     (unless (%same-name-p (%field certificate :issuer nil) (%field issuer :subject nil))
       (error 'invalid-certificate-chain :certificate certificate))
+    (%check-name-constraints certificate issuer)
     (%verify-signature certificate issuer verify-signature)
-    (unless (eq t (%basic-constraint issuer :ca nil)) (error 'not-a-ca :certificate issuer))
+    (unless (eq t (%basic-constraint issuer :ca nil))
+      (error 'not-a-ca :certificate issuer))
     (let ((usage (%field issuer :key-usage nil)))
       (when (and usage (not (%has-p usage :key-cert-sign)))
         (error 'invalid-key-usage :certificate issuer)))
     (let ((limit (%basic-constraint issuer :path-length nil)))
-      (when (and limit (> ca-depth limit)) (error 'path-length-exceeded :certificate issuer)))))
+      (when (and limit (> ca-depth limit))
+        (error 'path-length-exceeded :certificate issuer)))))
 
 (defun verify-certificate-chain (chain &key hostname trust-anchors
                                            (now (get-universal-time)) verify-signature)
-  "Verify a leaf-first CHAIN. VERIFY-SIGNATURE takes algorithm, public key,
-TBS bytes, and signature bytes, and defaults to a loaded crypto provider."
+  "Verify a leaf-first CHAIN using crypto-kit's common VERIFY-SIGNATURE API.
+VERIFY-SIGNATURE, when supplied, has the same four-argument contract."
   (unless chain (error 'untrusted-root :certificate nil))
   (loop for certificate in chain
         for issuer in (append (rest chain) '(nil))
         for index from 0
         do (%check-certificate certificate issuer
                                (count-if (lambda (item) (%field item :basic-constraints nil))
-                                         (nthcdr (1+ index) chain))
+                                         (nthcdr (+ index 2) chain))
                                now verify-signature))
   (let* ((leaf (first chain)) (root (car (last chain))))
     (unless (and trust-anchors (member root trust-anchors :test #'equalp))
@@ -114,7 +206,8 @@ TBS bytes, and signature bytes, and defaults to a loaded crypto provider."
           (error 'self-signed-certificate :certificate root)
           (error 'untrusted-root :certificate root)))
     (let ((eku (%field leaf :extended-key-usage nil)))
-      (when (and eku (not (%has-p eku :server-auth)))
+      (when (and eku (not (or (%has-p eku :server-auth)
+                              (%has-p eku :any-extended-key-usage))))
         (error 'invalid-extended-key-usage :certificate leaf)))
     (when hostname
       (unless (hostname-match-p hostname (%field leaf :subject-alternative-names nil))

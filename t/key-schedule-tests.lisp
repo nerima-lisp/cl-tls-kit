@@ -80,4 +80,21 @@
                                    (search "traffic upd" (map 'string #'code-char info)))
                                  expanded-labels)
                            "traffic secret ratchet uses traffic upd label")))
+    (when (find-package '#:crypto-kit)
+      (let* ((secret (make-array 32 :element-type '(unsigned-byte 8)
+                                 :initial-element #x42))
+             (state (cl-tls-kit::make-tls13-traffic-state
+                     provider :sha256 :aes-128-gcm secret 16 12))
+             (old-secret (copy-seq (cl-tls-kit::tls13-traffic-state-secret state)))
+             (old-key (copy-seq (cl-tls-kit::tls13-traffic-state-key state))))
+        (setf (cl-tls-kit::tls13-traffic-state-sequence-number state) 11)
+        (cl-tls-kit::tls13-update-traffic-secret state)
+        (record-test-check (not (equalp old-secret
+                                        (cl-tls-kit::tls13-traffic-state-secret state)))
+                           "real provider changes the traffic secret")
+        (record-test-check (not (equalp old-key
+                                        (cl-tls-kit::tls13-traffic-state-key state)))
+                           "real provider changes the traffic key")
+        (record-test-check (zerop (cl-tls-kit::tls13-traffic-state-sequence-number state))
+                           "real provider ratchet resets sequence")))
     t))

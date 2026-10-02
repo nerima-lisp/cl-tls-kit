@@ -53,7 +53,8 @@
    #:tls13-certificate-entry #:make-tls13-certificate-entry
    #:tls13-certificate #:make-tls13-certificate #:tls13-certificate-entries
    #:tls13-certificate-verify #:make-tls13-certificate-verify
-   #:tls13-finished #:make-tls13-finished #:tls13-new-session-ticket
+   #:tls13-finished #:make-tls13-finished #:tls13-finished-verify-data
+   #:tls13-new-session-ticket
    #:make-tls13-new-session-ticket #:tls13-key-update #:make-tls13-key-update
    #:tls13-certificate-request #:make-tls13-certificate-request
    #:encode-encrypted-extensions #:decode-encrypted-extensions
@@ -66,6 +67,7 @@
    #:tls13-state #:make-tls13-state #:tls13-state-role #:tls13-state-phase
    #:tls13-state-advance
    #:tls-client #:make-tls-client #:tls-client-state #:tls-client-alpn
+   #:make-tls-client-over-tcp #:tls-client-make-client-hello
    #:tls-client-peer-certificate #:tls-client-start #:tls-client-step
    #:tls-client-read #:tls-client-write #:tls-client-close
    #:tls-client-emit-quic-message #:tls-client-emit-quic-secret

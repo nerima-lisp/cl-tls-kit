@@ -45,6 +45,12 @@
   role on-crypto on-secret on-transport-parameters hash-function
   (pending (make-array 0 :element-type '(unsigned-byte 8))
            :type (vector (unsigned-byte 8)))
+  ;; RFC 9001 carries TLS bytes in an independently offset CRYPTO stream at
+  ;; each encryption level.  Keep the old PENDING slot for the sequential API
+  ;; and use these slots for offset-aware input.
+  (crypto-next-offsets '())
+  (crypto-fragments '())
+  (crypto-delivered '())
   (transcript '())
   transport-parameters received-transport-parameters
   (hrr-seen-p nil) selected-group cookie)
@@ -81,6 +87,117 @@
   (apply #'%quic-cat (nreverse (copy-list (quic-tls-boundary-transcript boundary)))))
 (defun %quic-transcript-add (boundary wire)
   (push wire (quic-tls-boundary-transcript boundary)))
+
+(defun %quic-level-value (alist level)
+  (cdr (assoc level alist)))
+
+(defun %quic-set-level-value (alist level value)
+  (let ((cell (assoc level alist)))
+    (if cell
+        (setf (cdr cell) value)
+        (push (cons level value) alist))
+    alist))
+
+(defun %quic-feed-sequential (boundary level bytes)
+  (let ((pending (%quic-cat (quic-tls-boundary-pending boundary)
+                            bytes))
+        (messages '()))
+    (loop while (>= (length pending) 4) do
+      (let ((length (%quic-integer pending 1 3)))
+        (if (< (length pending) (+ 4 length))
+            (return)
+            (let* ((wire (subseq pending 0 (+ 4 length)))
+                   (type (aref wire 0))
+                   (body (subseq wire 4)))
+              (setf pending (subseq pending (+ 4 length)))
+              (if (= type 2)
+                  (progn
+                    (%quic-replace-transcript-for-hrr boundary)
+                    (setf (quic-tls-boundary-hrr-seen-p boundary) t)
+                    (handler-case
+                        (let ((hrr (decode-handshake wire)))
+                          (when (typep hrr 'tls13-hello-retry-request)
+                            (setf (quic-tls-boundary-selected-group boundary)
+                                  (tls13-hello-retry-request-selected-group hrr))
+                            (let ((cookie (find 44 (tls13-hello-retry-request-extensions hrr)
+                                             :key #'tls-extension-type)))
+                              (setf (quic-tls-boundary-cookie boundary)
+                                    (and cookie (tls-extension-data cookie))))))
+                      (tls13-error () nil)))
+                (%quic-transcript-add boundary wire))
+              (when (= type 2) (%quic-transcript-add boundary wire))
+              (let ((parameters (%quic-transport-parameters-from-message type body)))
+                (when parameters
+                  (setf (quic-tls-boundary-received-transport-parameters boundary) parameters)
+                  (when (quic-tls-boundary-on-transport-parameters boundary)
+                    (funcall (quic-tls-boundary-on-transport-parameters boundary)
+                             boundary parameters))))
+              (push (list :level level :type type :wire wire :body body) messages)))))
+    (setf (quic-tls-boundary-pending boundary) pending)
+    (nreverse messages)))
+
+(defun %quic-feed-offset (boundary level offset bytes)
+  (unless (typep offset '(integer 0 *))
+    (error 'quic-tls-boundary-decode-error :message "CRYPTO offset must be non-negative"))
+  (let* ((bytes (%quic-octets bytes))
+         (next (or (%quic-level-value
+                    (quic-tls-boundary-crypto-next-offsets boundary) level)
+                   0))
+         (fragments (%quic-level-value (quic-tls-boundary-crypto-fragments boundary)
+                                       level))
+         (end (+ offset (length bytes))))
+    (when (< offset next)
+      (let* ((delivered (%quic-level-value
+                         (quic-tls-boundary-crypto-delivered boundary) level))
+             (overlap (min end next)))
+        (unless (equalp (subseq bytes 0 (- overlap offset))
+                        (subseq delivered offset overlap))
+          (error 'quic-tls-boundary-decode-error
+                 :message "conflicting overlap with delivered CRYPTO data")))
+      (when (<= end next) (return-from %quic-feed-offset nil))
+      (setf bytes (subseq bytes (- next offset))
+            offset next))
+    (dolist (fragment fragments)
+      (let* ((start (car fragment)) (finish (+ start (length (cdr fragment)))))
+        (when (and (< offset finish) (< start end))
+          (unless (equalp (subseq bytes (max 0 (- start offset))
+                                  (min (length bytes) (- finish offset)))
+                          (subseq (cdr fragment) (max 0 (- offset start))
+                                  (min (length (cdr fragment)) (- end start))))
+            (error 'quic-tls-boundary-decode-error
+                   :message "conflicting overlapping CRYPTO data")))))
+    (push (cons offset bytes) fragments)
+    (setf (quic-tls-boundary-crypto-fragments boundary)
+          (%quic-set-level-value (quic-tls-boundary-crypto-fragments boundary)
+                                 level fragments))
+    (let ((next (or (%quic-level-value
+                     (quic-tls-boundary-crypto-next-offsets boundary) level)
+                    0))
+          (ready '()))
+      (loop
+        for fragment = (find next fragments :key #'car)
+        while fragment do
+          (push (cdr fragment) ready)
+          (incf next (length (cdr fragment)))
+          (setf fragments (delete fragment fragments :test #'eq)))
+      (setf (quic-tls-boundary-crypto-fragments boundary)
+            (%quic-set-level-value (quic-tls-boundary-crypto-fragments boundary)
+                                   level fragments)
+            (quic-tls-boundary-crypto-next-offsets boundary)
+            (%quic-set-level-value (quic-tls-boundary-crypto-next-offsets boundary)
+                                   level next))
+      (let ((ready (nreverse ready)))
+        (when ready
+          (setf (quic-tls-boundary-crypto-delivered boundary)
+                (%quic-set-level-value
+                 (quic-tls-boundary-crypto-delivered boundary) level
+                 (%quic-cat (or (%quic-level-value
+                                (quic-tls-boundary-crypto-delivered boundary) level)
+                               (make-array 0 :element-type '(unsigned-byte 8)))
+                               (apply #'%quic-cat ready)))))
+        (if ready
+          (%quic-feed-sequential boundary level (apply #'%quic-cat ready))
+          nil)))))
 
 (defun %quic-extension-data (body start)
   (let ((total (%quic-integer body start 2)) (cursor (+ start 2))
@@ -145,48 +262,19 @@
                   (funcall (cdr (assoc type *tls13-message-codecs*)) message))))
     (quic-tls-boundary-send boundary level type wire)))
 
-(defun quic-tls-boundary-feed (boundary level bytes)
+(defun quic-tls-boundary-feed (boundary level bytes &key offset)
   "Consume CRYPTO payload bytes, retaining an incomplete handshake message."
   (unless (%quic-level-p level)
     (error 'quic-tls-boundary-error :message "invalid QUIC encryption level"))
-  (let ((pending (%quic-cat (quic-tls-boundary-pending boundary) (%quic-octets bytes)))
-        (messages '()))
-    (loop while (>= (length pending) 4) do
-      (let ((length (%quic-integer pending 1 3)))
-        (if (< (length pending) (+ 4 length))
-            (return)
-            (let* ((wire (subseq pending 0 (+ 4 length)))
-                   (type (aref wire 0))
-                   (body (subseq wire 4)))
-              (setf pending (subseq pending (+ 4 length)))
-              (if (= type 2)
-                  (progn
-                    (%quic-replace-transcript-for-hrr boundary)
-                    (setf (quic-tls-boundary-hrr-seen-p boundary) t)
-                    (handler-case
-                        (let ((hrr (decode-handshake wire)))
-                          (when (typep hrr 'tls13-hello-retry-request)
-                            (setf (quic-tls-boundary-selected-group boundary)
-                                  (tls13-hello-retry-request-selected-group hrr))
-                            (let ((cookie (find 44 (tls13-hello-retry-request-extensions hrr)
-                                             :key #'tls-extension-type)))
-                              (setf (quic-tls-boundary-cookie boundary)
-                                    (and cookie (tls-extension-data cookie))))))
-                      (tls13-error () nil))
-                    (%quic-transcript-add boundary wire))
-                  (%quic-transcript-add boundary wire))
-              (let ((parameters (%quic-transport-parameters-from-message type body)))
-                (when parameters
-                  (setf (quic-tls-boundary-received-transport-parameters boundary) parameters)
-                  (when (quic-tls-boundary-on-transport-parameters boundary)
-                    (funcall (quic-tls-boundary-on-transport-parameters boundary)
-                             boundary parameters))))
-              (push (list :level level :type type :wire wire :body body) messages)))))
-    (setf (quic-tls-boundary-pending boundary) pending)
-    (nreverse messages)))
-
+  (if offset
+      (%quic-feed-offset boundary level offset bytes)
+      (%quic-feed-sequential boundary level (%quic-octets bytes))))
 (defun quic-tls-boundary-receive (boundary level bytes)
   (quic-tls-boundary-feed boundary level bytes))
+
+(defun quic-tls-boundary-feed-crypto (boundary level offset bytes)
+  "Feed one RFC 9001 CRYPTO frame's OFFSET and DATA into the TLS boundary."
+  (quic-tls-boundary-feed boundary level bytes :offset offset))
 
 (defun quic-tls-boundary-send-with-transport-parameters
     (boundary level type body parameters)
@@ -259,6 +347,7 @@
           quic-tls-transport-parameters-extension quic-tls-boundary-send
           quic-tls-boundary-send-message quic-tls-boundary-feed
           quic-tls-boundary-receive quic-tls-boundary-send-with-transport-parameters
+          quic-tls-boundary-feed-crypto
           quic-tls-boundary-send-client-hello quic-tls-boundary-send-hrr
           quic-tls-boundary-emit-secret quic-tls-boundary-send-alert
           quic-tls-boundary-send-close-notify quic-tls-boundary-send-key-update
