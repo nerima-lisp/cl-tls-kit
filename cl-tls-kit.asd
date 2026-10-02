@@ -15,7 +15,8 @@
                (:file "hostname") (:file "x509") (:file "trust-store")
                (:file "verify") (:file "key-schedule") (:file "record")
                (:file "handshake") (:file "verification")
-               (:file "quic-boundary") (:file "rfc8448") (:file "client"))
+               (:file "quic-boundary") (:file "rfc8448") (:file "client")
+               (:file "client-driver"))
   :in-order-to ((test-op (test-op "cl-tls-kit/test"))))
 
 (asdf:defsystem "cl-tls-kit/test"
