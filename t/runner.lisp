@@ -16,6 +16,8 @@
         (error "cl-tls-kit test group failed: ~A" test))
       (incf passed))
     (let ((rfc8448-result (run-rfc8448-tests)))
+      (when (eq rfc8448-result t)
+        (incf passed))
       (format t "cl-tls-kit tests: ~D groups passed; RFC 8448 result: ~A~%"
               passed rfc8448-result))
     (unless (plusp passed)

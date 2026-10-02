@@ -37,6 +37,12 @@
              (format stream "TLS peer certificate verification failed~@[ (~A)~]"
                      (tls-client-verification-cause condition)))))
 
+(define-condition tls13-negotiation-error (tls-client-error)
+  ((field :initarg :field :reader tls13-negotiation-error-field))
+  (:report (lambda (condition stream)
+             (format stream "Invalid TLS 1.3 negotiated ~A"
+                     (tls13-negotiation-error-field condition)))))
+
 (defstruct (tls-client (:constructor %make-tls-client))
   transport-read transport-write
   transport-close
@@ -108,6 +114,23 @@ record to pass to the transport write callback."
           (error 'tls12-downgrade-sentinel :client client :reason :downgrade
                  :version version))))
     t))
+
+(defun %tls-client-check-server-hello (client hello)
+  (unless (= (tls13-server-hello-legacy-version hello) #x0303)
+    (error 'tls13-negotiation-error :client client :reason :legacy-version
+           :field :legacy-version))
+  (unless (member (tls13-server-hello-cipher-suite hello)
+                  '(#x1301 #x1302 #x1303 #x1304 #x1305))
+    (error 'tls13-negotiation-error :client client :reason :cipher-suite
+           :field :cipher-suite))
+  (let ((versions (remove-if-not
+                   (lambda (extension) (= (tls-extension-type extension) 43))
+                   (tls13-server-hello-extensions hello))))
+    (unless (and (= (length versions) 1)
+                 (equalp (tls-extension-data (first versions)) #(3 4)))
+      (error 'tls13-negotiation-error :client client :reason :supported-version
+             :field :supported-version)))
+  t)
 
 (defun tls-client-start (client)
   (unless (eq (tls-client-state client) :new)
@@ -255,6 +278,7 @@ record to pass to the transport write callback."
       (when (typep input 'tls13-hello-retry-request)
         (setf (tls-client-expected-message client) :server-hello))
       (when (typep input 'tls13-server-hello)
+        (%tls-client-check-server-hello client input)
         (tls-client-check-server-random client
                                          (tls13-server-hello-random input)))
       (when (typep input 'tls13-certificate-request)
@@ -349,7 +373,8 @@ The KEY-SHARE value is supplied by the crypto/provider integration."
     (unless (= (read-sequence header stream) 5) (return-from %tls-client-stream-record-reader nil))
     (let* ((length (+ (ash (aref header 3) 8) (aref header 4)))
            (body (make-array length :element-type '(unsigned-byte 8))))
-      (unless (= (read-sequence body stream) length) (%client-fail nil :read :truncated-record))
+      (unless (= (read-sequence body stream) length)
+        (error 'tls-client-error :client nil :reason :truncated-record))
       (concatenate '(vector (unsigned-byte 8)) header body))))
 
 (defun make-tls-client-over-tcp (host port &rest args &key &allow-other-keys)
@@ -432,3 +457,10 @@ must provide TRANSPORT callbacks directly to MAKE-TLS-CLIENT."
     (unless callback (%client-fail client :key-update :missing-callback))
     (incf (tls-client-key-update-count client))
     (%apply-provider-result client (funcall callback client request))))
+
+(defun tls-client-connect (client)
+  "Start the TLS client and return it after the provider has emitted ClientHello."
+  (tls-client-start client))
+
+(export '(tls13-negotiation-error tls13-negotiation-error-field
+          tls-client-connect tls-client-key-update))

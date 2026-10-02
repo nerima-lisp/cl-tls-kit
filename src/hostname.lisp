@@ -19,6 +19,8 @@ Unicode (which would make the result dependent on implementation details)."
     (when (or (zerop (length name))
               (find #\Null name))
       (error 'hostname-mismatch :hostname name :names nil))
+    (when (and (> (length name) 1) (char= (char name (1- (length name))) #\.))
+      (setf name (subseq name 0 (1- (length name)))))
     (if (every (lambda (character) (< (char-code character) 128)) name)
         name
         (let* ((package (find-package "IDNA"))

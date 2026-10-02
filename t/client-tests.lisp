@@ -63,6 +63,18 @@
     (check (handler-case (progn (tls-kit::tls-client-start client) nil)
              (tls-kit::tls-client-verification-error () t))
            "verification failure is a client condition"))
+  (let* ((client (tls-kit::make-tls-client
+                  :provider (list :handshake
+                                  (lambda (ignored input)
+                                    (declare (ignore ignored input))
+                                    '(:state :awaiting-input)))))
+         (hello (make-tls13-server-hello
+                 #x0303 (make-array 32 :element-type '(unsigned-byte 8)) #()
+                 #x1301 (list (make-tls-extension 43 #(3 3))))))
+    (tls-kit::tls-client-start client)
+    (check (handler-case (progn (tls-kit::tls-client-step client hello) nil)
+             (tls-kit::tls13-negotiation-error () t))
+           "TLS 1.2 ServerHello version is rejected by negotiation boundary"))
   (let ((writes '()) (hellos 0)
         (client nil))
     (setf client

@@ -17,7 +17,10 @@
           (t nil))))
 
 (defun %first-existing-path (paths)
-  (find-if (lambda (path) (and path (probe-file path))) paths))
+  (find-if (lambda (path)
+             (and path (probe-file path)
+                  (not (uiop:directory-pathname-p (pathname path)))))
+           paths))
 
 (defun default-trust-store-path (&optional (environment #'%getenv))
   "Choose SSL_CERT_FILE, then NIX_SSL_CERT_FILE, then a platform default.

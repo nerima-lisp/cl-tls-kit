@@ -72,7 +72,10 @@
    #:tls-client-read #:tls-client-write #:tls-client-close
    #:tls-client-emit-quic-message #:tls-client-emit-quic-secret
    #:tls-client-check-server-random #:tls-client-error
+   #:tls13-negotiation-error #:tls13-negotiation-error-field
+   #:tls-client-connect #:tls-client-key-update
    #:tls-client-state-error #:unexpected-message #:tls12-downgrade-sentinel
+   #:tls12-downgrade-version
    #:tls-client-verification-error
    #:tls13-verification-error #:tls13-verification-error-reason
    #:tls13-verification-error-message #:tls13-invalid-verification-input
