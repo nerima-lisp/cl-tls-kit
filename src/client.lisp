@@ -195,12 +195,16 @@ record to pass to the transport write callback."
   "Replace the initial ClientHello transcript with RFC 8446 message_hash."
   (let* ((provider (tls-client-provider client))
          (digest (and (listp provider) (getf provider :digest)))
-         (hash (if digest
-                   (funcall digest :sha256 (tls-client-transcript client))
-                   (tls-client-transcript client))))
+         (hash (progn
+                 (unless digest (%client-fail client :hrr :missing-transcript-hash))
+                 (funcall digest :sha256 (tls-client-transcript client)))))
     (setf (tls-client-transcript client)
           (concatenate '(vector (unsigned-byte 8))
-                       #(254 0 0 32) hash hrr-wire))))
+                       (vector #xfe
+                               (ldb (byte 8 16) (length hash))
+                               (ldb (byte 8 8) (length hash))
+                               (ldb (byte 8 0) (length hash)))
+                       hash hrr-wire))))
 
 (defun %client-advance-message (client type)
   (let ((expected (tls-client-expected-message client)))

@@ -92,6 +92,10 @@
                     (list (cons #x001d (make-array 32
                                                     :element-type '(unsigned-byte 8)
                                                     :initial-element hellos)))))
+                 :digest
+                 (lambda (algorithm bytes)
+                   (declare (ignore algorithm bytes))
+                   (make-array 32 :element-type '(unsigned-byte 8)))
                  :handshake
                  (lambda (ignored input)
                    (declare (ignore ignored input))

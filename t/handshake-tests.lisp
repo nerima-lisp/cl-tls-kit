@@ -95,10 +95,19 @@
                  (progn (decode-encrypted-extensions #(0 8 0 1 10 0 1 10)) nil)
                  (tls13-decode-error () t))
              "duplicate extensions are rejected")
-      (check (handler-case
+    (check (handler-case
                  (progn (decode-key-update #(2)) nil)
                  (tls13-decode-error () t))
              "invalid KeyUpdate request is rejected"))
+    (let ((state (make-tls13-state
+                  :client :server-hello
+                  (lambda (bytes)
+                    (declare (ignore bytes))
+                    (make-array 48 :element-type '(unsigned-byte 8)))))
+          (hrr (make-tls13-hello-retry-request #x0303 #x0017 nil)))
+      (tls13-state-handle-hello-retry-request state hrr #(1 0 0 0))
+      (check (= (aref (tls13-state-transcript state) 3) 48)
+             "HRR message_hash uses the negotiated digest length"))
     (let ((state (make-tls13-state :client)))
       (tls13-state-advance state 2)
       (check (eq (tls13-state-phase state) :server-hello)

@@ -566,16 +566,20 @@ message_hash(ClientHello) || HRR, as required by RFC 8446 section 4.4.1."
   (unless (tls13-state-retry-requested state)
     (when (and (zerop (length (tls13-state-transcript state))) encoded-client-hello)
       (tls13-state-add-transcript state encoded-client-hello))
-    (let* ((hash-function (tls13-state-transcript-hash-function state))
+    (let* ((hash-function (tls13-state-hash-function state))
            (hash (if hash-function
                      (funcall hash-function (tls13-state-transcript state))
                      (tls13-state-transcript state)))
            (marker (concatenate '(vector (unsigned-byte 8))
-                                #(254 0 0 32) hash)))
+                                (vector #xfe
+                                        (ldb (byte 8 16) (length hash))
+                                        (ldb (byte 8 8) (length hash))
+                                        (ldb (byte 8 0) (length hash)))
+                                hash)))
       (setf (tls13-state-transcript state) marker)))
   (setf (tls13-state-retry-requested state) t
         (tls13-state-phase state) :client-hello)
-  (tls13-state-add-transcript state (encode-handshake 2 hrr))
+  (tls13-state-add-transcript state (encode-hello-retry-request hrr))
   state)
 
 (export '(+tls13-extension-supported-groups+
