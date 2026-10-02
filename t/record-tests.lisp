@@ -57,6 +57,14 @@
      (handler-case (progn (decode-tls-plaintext #(23 3 3 0 1)) nil)
        (tls-invalid-record () t))
      "truncated fragment")
+    (record-test-check
+     (handler-case (progn (make-tls-plaintext 22 #()) nil)
+       (tls-invalid-record () t))
+     "empty handshake fragment is rejected")
+    (record-test-check
+     (handler-case (progn (make-tls-plaintext 21 #()) nil)
+       (tls-invalid-record () t))
+     "empty alert fragment is rejected")
     (record-test-check (tls-key-update-p
                         (make-tls-plaintext 22 #(24 0 0 1 0)))
                        "KeyUpdate format")

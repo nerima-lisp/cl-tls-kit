@@ -47,6 +47,11 @@
 (defun %valid-content-type-p (type)
   (member type '(20 21 22 23)))
 
+(defun %valid-plaintext-fragment-p (content-type fragment)
+  (or (not (member content-type (list +tls-content-type-alert+
+                                      +tls-content-type-handshake+)))
+      (plusp (length fragment))))
+
 (defun make-tls-plaintext (content-type fragment)
   (check-type content-type (unsigned-byte 8))
   (unless (%valid-content-type-p content-type)
@@ -54,6 +59,8 @@
   (let ((bytes (%record-octets fragment)))
     (when (> (length bytes) +tls-plaintext-limit+)
       (%record-fail 'tls-record-overflow "TLSPlaintext exceeds 2^14 octets"))
+    (unless (%valid-plaintext-fragment-p content-type bytes)
+      (%record-fail 'tls-invalid-record "empty handshake or alert fragment"))
     (%make-tls-plaintext content-type bytes)))
 
 (defun encode-tls-plaintext (record)
@@ -83,7 +90,7 @@
         (%record-fail 'tls-record-overflow "TLSPlaintext length exceeds 2^14"))
       (unless (= (+ 5 length) (length bytes))
         (%record-fail 'tls-invalid-record "TLSPlaintext length mismatch"))
-      (%make-tls-plaintext type (subseq bytes 5)))))
+      (make-tls-plaintext type (subseq bytes 5)))))
 
 (defun make-tls-ciphertext (content-type fragment &key (legacy-version +tls-record-version+))
   (unless (%valid-content-type-p content-type)
