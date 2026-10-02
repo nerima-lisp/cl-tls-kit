@@ -177,11 +177,12 @@ dependency and does not refer to an uninterned package at read time."
 
 (defun tls13-master-secret (provider hash handshake-secret)
   "Derive the master secret from the handshake secret."
-  (tls13-hkdf-extract provider hash
-                       (tls13-hkdf-expand-label provider hash handshake-secret "derived"
-                                                (tls13-empty-hash provider hash)
-                                                (%tls13-hash-length provider hash))
-                       (make-array 0 :element-type '(unsigned-byte 8))))
+  (let ((hash-length (%tls13-hash-length provider hash)))
+    (tls13-hkdf-extract provider hash
+                         (tls13-hkdf-expand-label provider hash handshake-secret "derived"
+                                                  (tls13-empty-hash provider hash)
+                                                  hash-length)
+                         (make-array hash-length :element-type '(unsigned-byte 8)))))
 
 (defun tls13-traffic-key-and-iv (provider hash traffic-secret key-length iv-length)
   "Return two values: TLS record protection key and IV (RFC 8446 section 7.3)."

@@ -80,6 +80,23 @@
                                    (search "traffic upd" (map 'string #'code-char info)))
                                  expanded-labels)
                            "traffic secret ratchet uses traffic upd label")))
+    (let* ((captured-ikm nil)
+           (stub (cl-tls-kit::%make-tls13-crypto-provider
+                  (lambda (hash salt ikm)
+                    (declare (ignore hash salt))
+                    (setf captured-ikm ikm)
+                    (make-array 32 :element-type '(unsigned-byte 8)))
+                  (lambda (hash secret info length)
+                    (declare (ignore hash secret info))
+                    (make-array length :element-type '(unsigned-byte 8)))
+                  (lambda (hash) (declare (ignore hash)) 32)
+                  (lambda (hash octets) (declare (ignore hash octets))
+                    (make-array 32 :element-type '(unsigned-byte 8))))))
+      (cl-tls-kit::tls13-master-secret
+       stub :sha256 (make-array 32 :element-type '(unsigned-byte 8)))
+      (record-test-check (equalp captured-ikm
+                                (make-array 32 :element-type '(unsigned-byte 8)))
+                         "master secret uses a hash-length zero IKM"))
     (when (find-package '#:crypto-kit)
       (let* ((secret (make-array 32 :element-type '(unsigned-byte 8)
                                  :initial-element #x42))
