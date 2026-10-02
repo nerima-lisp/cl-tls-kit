@@ -342,7 +342,7 @@ record to pass to the transport write callback."
   "Build a TLS 1.3 ClientHello carrying the configured SNI and ALPN.
 The KEY-SHARE value is supplied by the crypto/provider integration."
   (let ((extensions
-          (list (make-tls-extension +tls13-extension-supported-versions+ #(0 2 3 4))
+          (list (make-tls-extension +tls13-extension-supported-versions+ #(2 3 4))
                 (make-tls-extension +tls13-extension-supported-groups+
                                      (%encode-vector
                                       (apply #'%cat
@@ -400,7 +400,7 @@ The KEY-SHARE value is supplied by the crypto/provider integration."
     (require :sb-bsd-sockets))
   (let* ((socket (funcall (find-symbol "MAKE-INET-SOCKET" '#:sb-bsd-sockets)
                           :stream :tcp))
-         (address (funcall (find-symbol "NAME-SERVICE-GET-HOST-BY-NAME" '#:sb-bsd-sockets) host))
+         (address (funcall (find-symbol "GET-HOST-BY-NAME" '#:sb-bsd-sockets) host))
          (connect (find-symbol "SOCKET-CONNECT" '#:sb-bsd-sockets)))
     (funcall connect socket
              (funcall (find-symbol "HOST-ENT-ADDRESS" '#:sb-bsd-sockets) address) port)

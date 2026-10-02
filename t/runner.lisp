@@ -12,7 +12,8 @@
                     run-client-tests
                     run-client-driver-tests
                     run-verification-tests
-                    run-quic-boundary-tests))
+                    run-quic-boundary-tests
+                    run-openssl-e2e-tests))
       (let ((result (funcall test)))
         (unless (member result '(t :skipped))
           (error "cl-tls-kit test group failed: ~A" test))

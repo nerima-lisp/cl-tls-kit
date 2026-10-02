@@ -29,7 +29,7 @@
                (:file "handshake-tests") (:file "client-tests")
                (:file "client-driver-tests")
                (:file "verification-tests") (:file "quic-boundary-tests")
-               (:file "rfc8448-tests")
+               (:file "rfc8448-tests") (:file "openssl-e2e")
                (:file "runner"))
   :perform (asdf:test-op (op c)
              (declare (ignore op c))

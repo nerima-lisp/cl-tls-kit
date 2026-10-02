@@ -63,7 +63,7 @@
             pname = "cl-tls-kit-tests";
             version = "0.1.0";
             src = self;
-            nativeBuildInputs = [ pkgs.sbcl ];
+            nativeBuildInputs = [ pkgs.sbcl pkgs.openssl ];
             dontConfigure = true;
             dontBuild = true;
             doCheck = true;
@@ -72,6 +72,7 @@
               export HOME="$TMPDIR/home"
               export XDG_CACHE_HOME="$TMPDIR/cache"
               mkdir -p "$HOME" "$XDG_CACHE_HOME"
+              export OPENSSL="${pkgs.openssl}/bin/openssl"
               export CL_SOURCE_REGISTRY="$PWD//:${cl-crypto-kit.outPath}/"
               ${pkgs.sbcl}/bin/sbcl --noinform --non-interactive \
                 --load t/crypto-provider-check.lisp

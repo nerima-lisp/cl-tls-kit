@@ -111,11 +111,16 @@ the crypto provider supplies hash, HKDF, HMAC, and AEAD primitives."
     (%driver-fail :already-started))
   (let* ((group (first (tls13-client-driver-supported-groups driver)))
          (share (%driver-key-share driver group))
+         (random (or (and (listp (tls13-client-driver-key-exchange driver))
+                          (getf (tls13-client-driver-key-exchange driver) :random))
+                     (lambda (length)
+                       (declare (ignore length))
+                       (make-array 32 :element-type '(unsigned-byte 8)
+                                   :initial-element 0))))
          (client (make-tls13-client-hello
                   #x0303
-                  (make-array 32 :element-type '(unsigned-byte 8)
-                              :initial-element 0)
-                  #()
+                  (funcall random 32)
+                  (funcall random 32)
                   (tls13-client-driver-cipher-suites driver)
                   (append
                    (when (tls13-client-driver-hostname driver)
@@ -126,7 +131,7 @@ the crypto provider supplies hash, HKDF, HMAC, and AEAD primitives."
                      (list (make-tls-extension 16
                                                (encode-alpn-extension
                                                 (tls13-client-driver-alpn driver)))))
-                   (list (make-tls-extension 43 #(0 2 3 4))
+                         (list (make-tls-extension 43 #(2 3 4))
                          (make-tls-extension 10
                                               (%encode-vector
                                                (apply #'%cat
@@ -139,6 +144,7 @@ the crypto provider supplies hash, HKDF, HMAC, and AEAD primitives."
                                                       (map 'list #'%hs-u16
                                                            (tls13-client-driver-signature-algorithms driver)))
                                                2))
+                         (make-tls-extension 45 #(1 1))
                          (make-tls-extension 51 (encode-key-share-extension (list share))))))))
     (setf (tls13-client-driver-client-hello driver) client
           (tls13-client-driver-state driver) :awaiting-server-hello)
@@ -369,12 +375,16 @@ Returns application plaintext, NIL for a consumed handshake or KeyUpdate,
 and marks the driver closed after a peer close_notify."
   (let* ((wire (%driver-read-record driver))
          (ignore-eof (unless wire (%driver-fail :eof)))
-         (plaintext (if (and (eq (tls13-client-driver-state driver) :awaiting-server-hello)
-                            (not (tls13-client-driver-handshake-read-state driver)))
+         (plaintext (if (or (= (aref wire 0) +tls-content-type-change-cipher-spec+)
+                            (and (eq (tls13-client-driver-state driver) :awaiting-server-hello)
+                            (not (tls13-client-driver-handshake-read-state driver))))
                         (decode-tls-plaintext wire)
                         (%driver-decrypt-record driver wire))))
     (declare (ignore ignore-eof))
     (cond
+      ((= (tls-plaintext-content-type plaintext)
+          +tls-content-type-change-cipher-spec+)
+       nil)
       ((tls-close-notify-p plaintext)
        (setf (tls13-client-driver-close-notify-received driver) t
              (tls13-client-driver-state driver) :closed)
