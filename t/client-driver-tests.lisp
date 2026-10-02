@@ -45,6 +45,8 @@
                        (declare (ignore ignored))
                        (push wire sent)))))
     (cl-tls-kit:tls13-client-driver-start driver)
+    (check (null (cl-tls-kit:tls13-client-driver-negotiated-alpn driver))
+           "driver exposes no negotiated ALPN before EncryptedExtensions")
     (check (= (length sent) 1) "driver emits ClientHello")
     (let ((hello (decode-handshake (first sent))))
       (check (typep hello 'tls13-client-hello) "driver emits a ClientHello message")

@@ -9,7 +9,7 @@
 (defstruct (tls13-client-driver (:constructor %make-tls13-client-driver))
   provider key-exchange on-send verify-certificate-verify
   transport-read transport-write transport-close
-  hostname alpn cipher-suites supported-groups signature-algorithms
+  hostname alpn negotiated-alpn cipher-suites supported-groups signature-algorithms
   client-hello private-key selected-group hash suite state
   certificate-chain peer-certificate trust-anchors now verify-signature
   (transcript (make-array 0 :element-type '(unsigned-byte 8)))
@@ -31,6 +31,12 @@
 (defun %driver-digest (driver bytes)
   (funcall (tls13-crypto-provider-digest (tls13-client-driver-provider driver))
            (tls13-client-driver-hash driver) bytes))
+
+(defun %driver-message-hash (driver)
+  (let ((digest (%driver-digest driver (tls13-client-driver-transcript driver))))
+    (when (> (length digest) #xffffff)
+      (%driver-fail :transcript-too-long))
+    (%cat (vector #xfe) (%u24 (length digest)) digest)))
 
 (defun %driver-write-record (driver plaintext &optional state)
   (let ((wire (if state
@@ -180,18 +186,38 @@ the crypto provider supplies hash, HKDF, HMAC, and AEAD primitives."
         (declare (ignore condition))
         (%driver-fail :invalid-server-certificate)))))
 
+(defun %driver-trust-anchors (driver)
+  (or (tls13-client-driver-trust-anchors driver)
+      (handler-case
+          (let ((path (load-trust-store))
+                (anchors nil))
+            (dolist (block (pem-decode (uiop:read-file-string path)))
+              (when (string= (pem-block-label block) "CERTIFICATE")
+                (handler-case
+                    (push (cl-tls-kit.x509:parse-certificate-der
+                           (pem-block-der block))
+                          anchors)
+                  (error () nil))))
+            (unless anchors
+              (error 'untrusted-root :certificate nil))
+            (setf (tls13-client-driver-trust-anchors driver) anchors))
+        (certificate-verification-error (condition)
+          (error condition))
+        (error (condition)
+          (declare (ignore condition))
+          (error 'invalid-certificate-chain :certificate nil)))))
+
 (defun %driver-verify-certificate-chain (driver chain)
-  (when (tls13-client-driver-trust-anchors driver)
-    (handler-case
-        (verify-certificate-chain
-         chain :hostname (tls13-client-driver-hostname driver)
-         :trust-anchors (tls13-client-driver-trust-anchors driver)
-         :now (tls13-client-driver-now driver)
-         :verify-signature (tls13-client-driver-verify-signature driver))
-      (certificate-verification-error (condition)
-        (%driver-fail (list :certificate-verification-failed
-                            :condition condition
-                            :certificate (verification-error-certificate condition)))))))
+  (handler-case
+      (verify-certificate-chain
+       chain :hostname (tls13-client-driver-hostname driver)
+       :trust-anchors (%driver-trust-anchors driver)
+       :now (tls13-client-driver-now driver)
+       :verify-signature (tls13-client-driver-verify-signature driver))
+    (certificate-verification-error (condition)
+      (%driver-fail (list :certificate-verification-failed
+                          :condition condition
+                          :certificate (verification-error-certificate condition))))))
 
 (defun tls13-client-driver-step (driver wire)
   "Consume one complete TLS handshake message and advance DRIVER.
@@ -207,30 +233,35 @@ Returns DRIVER; outgoing messages are delivered to ON-SEND."
       (when (= (tls13-key-update-request message) 1)
         (tls13-client-driver-key-update driver 0))
       (return-from tls13-client-driver-step driver))
+    (when (and (eq (tls13-client-driver-state driver) :connected)
+               (typep message 'tls13-new-session-ticket))
+      (return-from tls13-client-driver-step driver))
     (when (and (= type 2) (typep message 'tls13-hello-retry-request))
       (unless (eq (tls13-client-driver-state driver) :awaiting-server-hello)
         (%driver-fail :unexpected-hrr))
       (setf (tls13-client-driver-transcript driver)
             (concatenate '(vector (unsigned-byte 8))
-                         #(254 0 0 32)
-                         (%driver-digest driver
-                                         (tls13-client-driver-transcript driver))
+                         (%driver-message-hash driver)
                          bytes))
       (let* ((group (tls13-hello-retry-request-selected-group message))
-             (share (%driver-key-share driver group))
-             (hello (tls13-client-driver-client-hello driver)))
-        (setf (tls13-client-driver-client-hello driver)
-              (make-tls13-client-hello
-               (tls13-client-hello-legacy-version hello)
-               (tls13-client-hello-random hello)
-               (tls13-client-hello-session-id hello)
-               (tls13-client-hello-cipher-suites hello)
-               (cons (make-tls-extension 51 (encode-key-share-extension (list share)))
-                     (remove 51 (tls13-client-hello-extensions hello)
-                             :key #'tls-extension-type))))
-      )
-      (%driver-send driver 1 (tls13-client-driver-client-hello driver))
-      (return-from tls13-client-driver-step driver))
+             (initial-group (tls13-client-driver-selected-group driver)))
+        (unless (member group (tls13-client-driver-supported-groups driver))
+          (%driver-fail :hrr-unsupported-group))
+        (when (= group initial-group)
+          (%driver-fail :hrr-repeated-group))
+        (let ((share (%driver-key-share driver group))
+              (hello (tls13-client-driver-client-hello driver)))
+          (setf (tls13-client-driver-client-hello driver)
+                (make-tls13-client-hello
+                 (tls13-client-hello-legacy-version hello)
+                 (tls13-client-hello-random hello)
+                 (tls13-client-hello-session-id hello)
+                 (tls13-client-hello-cipher-suites hello)
+                 (cons (make-tls-extension 51 (encode-key-share-extension (list share)))
+                       (remove 51 (tls13-client-hello-extensions hello)
+                               :key #'tls-extension-type)))))
+        (%driver-send driver 1 (tls13-client-driver-client-hello driver))
+      (return-from tls13-client-driver-step driver)))
     (unless (member (tls13-client-driver-state driver)
                     '(:awaiting-server-hello :awaiting-encrypted-extensions
                       :awaiting-certificate :awaiting-certificate-verify
@@ -271,6 +302,16 @@ Returns DRIVER; outgoing messages are delivered to ON-SEND."
                (%driver-make-traffic-state driver client-secret)))
        (setf (tls13-client-driver-state driver) :awaiting-encrypted-extensions))
       (tls13-encrypted-extensions
+       (let ((extension (find +tls13-extension-application-layer-protocol-negotiation+
+                              (tls13-encrypted-extensions-extensions message)
+                              :key #'tls-extension-type)))
+         (when extension
+           (let ((protocols (decode-alpn-extension (tls-extension-data extension))))
+             (unless (member (first protocols) (tls13-client-driver-alpn driver)
+                             :test #'string=)
+               (%driver-fail :unexpected-alpn))
+             (setf (tls13-client-driver-negotiated-alpn driver)
+                   (first protocols)))))
        (setf (tls13-client-driver-state driver) :awaiting-certificate))
       (tls13-certificate
        (let ((chain (%driver-certificate-chain message)))
@@ -304,13 +345,6 @@ Returns DRIVER; outgoing messages are delivered to ON-SEND."
                  (%driver-digest driver prior-transcript))
                 (tls13-finished-verify-data message))
          (%driver-fail :finished-mismatch))
-       (let ((verify-data
-               (tls13-compute-finished-verify-data
-                (tls13-client-driver-provider driver)
-                (tls13-client-driver-hash driver)
-                (tls13-client-driver-client-finished-key driver)
-                (%driver-digest driver (tls13-client-driver-transcript driver)))))
-         (%driver-send driver 20 (make-tls13-finished verify-data)))
        (let* ((provider (tls13-client-driver-provider driver))
               (master (tls13-master-secret
                        provider (tls13-client-driver-hash driver)
@@ -330,6 +364,13 @@ Returns DRIVER; outgoing messages are delivered to ON-SEND."
                (%driver-make-traffic-state driver server-secret)
                (tls13-client-driver-application-write-state driver)
                (%driver-make-traffic-state driver client-secret)))
+       (let ((verify-data
+               (tls13-compute-finished-verify-data
+                (tls13-client-driver-provider driver)
+                (tls13-client-driver-hash driver)
+                (tls13-client-driver-client-finished-key driver)
+                (%driver-digest driver (tls13-client-driver-transcript driver)))))
+         (%driver-send driver 20 (make-tls13-finished verify-data)))
        (setf (tls13-client-driver-state driver) :connected))
       (otherwise (%driver-fail :unexpected-message)))
     driver))
@@ -460,4 +501,5 @@ and marks the driver closed after a peer close_notify."
           tls13-client-driver-connect tls13-client-driver-read-record
           tls13-client-driver-write tls13-client-driver-close
           tls13-client-driver-key-update make-tls13-client-driver-over-tcp
+          tls13-client-driver-negotiated-alpn
           tls13-client-driver-error tls13-client-driver-error-reason))
