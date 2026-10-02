@@ -76,7 +76,8 @@
    #:tls-client-connect #:tls-client-key-update
    #:tls-client-state-error #:unexpected-message #:tls12-downgrade-sentinel
    #:tls12-downgrade-version
-   #:tls-client-verification-error
+   #:tls-client-verification-error #:tls-client-alert-error
+   #:tls-client-alert-level #:tls-client-alert-description
    #:tls13-verification-error #:tls13-verification-error-reason
    #:tls13-verification-error-message #:tls13-invalid-verification-input
    #:tls13-signature-scheme-error #:tls13-signature-scheme-not-offered

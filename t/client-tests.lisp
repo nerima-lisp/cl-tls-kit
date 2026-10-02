@@ -109,4 +109,23 @@
       (tls-kit::tls-client-step client hrr-wire)
       (check (= hellos 2) "HRR emits exactly one replacement ClientHello")
       (check (= (length writes) 2) "ClientHello and HRR retry cross transport")) )
+  (let ((client nil) (reads (list (make-tls-plaintext 21 #(2 40)))))
+    (setf client
+          (tls-kit::make-tls-client
+           :provider (list :key-update
+                           (lambda (ignored request)
+                             (declare (ignore ignored request))
+                             '(:state :connected)))
+           :transport-read (lambda (ignored)
+                             (declare (ignore ignored))
+                             (pop reads))
+           :record-unprotect (lambda (ignored record)
+                               (declare (ignore ignored))
+                               record)))
+    (setf (tls-kit::tls-client-state client) :connected)
+    (check (handler-case (progn (tls-kit::tls-client-read client) nil)
+             (tls-kit::tls-client-alert-error (condition)
+               (and (= (tls-kit::tls-client-alert-level condition) 2)
+                    (= (tls-kit::tls-client-alert-description condition) 40))))
+           "fatal and warning alerts are surfaced as client conditions"))
   t)

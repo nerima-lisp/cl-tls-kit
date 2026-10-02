@@ -37,6 +37,14 @@
              (format stream "TLS peer certificate verification failed~@[ (~A)~]"
                      (tls-client-verification-cause condition)))))
 
+(define-condition tls-client-alert-error (tls-client-error)
+  ((level :initarg :level :reader tls-client-alert-level)
+   (description :initarg :description :reader tls-client-alert-description))
+  (:report (lambda (condition stream)
+             (format stream "TLS peer sent alert ~D/~D"
+                     (tls-client-alert-level condition)
+                     (tls-client-alert-description condition)))))
+
 (define-condition tls13-negotiation-error (tls-client-error)
   ((field :initarg :field :reader tls13-negotiation-error-field))
   (:report (lambda (condition stream)
@@ -408,9 +416,28 @@ must provide TRANSPORT callbacks directly to MAKE-TLS-CLIENT."
     (%client-fail client :read :missing-transport))
   (let ((record (funcall (tls-client-transport-read client) client)))
     (when record
-      (if (tls-client-record-unprotect client)
-          (funcall (tls-client-record-unprotect client) client record)
-          record))))
+      (let ((plaintext (if (tls-client-record-unprotect client)
+                           (funcall (tls-client-record-unprotect client) client record)
+                           record)))
+        (when (typep plaintext 'tls-plaintext)
+          (cond
+            ((tls-close-notify-p plaintext)
+             (setf (tls-client-close-notify-received client) t
+                   (tls-client-state client) :closed))
+            ((and (= (tls-plaintext-content-type plaintext) +tls-content-type-alert+)
+                  (= (length (tls-plaintext-fragment plaintext)) 2))
+             (error 'tls-client-alert-error
+                    :client client :reason :peer-alert
+                    :level (aref (tls-plaintext-fragment plaintext) 0)
+                    :description (aref (tls-plaintext-fragment plaintext) 1)))
+            ((tls-key-update-p plaintext)
+             (let ((callback (%provider-callback client :key-update)))
+               (unless callback
+                 (%client-fail client :read :missing-key-update-callback))
+               (%apply-provider-result
+                client (funcall callback client
+                                (aref (tls-plaintext-fragment plaintext) 4)))))))
+        plaintext))))
 
 (defun tls-client-write (client plaintext)
   (unless (eq (tls-client-state client) :connected)
