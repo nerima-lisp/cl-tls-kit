@@ -45,6 +45,16 @@
     (check (hostname-match-p "WWW.EXAMPLE.TEST."
                              '((:dns "www.example.test")))
            "DNS trailing dot is normalized")
+    (check (hostname-match-p "127.0.0.1"
+                             (list (list :ip #(127 0 0 1))))
+           "IPv4 hostname matches an IP SAN")
+    (check (hostname-match-p "2001:db8::1"
+                             (list (list :ip
+                                         #(32 1 13 184 0 0 0 0 0 0 0 0 0 0 0 1))))
+           "IPv6 hostname matches an IP SAN")
+    (check (not (hostname-match-p "127.0.0.1"
+                                  '((:dns "127.0.0.1"))))
+           "IP hostnames do not match DNS SANs")
     (check (handler-case
                (progn (cl-tls-kit.x509::%read-der #(48)) nil)
              (cl-tls-kit.x509:x509-error () t))
@@ -128,4 +138,23 @@
               :verify-signature (lambda (&rest arguments)
                                   (declare (ignore arguments)) t))
              "ancestor name constraints permit a valid leaf"))
+    (let* ((leaf (list :issuer "root" :subject "leaf"
+                       :not-before 0 :not-after (1+ (get-universal-time))
+                       :signature-algorithm :rsa-pkcs1-sha256
+                       :key-usage '(:key-encipherment)
+                       :subject-alternative-names '((:dns "example.test"))))
+           (root (list :subject "root" :self-signed t
+                       :not-before 0 :not-after (1+ (get-universal-time))
+                       :basic-constraints '(:ca t)))
+           (chain (list leaf root)))
+      (check (handler-case
+                 (progn
+                   (verify-certificate-chain
+                    chain :hostname "example.test" :trust-anchors (list root)
+                    :verify-signature (lambda (&rest arguments)
+                                        (declare (ignore arguments)) t))
+                   nil)
+               (invalid-key-usage () t)
+               (condition () nil))
+             "leaf key usage requires digitalSignature for TLS server authentication"))
     t))

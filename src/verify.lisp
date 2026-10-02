@@ -52,8 +52,12 @@
     (and (<= not-before now) (<= now not-after))))
 
 (defun %token (value)
-  (coerce (remove-if (lambda (character) (find character "-_ "))
-                     (string-downcase (string value))) 'string))
+  (let ((token (coerce (remove-if (lambda (character) (find character "-_ "))
+                                  (string-downcase (string value)))
+                        'string)))
+    (cond ((string= token "1.3.6.1.5.5.7.3.1") "serverauth")
+          ((string= token "2.5.29.37.0") "anyextendedkeyusage")
+          (t token))))
 
 (defun %has-p (value item)
   (some (lambda (x) (string= (%token x) (%token item))) value))
@@ -225,6 +229,9 @@ VERIFY-SIGNATURE, when supplied, has the same four-argument contract."
       (when (and eku (not (or (%has-p eku :server-auth)
                               (%has-p eku :any-extended-key-usage))))
         (error 'invalid-extended-key-usage :certificate leaf)))
+    (let ((usage (%field leaf :key-usage nil)))
+      (when (and usage (not (%has-p usage :digital-signature)))
+        (error 'invalid-key-usage :certificate leaf)))
     (when hostname
       (unless (hostname-match-p hostname (%field leaf :subject-alternative-names nil))
         (error 'certificate-hostname-mismatch :certificate leaf)))
