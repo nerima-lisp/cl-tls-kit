@@ -93,9 +93,10 @@
         let
           test = pkgs.writeShellApplication {
             name = "cl-tls-kit-test";
-            runtimeInputs = [ pkgs.sbcl ];
+            runtimeInputs = [ pkgs.sbcl pkgs.openssl ];
             text = ''
-              export CL_SOURCE_REGISTRY="$PWD//"
+              export OPENSSL="${pkgs.openssl}/bin/openssl"
+              export CL_SOURCE_REGISTRY="$PWD//:${cl-crypto-kit.outPath}/"
               sbcl --noinform --non-interactive --eval '(require :asdf)' --eval '(asdf:test-system "cl-tls-kit")'
             '';
           };
