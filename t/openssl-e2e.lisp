@@ -112,6 +112,9 @@
               "OpenSSL certificate failure has the expected condition")))))
 
 (defun run-openssl-e2e-tests ()
+  (unless (find-package "CRYPTO-KIT")
+    (format t "OpenSSL E2E: skipped; cl-crypto-kit is unavailable~%")
+    (return-from run-openssl-e2e-tests :skipped))
   (let* ((openssl (or (uiop:getenv "OPENSSL") "openssl"))
          (directory (merge-pathnames "cl-tls-kit-openssl-e2e/"
                                      (uiop:temporary-directory)))
