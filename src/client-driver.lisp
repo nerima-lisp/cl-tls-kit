@@ -10,6 +10,7 @@
   provider key-exchange on-send verify-certificate-verify
   hostname alpn cipher-suites supported-groups signature-algorithms
   client-hello private-key selected-group hash suite state
+  certificate-chain peer-certificate trust-anchors now verify-signature
   (transcript (make-array 0 :element-type '(unsigned-byte 8)))
   early-secret handshake-secret master-secret handshake-traffic-secret
   client-finished-key server-finished-key)
@@ -44,6 +45,7 @@
 
 (defun make-tls13-client-driver
     (&key provider key-exchange on-send verify-certificate-verify hostname alpn
+          trust-anchors (now (get-universal-time)) verify-signature
           (cipher-suites #( #x1301 #x1302 #x1303))
           (supported-groups '(#x001d #x0017))
           (signature-algorithms #( #x0804 #x0805 #x0806 #x0403 #x0503)))
@@ -59,7 +61,9 @@ the crypto provider supplies hash, HKDF, HMAC, and AEAD primitives."
                   :verify-certificate-verify verify-certificate-verify
                   :hostname hostname :alpn alpn :cipher-suites cipher-suites
                   :supported-groups supported-groups
-                  :signature-algorithms signature-algorithms :suite suite
+                  :signature-algorithms signature-algorithms
+                  :trust-anchors trust-anchors :now now
+                  :verify-signature verify-signature :suite suite
                   :hash (tls13-cipher-suite-hash suite) :state :new)))
     (setf (tls13-client-driver-early-secret driver)
           (tls13-early-secret provider (tls13-client-driver-hash driver)))
@@ -120,6 +124,31 @@ the crypto provider supplies hash, HKDF, HMAC, and AEAD primitives."
                     (tls13-client-driver-hash driver)
                     (tls13-client-driver-early-secret driver) dhe)))
       (setf (tls13-client-driver-handshake-secret driver) secret))))
+
+(defun %driver-certificate-chain (message)
+  (let ((entries (tls13-certificate-entries message)))
+    (unless entries (%driver-fail :missing-server-certificate))
+    (handler-case
+        (mapcar (lambda (entry)
+                  (cl-tls-kit.x509:parse-certificate-der
+                   (tls13-certificate-entry-certificate entry)))
+                entries)
+      (error (condition)
+        (declare (ignore condition))
+        (%driver-fail :invalid-server-certificate)))))
+
+(defun %driver-verify-certificate-chain (driver chain)
+  (when (tls13-client-driver-trust-anchors driver)
+    (handler-case
+        (verify-certificate-chain
+         chain :hostname (tls13-client-driver-hostname driver)
+         :trust-anchors (tls13-client-driver-trust-anchors driver)
+         :now (tls13-client-driver-now driver)
+         :verify-signature (tls13-client-driver-verify-signature driver))
+      (certificate-verification-error (condition)
+        (%driver-fail (list :certificate-verification-failed
+                            :condition condition
+                            :certificate (verification-error-certificate condition)))))))
 
 (defun tls13-client-driver-step (driver wire)
   "Consume one complete TLS handshake message and advance DRIVER.
@@ -186,10 +215,27 @@ Returns DRIVER; outgoing messages are delivered to ON-SEND."
       (tls13-encrypted-extensions
        (setf (tls13-client-driver-state driver) :awaiting-certificate))
       (tls13-certificate
-       (when (tls13-client-driver-verify-certificate-verify driver)
-         (funcall (tls13-client-driver-verify-certificate-verify driver) message))
+       (let ((chain (%driver-certificate-chain message)))
+         (setf (tls13-client-driver-certificate-chain driver) chain
+               (tls13-client-driver-peer-certificate driver) (first chain))
+         (%driver-verify-certificate-chain driver chain))
        (setf (tls13-client-driver-state driver) :awaiting-certificate-verify))
       (tls13-certificate-verify
+       (let ((certificate (tls13-client-driver-peer-certificate driver)))
+         (unless certificate (%driver-fail :missing-server-certificate))
+         (when (tls13-client-driver-verify-certificate-verify driver)
+           (funcall (tls13-client-driver-verify-certificate-verify driver) message))
+         (handler-case
+             (tls13-verify-certificate-verify
+              (tls13-client-driver-client-hello driver) :server
+              (cl-tls-kit.x509:x509-certificate-public-key certificate)
+              (tls13-certificate-verify-algorithm message)
+              (tls13-certificate-verify-signature message)
+              (%driver-digest driver prior-transcript)
+              (tls13-client-driver-verify-signature driver))
+           (tls13-verification-error (condition)
+             (%driver-fail (list :certificate-verify-failed
+                                 (tls13-verification-error-reason condition))))))
        (setf (tls13-client-driver-state driver) :awaiting-finished))
       (tls13-finished
        (unless (tls13-verify-finished

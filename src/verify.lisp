@@ -88,7 +88,8 @@
 (defun %crypto-public-key (key)
   (if (not (typep key 'cl-tls-kit.x509:x509-public-key))
       key
-      (let* ((package (find-package "CRYPTO-KIT"))
+      (let* ((package (or (find-package "CRYPTO-KIT")
+                          (find-package "CL-CRYPTO-KIT")))
              (constructor (and package
                                (find-symbol
                                 (ecase (cl-tls-kit.x509:x509-public-key-type key)
@@ -103,8 +104,12 @@
                          (cl-tls-kit.x509:x509-rsa-public-key-modulus key)
                          (cl-tls-kit.x509:x509-rsa-public-key-exponent key)))
           (:ec (funcall constructor
-                        (if (string= (cl-tls-kit.x509:x509-ec-public-key-curve key)
-                                     "1.3.132.0.34") :p384 :p256)
+                        (cond ((string= (cl-tls-kit.x509:x509-ec-public-key-curve key)
+                                       "1.3.132.0.34") :p384)
+                              ((string= (cl-tls-kit.x509:x509-ec-public-key-curve key)
+                                        "1.2.840.10045.3.1.7") :p256)
+                              (t (error 'certificate-signature-provider-unavailable
+                                        :certificate key)))
                         (cl-tls-kit.x509:x509-ec-public-key-point key)))
           (:ed25519 (funcall constructor
                              (cl-tls-kit.x509:x509-ed25519-public-key-point key)))))))
@@ -171,6 +176,12 @@
                                       values)))
             (error 'invalid-certificate-chain :certificate certificate)))))))
 
+(defun %check-chain-name-constraints (chain index certificate)
+  "Apply every ancestor's name constraints to CERTIFICATE."
+  (dolist (issuer (nthcdr (1+ index) chain))
+    (when (%field issuer :name-constraints nil)
+      (%check-name-constraints certificate issuer))))
+
 (defun %check-certificate (certificate issuer ca-depth now verify-signature)
   (unless (%time-ok-p certificate now)
     (error 'certificate-expired :certificate certificate))
@@ -188,6 +199,11 @@
       (when (and limit (> ca-depth limit))
         (error 'path-length-exceeded :certificate issuer)))))
 
+(defun %subordinate-ca-depth (chain issuer-index)
+  "Count CA certificates below the issuer in a leaf-first chain."
+  (count-if (lambda (item) (eq t (%basic-constraint item :ca nil)))
+            (subseq chain 1 (min issuer-index (length chain)))))
+
 (defun verify-certificate-chain (chain &key hostname trust-anchors
                                            (now (get-universal-time)) verify-signature)
   "Verify a leaf-first CHAIN using crypto-kit's common VERIFY-SIGNATURE API.
@@ -196,9 +212,9 @@ VERIFY-SIGNATURE, when supplied, has the same four-argument contract."
   (loop for certificate in chain
         for issuer in (append (rest chain) '(nil))
         for index from 0
-        do (%check-certificate certificate issuer
-                               (count-if (lambda (item) (%field item :basic-constraints nil))
-                                         (nthcdr (+ index 2) chain))
+        do (%check-chain-name-constraints chain index certificate)
+           (%check-certificate certificate issuer
+                               (%subordinate-ca-depth chain (1+ index))
                                now verify-signature))
   (let* ((leaf (first chain)) (root (car (last chain))))
     (unless (and trust-anchors (member root trust-anchors :test #'equalp))

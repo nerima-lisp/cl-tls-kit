@@ -73,4 +73,59 @@
                (self-signed-certificate () t)
                (condition () nil))
              "self-signed condition"))
+    (let ((now (get-universal-time)))
+      (let* ((leaf (list :issuer "intermediate" :subject "leaf"
+                       :not-before 0 :not-after (1+ now)
+                       :signature-algorithm :rsa-pkcs1-sha256))
+           (intermediate (list :issuer "root" :subject "intermediate"
+                               :not-before 0 :not-after (1+ now)
+                               :signature-algorithm :rsa-pkcs1-sha256
+                               :basic-constraints '(:ca t)))
+           (root (list :subject "root" :not-before 0 :not-after (1+ now)
+                       :self-signed t
+                       :basic-constraints '(:ca t :path-length 0)))
+             (chain (list leaf intermediate root)))
+        (check (handler-case
+                 (progn
+                   (verify-certificate-chain
+                    chain :trust-anchors (list root)
+                    :verify-signature (lambda (&rest arguments)
+                                        (declare (ignore arguments)) t))
+                   nil)
+               (path-length-exceeded () t)
+               (condition () nil))
+               "pathLen counts subordinate CA certificates")
+        (setf (getf (getf root :basic-constraints) :path-length) 1)
+        (check (verify-certificate-chain
+                chain :trust-anchors (list root)
+                :verify-signature (lambda (&rest arguments)
+                                    (declare (ignore arguments)) t))
+               "pathLen permits the configured subordinate CA depth")))
+    (let* ((leaf (list :issuer "root" :subject "leaf"
+                       :not-before 0 :not-after (1+ (get-universal-time))
+                       :signature-algorithm :rsa-pkcs1-sha256
+                       :subject-alternative-names '((:dns "outside.example"))))
+           (root (list :subject "root" :self-signed t
+                       :not-before 0 :not-after (1+ (get-universal-time))
+                       :basic-constraints '(:ca t)
+                       :name-constraints
+                       '(:permitted-subtrees ((:dns "allowed.example")))))
+           (chain (list leaf root)))
+      (check (handler-case
+                 (progn
+                   (verify-certificate-chain
+                    chain :trust-anchors (list root)
+                    :verify-signature (lambda (&rest arguments)
+                                        (declare (ignore arguments)) t))
+                   nil)
+               (invalid-certificate-chain () t)
+               (condition () nil))
+             "ancestor name constraints reject an invalid leaf")
+      (setf (getf leaf :subject-alternative-names)
+            '((:dns "allowed.example")))
+      (check (verify-certificate-chain
+              chain :trust-anchors (list root)
+              :verify-signature (lambda (&rest arguments)
+                                  (declare (ignore arguments)) t))
+             "ancestor name constraints permit a valid leaf"))
     t))

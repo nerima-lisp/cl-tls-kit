@@ -15,10 +15,12 @@
    #:hostname-match-p #:normalize-hostname #:hostname-mismatch
    #:hostname-mismatch-hostname #:hostname-mismatch-names
    #:verify-certificate #:verify-certificate-chain
-   #:certificate-expired #:certificate-hostname-mismatch
+   #:expired #:certificate-expired #:certificate-hostname-mismatch
    #:untrusted-root #:self-signed-certificate #:not-a-ca
    #:path-length-exceeded #:bad-signature #:invalid-key-usage
-   #:invalid-extended-key-usage #:default-trust-store-path
+   #:invalid-extended-key-usage #:invalid-certificate-chain
+   #:certificate-signature-provider-unavailable
+   #:default-trust-store-path
    #:load-trust-store
    #:tls13-crypto-provider #:make-cl-crypto-kit-provider
    #:tls13-hkdf-extract #:tls13-hkdf-expand-label #:tls13-derive-secret
@@ -26,6 +28,14 @@
    #:tls13-traffic-key-and-iv #:tls13-finished-key
    #:tls13-compute-finished-verify-data #:tls13-resumption-secret
    #:tls13-traffic-secret
+   #:tls13-aead-seal #:tls13-aead-open #:tls13-provider-constant-time-equal-p
+   #:tls13-traffic-state #:tls13-traffic-state-p #:make-tls13-traffic-state
+   #:tls13-traffic-state-provider #:tls13-traffic-state-hash
+   #:tls13-traffic-state-algorithm #:tls13-traffic-state-secret
+   #:tls13-traffic-state-key #:tls13-traffic-state-iv
+   #:tls13-traffic-state-sequence-number #:tls13-update-traffic-secret
+   #:encrypt-tls13-record #:decrypt-tls13-record
+   #:encrypt-tls13-traffic-record #:decrypt-tls13-traffic-record
    #:tls-record-error #:tls-record-error-reason #:tls-record-overflow
    #:tls-invalid-record #:tls-sequence-overflow #:tls-aead-error
    #:tls-plaintext #:make-tls-plaintext #:tls-plaintext-p
@@ -36,9 +46,45 @@
    #:encode-tls-ciphertext #:decode-tls-ciphertext #:tls-record-nonce
    #:tls-record-additional-data #:encrypt-tls-record #:decrypt-tls-record
    #:tls-key-update-p #:tls-close-notify-p
+   #:+tls-record-version+ #:+tls-plaintext-limit+ #:+tls-ciphertext-limit+
+   #:+tls-content-type-alert+ #:+tls-content-type-handshake+
+   #:+tls-content-type-application-data+ #:+tls-handshake-key-update+
+   #:+tls-alert-close-notify+
    #:tls13-error #:tls13-error-message #:tls13-decode-error #:tls13-state-error
    #:tls-extension #:make-tls-extension #:tls-extension-p #:tls-extension-type
    #:tls-extension-data
+   #:+tls13-cipher-suite-aes-128-gcm-sha256+
+   #:+tls13-cipher-suite-aes-256-gcm-sha384+
+   #:+tls13-cipher-suite-chacha20-poly1305-sha256+
+   #:+tls13-cipher-suite-aes-128-ccm-sha256+
+   #:+tls13-cipher-suite-aes-128-ccm-8-sha256+
+   #:+tls13-cipher-suite-aes-128-gcm-sha256-name+
+   #:+tls13-cipher-suite-aes-256-gcm-sha384-name+
+   #:+tls13-cipher-suite-chacha20-poly1305-sha256-name+
+   #:+tls13-cipher-suite-aes-128-ccm-sha256-name+
+   #:+tls13-cipher-suite-aes-128-ccm-8-sha256-name+
+   #:+tls13-cipher-suite-aes-128-gcm-sha256-hash+
+   #:+tls13-cipher-suite-aes-256-gcm-sha384-hash+
+   #:+tls13-cipher-suite-chacha20-poly1305-sha256-hash+
+   #:+tls13-cipher-suite-aes-128-ccm-sha256-hash+
+   #:+tls13-cipher-suite-aes-128-ccm-8-sha256-hash+
+   #:+tls13-cipher-suite-aes-128-gcm-sha256-key-length+
+   #:+tls13-cipher-suite-aes-256-gcm-sha384-key-length+
+   #:+tls13-cipher-suite-chacha20-poly1305-sha256-key-length+
+   #:+tls13-cipher-suite-aes-128-ccm-sha256-key-length+
+   #:+tls13-cipher-suite-aes-128-ccm-8-sha256-key-length+
+   #:tls13-cipher-suite-name #:tls13-cipher-suite-hash
+   #:tls13-cipher-suite-key-length
+   #:+tls13-extension-server-name+
+   #:+tls13-extension-application-layer-protocol-negotiation+
+   #:+tls13-extension-supported-groups+
+   #:+tls13-extension-signature-algorithms+
+   #:+tls13-extension-supported-versions+ #:+tls13-extension-key-share+
+   #:encode-sni-extension #:decode-sni-extension
+   #:encode-alpn-extension #:decode-alpn-extension
+   #:encode-key-share-extension #:decode-key-share-extension
+   #:encode-key-share-server-extension #:decode-key-share-server-extension
+   #:make-tls13-client-hello-extensions
    #:tls13-client-hello #:make-tls13-client-hello
    #:tls13-client-hello-legacy-version #:tls13-client-hello-random
    #:tls13-client-hello-session-id #:tls13-client-hello-cipher-suites
@@ -77,6 +123,7 @@
    #:tls-client-state-error #:unexpected-message #:tls12-downgrade-sentinel
    #:tls12-downgrade-version
    #:tls-client-verification-error #:tls-client-alert-error
+   #:tls-client-verification-certificate #:tls-client-verification-cause
    #:tls-client-alert-level #:tls-client-alert-description
    #:tls13-verification-error #:tls13-verification-error-reason
    #:tls13-verification-error-message #:tls13-invalid-verification-input
@@ -86,7 +133,24 @@
    #:tls13-signature-scheme-name #:tls13-client-hello-signature-algorithms
    #:tls13-signature-scheme-offered-p #:tls13-validate-certificate-verify-algorithm
    #:tls13-certificate-verify-signature-input #:tls13-constant-time-equal-p
-   #:tls13-verify-finished #:tls13-verify-certificate-verify))
+   #:tls13-verify-finished #:tls13-verify-certificate-verify
+   #:tls13-client-driver #:tls13-client-driver-p #:make-tls13-client-driver
+   #:tls13-client-driver-start #:tls13-client-driver-step
+   #:tls13-client-driver-error #:tls13-client-driver-error-reason
+   #:quic-tls-boundary-error #:quic-tls-boundary-decode-error
+   #:make-quic-tls-boundary #:quic-tls-boundary-p
+   #:quic-tls-boundary-role #:quic-tls-boundary-transport-parameters
+   #:quic-tls-boundary-received-transport-parameters
+   #:quic-tls-boundary-transcript #:quic-tls-boundary-selected-group
+   #:quic-tls-boundary-cookie #:quic-tls-transport-parameters-extension
+   #:quic-tls-boundary-send #:quic-tls-boundary-send-message
+   #:quic-tls-boundary-feed #:quic-tls-boundary-receive
+   #:quic-tls-boundary-send-with-transport-parameters
+   #:quic-tls-boundary-feed-crypto #:quic-tls-boundary-send-client-hello
+   #:quic-tls-boundary-send-hrr #:quic-tls-boundary-emit-secret
+   #:quic-tls-boundary-send-alert #:quic-tls-boundary-send-close-notify
+   #:quic-tls-boundary-send-key-update #:quic-tls-boundary-close-notify-p
+   #:quic-tls-boundary-alert-p #:quic-tls-boundary-key-update-p))
 
 (defpackage #:cl-tls-kit.x509
   (:use #:cl #:cl-tls-kit)

@@ -128,6 +128,39 @@ Return the offered uint16 scheme identifiers in wire order."
                                      :missing-verify-signature
                                      "provider has no verify-signature operation"))))
 
+(defun %tls13-certificate-public-key (public-key)
+  "Convert a parsed X.509 public key when CL-CRYPTO-KIT is available."
+  (if (not (typep public-key 'cl-tls-kit.x509:x509-public-key))
+      public-key
+      (let* ((package (or (find-package "CRYPTO-KIT")
+                          (find-package "CL-CRYPTO-KIT")))
+             (constructor-name
+               (case (cl-tls-kit.x509:x509-public-key-type public-key)
+                 (:rsa "MAKE-RSA-PUBLIC-KEY")
+                 (:ec "MAKE-EC-PUBLIC-KEY")
+                 (:ed25519 "MAKE-ED25519-PUBLIC-KEY")))
+             (constructor (and package (find-symbol constructor-name package))))
+        (unless (and constructor (fboundp constructor))
+          (%tls13-verification-fail 'tls13-verification-provider-error
+                                    :missing-public-key-constructor
+                                    "crypto provider cannot construct the certificate public key"))
+        (case (cl-tls-kit.x509:x509-public-key-type public-key)
+          (:rsa (funcall constructor
+                         (cl-tls-kit.x509:x509-rsa-public-key-modulus public-key)
+                         (cl-tls-kit.x509:x509-rsa-public-key-exponent public-key)))
+          (:ec (funcall constructor
+                        (cond ((string= (cl-tls-kit.x509:x509-ec-public-key-curve public-key)
+                                       "1.3.132.0.34") :p384)
+                              ((string= (cl-tls-kit.x509:x509-ec-public-key-curve public-key)
+                                        "1.2.840.10045.3.1.7") :p256)
+                              (t (%tls13-verification-fail
+                                  'tls13-verification-provider-error
+                                  :unsupported-public-key
+                                  "unsupported EC certificate curve")))
+                        (cl-tls-kit.x509:x509-ec-public-key-point public-key)))
+          (:ed25519 (funcall constructor
+                             (cl-tls-kit.x509:x509-ed25519-public-key-point public-key)))))))
+
 (defun %tls13-crypto-scheme (scheme)
   (or (cdr (assoc scheme *tls13-signature-scheme-names*))
       (%tls13-verification-fail 'tls13-signature-algorithm-mismatch
@@ -154,7 +187,7 @@ the loaded crypto provider, and must return true for a valid signature."
          (verify-signature (%tls13-verify-signature-provider provider))
          (result (handler-case
                      (funcall verify-signature (%tls13-crypto-scheme scheme)
-                              public-key input signature)
+                              (%tls13-certificate-public-key public-key) input signature)
                    (tls13-verification-error (condition) (error condition))
                    (error (condition)
                      (%tls13-verification-fail 'tls13-verification-provider-error
