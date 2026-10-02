@@ -49,6 +49,9 @@
              "-days" (princ-to-string days) "-subj"
              (format nil "/CN=~A" common-name)
              "-addext" (format nil "subjectAltName=DNS:~A" common-name)
+             "-addext" "basicConstraints=critical,CA:FALSE"
+             "-addext" "keyUsage=critical,digitalSignature"
+             "-addext" "extendedKeyUsage=serverAuth"
              "-keyout" key-name "-out" path))
     (declare (ignore output))
     (unless (zerop exit-code)
@@ -58,7 +61,8 @@
   (uiop:launch-program
    (list openssl "s_server" "-accept" (princ-to-string port)
          "-cert" certificate "-key" key "-tls1_3"
-         "-ciphersuites" suite "-groups" groups "-no_ticket" "-quiet")
+         "-ciphersuites" suite "-groups" groups "-alpn" "http/1.1"
+         "-no_ticket" "-www" "-quiet")
    :output *standard-output* :error-output *error-output*
    :wait nil))
 
@@ -73,11 +77,24 @@
    :provider provider
    :key-exchange (%openssl-e2e-key-exchange)
    :on-send nil
+   :alpn '("http/1.1")
    :cipher-suites (vector suite)
    :supported-groups groups
    :hostname "localhost"
    :trust-anchors trust-anchors
    :now (or now (get-universal-time))))
+
+(defun %openssl-e2e-http-request ()
+  (map 'vector #'char-code
+       (format nil "GET / HTTP/1.0~C~CHost: localhost~C~CConnection: close~C~C~C~C"
+               #\Return #\Linefeed #\Return #\Linefeed
+               #\Return #\Linefeed #\Return #\Linefeed)))
+
+(defun %openssl-e2e-read-application (driver)
+  (loop repeat 16
+        for plaintext = (cl-tls-kit:tls13-client-driver-read-record driver)
+        when plaintext return (cl-tls-kit:tls-plaintext-fragment plaintext)
+        finally (error "OpenSSL did not return application data")))
 
 (defun %openssl-e2e-with-server
     (openssl suite groups certificate key function)
@@ -113,8 +130,7 @@
 
 (defun run-openssl-e2e-tests ()
   (unless (find-package "CRYPTO-KIT")
-    (format t "OpenSSL E2E: skipped; cl-crypto-kit is unavailable~%")
-    (return-from run-openssl-e2e-tests :skipped))
+    (error "OpenSSL E2E requires cl-crypto-kit in the canonical test process"))
   (let* ((openssl (or (uiop:getenv "OPENSSL") "openssl"))
          (directory (merge-pathnames "cl-tls-kit-openssl-e2e/"
                                      (uiop:temporary-directory)))
@@ -144,7 +160,8 @@
                 certificate key
                 (lambda (port)
                   (let ((driver (%openssl-e2e-driver "127.0.0.1" port provider
-                                                     suite group)))
+                                                     suite group :trust-anchors
+                                                     (list (%openssl-e2e-pem-certificate certificate)))))
                     (unwind-protect
                          (progn
                            (cl-tls-kit:tls13-client-driver-connect driver)
@@ -152,18 +169,25 @@
                            (check (eq (cl-tls-kit::tls13-client-driver-state driver)
                                       :connected)
                                   "cl-tls-kit completes an OpenSSL TLS 1.3 handshake")
-                           (cl-tls-kit:tls13-client-driver-key-update driver 0)
                            (incf assertions)
-                           (check (eq (cl-tls-kit::tls13-client-driver-state driver)
-                                      :connected)
-                                  "cl-tls-kit sends an encrypted KeyUpdate"))
+                           (check (string= (cl-tls-kit:tls13-client-driver-negotiated-alpn driver)
+                                           "http/1.1")
+                                  "OpenSSL negotiates the requested ALPN")
+                           (cl-tls-kit:tls13-client-driver-key-update driver 0)
+                           (cl-tls-kit:tls13-client-driver-write
+                            driver (%openssl-e2e-http-request))
+                           (incf assertions)
+                           (let ((response (%openssl-e2e-read-application driver)))
+                             (check (search "HTTP/1.0" (map 'string #'code-char response))
+                                    "OpenSSL accepts application data after KeyUpdate")))
                       (cl-tls-kit:tls13-client-driver-close driver)))))))
            (incf selected)
            (%openssl-e2e-with-server
             openssl "TLS_AES_128_GCM_SHA256" "P-256" certificate key
             (lambda (port)
               (let ((driver (%openssl-e2e-driver "127.0.0.1" port provider #x1301
-                                                 '(#x001d #x0017))))
+                                                 '(#x001d #x0017) :trust-anchors
+                                                 (list (%openssl-e2e-pem-certificate certificate)))))
                 (unwind-protect
                      (progn
                        (cl-tls-kit:tls13-client-driver-connect driver)
@@ -171,6 +195,17 @@
                        (check (eq (cl-tls-kit::tls13-client-driver-state driver)
                                   :connected)
                               "cl-tls-kit completes an OpenSSL HelloRetryRequest"))
+                       (incf assertions)
+                       (check (string= (cl-tls-kit:tls13-client-driver-negotiated-alpn driver)
+                                       "http/1.1")
+                              "OpenSSL negotiates ALPN after HelloRetryRequest")
+                       (cl-tls-kit:tls13-client-driver-write
+                        driver (%openssl-e2e-http-request))
+                       (incf assertions)
+                       (check (search "HTTP/1.0"
+                                      (map 'string #'code-char
+                                           (%openssl-e2e-read-application driver)))
+                              "OpenSSL accepts application data after HelloRetryRequest")
                   (cl-tls-kit:tls13-client-driver-close driver)
                   (incf assertions)
                   (check (eq (cl-tls-kit::tls13-client-driver-state driver) :closed)
@@ -195,6 +230,8 @@
               openssl provider other-certificate other-key anchor
               (get-universal-time) 'cl-tls-kit:untrusted-root)
              (incf assertions))
+           (check (plusp selected) "OpenSSL E2E selected at least one case")
+           (check (plusp assertions) "OpenSSL E2E executed at least one assertion")
            (format t "OpenSSL E2E: selected test count: ~D; assertions: ~D~%"
                    selected assertions)
            t)
