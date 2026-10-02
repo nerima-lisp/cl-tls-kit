@@ -72,7 +72,7 @@
               export HOME="$TMPDIR/home"
               export XDG_CACHE_HOME="$TMPDIR/cache"
               mkdir -p "$HOME" "$XDG_CACHE_HOME"
-            export CL_SOURCE_REGISTRY="$PWD//:${cl-crypto-kit.outPath}/"
+              export CL_SOURCE_REGISTRY="$PWD//:${cl-crypto-kit.outPath}/"
               ${pkgs.sbcl}/bin/sbcl --noinform --non-interactive \
                 --load t/crypto-provider-check.lisp
               ${pkgs.sbcl}/bin/sbcl --noinform --non-interactive \

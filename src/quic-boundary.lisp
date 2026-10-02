@@ -33,21 +33,22 @@
       (setf value (+ (ash value 8) (aref bytes (+ position index)))))))
 
 (defun %quic-extension (type data)
+  (unless (<= (length data) #xffff)
+    (error 'quic-tls-boundary-error :message "TLS extension data is too long"))
   (%quic-cat (vector (ldb (byte 8 8) type) (ldb (byte 8 0) type))
              (vector (ldb (byte 8 8) (length data)) (ldb (byte 8 0) (length data)))
              data))
 (defun quic-tls-transport-parameters-extension (parameters)
-  "Encode PARAMETERS as the TLS quic_transport_parameters extension body."
+  "Encode PARAMETERS as a complete TLS quic_transport_parameters extension."
   (%quic-extension +quic-tls-transport-parameters-extension+
                    (%quic-octets parameters)))
 
 (defstruct (quic-tls-boundary (:constructor %make-quic-tls-boundary))
   role on-crypto on-secret on-transport-parameters hash-function
-  (pending (make-array 0 :element-type '(unsigned-byte 8))
-           :type (vector (unsigned-byte 8)))
   ;; RFC 9001 carries TLS bytes in an independently offset CRYPTO stream at
-  ;; each encryption level.  Keep the old PENDING slot for the sequential API
-  ;; and use these slots for offset-aware input.
+  ;; each encryption level, so sequential input needs one pending buffer per
+  ;; level as well.
+  (pending '())
   (crypto-next-offsets '())
   (crypto-fragments '())
   (crypto-delivered '())
@@ -99,7 +100,9 @@
     alist))
 
 (defun %quic-feed-sequential (boundary level bytes)
-  (let ((pending (%quic-cat (quic-tls-boundary-pending boundary)
+  (let ((pending (%quic-cat (or (%quic-level-value
+                                 (quic-tls-boundary-pending boundary) level)
+                                (make-array 0 :element-type '(unsigned-byte 8)))
                             bytes))
         (messages '()))
     (loop while (>= (length pending) 4) do
@@ -133,7 +136,9 @@
                     (funcall (quic-tls-boundary-on-transport-parameters boundary)
                              boundary parameters))))
               (push (list :level level :type type :wire wire :body body) messages)))))
-    (setf (quic-tls-boundary-pending boundary) pending)
+    (setf (quic-tls-boundary-pending boundary)
+          (%quic-set-level-value (quic-tls-boundary-pending boundary)
+                                 level pending))
     (nreverse messages)))
 
 (defun %quic-feed-offset (boundary level offset bytes)
@@ -200,9 +205,8 @@
           nil)))))
 
 (defun %quic-extension-data (body start)
-  (let ((total (%quic-integer body start 2)) (cursor (+ start 2))
-        (end (+ start 2 (%quic-integer body start 2))) (found nil))
-    (declare (ignore total))
+  (let* ((total (%quic-integer body start 2)) (cursor (+ start 2))
+         (end (+ start 2 total)) (found nil))
     (when (> end (length body))
       (error 'quic-tls-boundary-decode-error :message "truncated TLS extensions"))
     (loop while (< cursor end) do
@@ -222,7 +226,7 @@
 (defun %quic-message-extensions (type body)
   (case type
     (1 (let ((p 34))
-         (when (> p (length body))
+         (when (>= p (length body))
            (error 'quic-tls-boundary-decode-error :message "truncated ClientHello"))
          (let* ((sid-length (aref body 34)) (p (+ 35 sid-length))
                 (suites-length (%quic-integer body p 2))
@@ -248,19 +252,36 @@
       (setf (quic-tls-boundary-transcript boundary) (list message-hash)))))
 
 (defun quic-tls-boundary-send (boundary level type body)
-  "Frame one TLS handshake message and offer it to the QUIC CRYPTO writer."
+  "Frame one TLS handshake message for direct QUIC CRYPTO delivery.
+
+BODY is the handshake message body, not a TLS record fragment.  The returned
+octets include the four-byte TLS handshake header and are passed unchanged to
+the ON-CRYPTO callback."
   (unless (%quic-level-p level)
     (error 'quic-tls-boundary-error :message "invalid QUIC encryption level"))
+  (unless (typep type '(integer 0 255))
+    (error 'quic-tls-boundary-error :message "invalid TLS handshake type"))
   (let* ((body (%quic-octets body))
-         (wire (%quic-cat (vector type) (%quic-u24 (length body)) body)))
+         (body-length (length body))
+         (wire (progn
+                 (when (> body-length #xffffff)
+                   (error 'quic-tls-boundary-error :message "TLS handshake body is too long"))
+                 (%quic-cat (vector type) (%quic-u24 body-length) body))))
     (%quic-transcript-add boundary wire)
     (%quic-emit boundary level wire)))
 
 (defun quic-tls-boundary-send-message (boundary level type message)
-  (let ((wire (if (and (= type 2) (typep message 'tls13-hello-retry-request))
-                  (encode-hello-retry-request message)
-                  (funcall (cdr (assoc type *tls13-message-codecs*)) message))))
-    (quic-tls-boundary-send boundary level type wire)))
+  "Encode MESSAGE and send it through the direct QUIC CRYPTO boundary.
+
+This uses the existing TLS handshake codecs and does not create a TLS record."
+  (let ((encoder (if (and (typep type '(integer 0 255)) (= type 2)
+                          (typep message 'tls13-hello-retry-request))
+                     #'encode-hello-retry-request
+                     (cdr (assoc type *tls13-message-codecs*)))))
+    (unless encoder
+      (error 'quic-tls-boundary-error :message "unsupported TLS handshake type"))
+    (let ((wire (funcall encoder message)))
+      (quic-tls-boundary-send boundary level type wire))))
 
 (defun quic-tls-boundary-feed (boundary level bytes &key offset)
   "Consume CRYPTO payload bytes, retaining an incomplete handshake message."
@@ -269,8 +290,12 @@
   (if offset
       (%quic-feed-offset boundary level offset bytes)
       (%quic-feed-sequential boundary level (%quic-octets bytes))))
-(defun quic-tls-boundary-receive (boundary level bytes)
-  (quic-tls-boundary-feed boundary level bytes))
+(defun quic-tls-boundary-receive (boundary level bytes &key offset)
+  "Receive direct QUIC CRYPTO data, optionally identified by its OFFSET.
+
+The result is a list of complete handshake messages.  No TLS record decoding
+is performed."
+  (quic-tls-boundary-feed boundary level bytes :offset offset))
 
 (defun quic-tls-boundary-feed-crypto (boundary level offset bytes)
   "Feed one RFC 9001 CRYPTO frame's OFFSET and DATA into the TLS boundary."
@@ -278,10 +303,18 @@
 
 (defun quic-tls-boundary-send-with-transport-parameters
     (boundary level type body parameters)
-  "Add the QUIC transport-parameters extension to ClientHello or EE."
+  "Add RFC 9001's quic_transport_parameters extension to ClientHello or EE.
+
+ClientHello is valid only for a client boundary and EncryptedExtensions only
+for a server boundary.  PARAMETERS is the already encoded QUIC transport
+parameters value; this function only wraps it in the TLS extension."
   (let ((body (%quic-octets body)) (parameters (%quic-octets parameters)))
     (unless (member type '(1 8))
       (error 'quic-tls-boundary-error :message "transport parameters require CH or EE"))
+    (unless (or (and (= type 1) (eq (quic-tls-boundary-role boundary) :client))
+                (and (= type 8) (eq (quic-tls-boundary-role boundary) :server)))
+      (error 'quic-tls-boundary-error
+             :message "transport parameters message does not match boundary role"))
     (let* ((start (%quic-message-extensions type body))
            (extensions-end (+ start 2 (when start (%quic-integer body start 2))))
            (extension (quic-tls-transport-parameters-extension parameters)))

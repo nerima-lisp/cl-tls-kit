@@ -69,8 +69,11 @@ handshake messages to its `on-send` callback. It sequences ClientHello,
 HelloRetryRequest, ServerHello, EncryptedExtensions, Certificate,
 CertificateVerify, and Finished. When `trust-anchors` is supplied, it parses
 the peer certificate chain, applies the hostname and chain policy, and verifies
-CertificateVerify through the provider. Socket/record transport remains an
-explicit callback boundary; the driver does not create or protect TLS records.
+CertificateVerify through the provider. Supply `transport-read` and
+`transport-write` callbacks, or use `make-tls13-client-driver-over-tcp`, to
+read and write TLS records. `tls13-client-driver-connect`, `-write`, `-close`,
+and `-key-update` provide the blocking stream lifecycle; cryptographic key
+exchange and certificate-signature verification remain provider callbacks.
 
 ## QUIC TLS boundary
 
@@ -80,9 +83,27 @@ supports sequential input and RFC 9001 offset-aware `feed-crypto` input,
 tracks the TLS transcript and HelloRetryRequest state, and forwards emitted
 handshake bytes through `on-crypto`. `on-secret` receives encryption-level
 read/write secrets without deriving keys or protecting QUIC packets.
-Transport parameters are supplied as opaque bytes and can be added to
-ClientHello or EncryptedExtensions. This boundary does not implement QUIC
-packets, CRYPTO frame scheduling, packet protection, or a TLS provider.
+Transport parameters are supplied as opaque RFC 9001 bytes and can be added to
+ClientHello from a client boundary or EncryptedExtensions from a server
+boundary. `quic-tls-boundary-send-message` and
+`quic-tls-boundary-receive` are the public message output/input boundary;
+`quic-tls-boundary-feed-crypto` additionally accepts CRYPTO offsets. They carry
+TLS handshake bytes directly in CRYPTO data and do not pass through the TLS
+record layer. The exported `cl-tls-kit` package
+(also nicknamed `tls-kit`) is the package a QUIC implementation such as
+`cl-quic-kit` can call.
+
+This boundary does not implement QUIC packets, CRYPTO frame scheduling, packet
+protection, key derivation, or a TLS provider. It also does not provide a TCP
+transport or an end-to-end QUIC connection; the QUIC implementation owns those
+layers and supplies CRYPTO offsets and callbacks. SNI and ALPN are TLS 1.3
+ClientHello extensions built with `encode-sni-extension`,
+`encode-alpn-extension`, and `make-tls13-client-hello-extensions`; QUIC
+transport parameters are a separate extension and are not SNI or ALPN.
+
+The project supports TLS 1.3 only. It does not negotiate TLS 1.2 or fall back
+to it. OCSP and CRL fetching or revocation-status evaluation are outside the
+scope of certificate parsing and chain verification.
 
 ## Public API
 

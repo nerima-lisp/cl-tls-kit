@@ -13,9 +13,11 @@
                     run-client-driver-tests
                     run-verification-tests
                     run-quic-boundary-tests))
-      (unless (funcall test)
-        (error "cl-tls-kit test group failed: ~A" test))
-      (incf passed))
+      (let ((result (funcall test)))
+        (unless (member result '(t :skipped))
+          (error "cl-tls-kit test group failed: ~A" test))
+        (when (eq result t)
+          (incf passed))))
     (let ((rfc8448-result (run-rfc8448-tests)))
       (when (eq rfc8448-result t)
         (incf passed))

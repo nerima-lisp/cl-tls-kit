@@ -1,6 +1,12 @@
 (in-package #:cl-tls-kit/test)
 
 (defun run-quic-boundary-tests ()
+  (dolist (name '(make-quic-tls-boundary quic-tls-boundary-send
+                  quic-tls-boundary-send-message quic-tls-boundary-feed
+                  quic-tls-boundary-receive quic-tls-boundary-feed-crypto
+                  quic-tls-boundary-send-with-transport-parameters))
+    (check (eq (nth-value 1 (find-symbol (symbol-name name) :cl-tls-kit)) :external)
+           "QUIC boundary is public from cl-tls-kit"))
   (let ((crypto '()) (secrets '()) (transport '()))
     (let ((boundary
             (make-quic-tls-boundary
@@ -17,6 +23,12 @@
              (wire (quic-tls-boundary-send-client-hello boundary :initial hello)))
         (check (= (aref wire 0) 1) "QUIC carries a TLS handshake header")
         (check (equalp (first (first crypto)) :initial) "ClientHello uses Initial CRYPTO")
+        (check (equalp (quic-tls-boundary-send-message
+                        (make-quic-tls-boundary :role :client) :initial 1 hello)
+                       (quic-tls-boundary-send
+                        (make-quic-tls-boundary :role :client) :initial 1
+                        (encode-client-hello hello)))
+               "public message output matches the raw CRYPTO handshake wire")
         (check (equalp (quic-tls-boundary-feed
                         (make-quic-tls-boundary :role :server
                                                 :on-transport-parameters
@@ -37,13 +49,24 @@
                            (make-quic-tls-boundary :role :client)
                            :initial 20 #(1 2 3)))
              (server (make-quic-tls-boundary :role :server)))
-        (check (null (quic-tls-boundary-feed-crypto server :initial 5
-                                                     (subseq offset-wire 5)))
+        (check (null (quic-tls-boundary-receive server :initial
+                                                (subseq offset-wire 5)
+                                                :offset 5))
                "out-of-order CRYPTO data waits for offset zero")
         (let ((messages (quic-tls-boundary-feed-crypto server :initial 0
                                                         (subseq offset-wire 0 5))))
           (check (= (length messages) 1)
                  "offset-aware CRYPTO data is reassembled")))
+      (let* ((initial-part #(20 0))
+             (handshake-wire (quic-tls-boundary-send
+                              (make-quic-tls-boundary :role :client)
+                              :handshake 20 #(4 5)))
+             (server (make-quic-tls-boundary :role :server)))
+        (check (null (quic-tls-boundary-feed server :initial initial-part))
+               "incomplete Initial handshake stays at its encryption level")
+        (quic-tls-boundary-feed server :handshake handshake-wire)
+        (check (= (length (quic-tls-boundary-feed server :initial #(0 2 1 2))) 1)
+               "sequential CRYPTO input is buffered independently per level"))
       (quic-tls-boundary-emit-secret boundary :handshake :write #(9 8))
       (check (equalp (first secrets) '(:handshake :write #(9 8)))
              "secret callback retains encryption level and direction")
@@ -58,7 +81,8 @@
          (hello (make-tls13-client-hello
                  #x0303 (make-array 32 :element-type '(unsigned-byte 8) :initial-element 2)
                  #() #( #x1301 #x1302) nil)))
-    (let* ((hello-wire (quic-tls-boundary-send-client-hello boundary :initial hello))
+    (let* ((hello-wire (quic-tls-boundary-send-client-hello
+                        (make-quic-tls-boundary :role :client) :initial hello))
            (hrr (quic-tls-boundary-send-hrr boundary #x001d #(7 7))))
       (check (= (aref hrr 0) 2) "HRR is encoded as ServerHello handshake")
       (check (= (length (second (quic-tls-boundary-transcript boundary))) 6)
@@ -82,4 +106,26 @@
     (check (equalp (quic-tls-boundary-received-transport-parameters boundary)
                    #(9 8))
            "server EncryptedExtensions carries transport_parameters 0x0039"))
+  (let* ((parameters #(9 8))
+         (server (make-quic-tls-boundary :role :server))
+         (body (encode-encrypted-extensions
+                (make-tls13-encrypted-extensions nil)))
+         (wire (quic-tls-boundary-send-with-transport-parameters
+                server :handshake 8 body parameters))
+         (client (make-quic-tls-boundary :role :client)))
+    (check (equalp (quic-tls-transport-parameters-extension parameters)
+                   #(0 57 0 2 9 8))
+           "RFC 9001 transport_parameters extension wire encoding")
+    (quic-tls-boundary-receive client :handshake wire)
+    (check (equalp (quic-tls-boundary-received-transport-parameters client)
+                   parameters)
+           "RFC 9001 transport parameters cross the public EE boundary")
+    (check (handler-case
+               (progn
+                  (quic-tls-boundary-send-with-transport-parameters
+                   (make-quic-tls-boundary :role :server) :initial 1
+                  #() parameters)
+                 nil)
+             (quic-tls-boundary-error () t))
+           "transport parameters reject a role/message mismatch"))
   t)
