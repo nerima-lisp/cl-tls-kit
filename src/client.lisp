@@ -74,7 +74,8 @@ read callback receives the client and returns an encoded record or NIL.  A
 write callback receives the client and encoded bytes.  Provider callbacks
 receive the client and, for HANDSHAKE, an optional input message.  A
 :CLOSE-NOTIFY provider callback receives the client and returns the encoded
-record to pass to the transport write callback."
+record to pass to the transport write callback.  VERIFY-CERTIFICATE must be
+provided before a peer certificate can be accepted."
   (let ((read (or transport-read (getf transport :read)))
         (write (or transport-write (getf transport :write))))
     (%make-tls-client :transport-read read :transport-write write
@@ -265,13 +266,15 @@ record to pass to the transport write callback."
   )
 
 (defun %verify-peer (client certificate)
-  (when (tls-client-verify-certificate client)
-    (handler-case
-        (unless (funcall (tls-client-verify-certificate client) certificate)
-          (error "verification callback returned false"))
-      (condition (cause)
-        (error 'tls-client-verification-error :client client
-               :certificate certificate :cause cause)))))
+  (unless (tls-client-verify-certificate client)
+    (error 'tls-client-verification-error :client client
+           :certificate certificate :cause :missing-verification-callback))
+  (handler-case
+      (unless (funcall (tls-client-verify-certificate client) certificate)
+        (error "verification callback returned false"))
+    (condition (cause)
+      (error 'tls-client-verification-error :client client
+             :certificate certificate :cause cause))))
 
 (defun %apply-provider-result (client result)
   (when (and (listp result) (getf result :transcript))

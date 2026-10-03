@@ -92,6 +92,16 @@
                  :provider (list :handshake
                                  (lambda (client input)
                                    (declare (ignore client input))
+                                   '(:state :connected :peer-certificate :leaf))))) )
+    (check (handler-case (progn (tls-kit::tls-client-start client) nil)
+             (tls-kit::tls-client-verification-error (condition)
+               (eq (tls-kit::tls-client-verification-cause condition)
+                   :missing-verification-callback)))
+           "peer certificates are rejected without a verification callback"))
+  (let ((client (tls-kit::make-tls-client
+                 :provider (list :handshake
+                                 (lambda (client input)
+                                   (declare (ignore client input))
                                    '(:state :connected :peer-certificate :leaf)))
                  :verify-certificate (lambda (certificate)
                                        (declare (ignore certificate))

@@ -324,7 +324,17 @@
 
 (defun %general-subtrees (sequence)
   (mapcar (lambda (subtree)
-            (let ((base (first (%children subtree))))
+            (let* ((parts (%children subtree))
+                   (base (first parts))
+                   (range (rest parts)))
+              (unless (and base
+                           (every (lambda (field)
+                                   (case (der-tag field)
+                                     (#x80 (and (= (length (der-content field)) 1)
+                                                (zerop (aref (der-content field) 0))))
+                                     (otherwise nil)))
+                                   range))
+                (%fail "GeneralSubtree minimum must be zero and maximum must be absent"))
               (case (der-tag base)
                 (#x82 (list :dns (%string base)))
                 (#x87 (list :ip (der-content base)))

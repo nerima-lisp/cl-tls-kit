@@ -138,6 +138,14 @@
                (self-signed-certificate () t)
                (condition () nil))
              "self-signed condition"))
+    (let ((anchor (list :subject "anchor" :not-before 0
+                        :not-after (1+ (get-universal-time))
+                        :self-signed t
+                        :basic-constraints '(:ca nil)
+                        :key-usage '(:digital-signature))))
+      (check (verify-certificate-chain
+              (list anchor) :trust-anchors (list anchor))
+             "explicit trust anchors are accepted without revalidating CA constraints"))
     (let ((now (get-universal-time)))
       (let* ((leaf (list :issuer "intermediate" :subject "leaf"
                        :not-before 0 :not-after (1+ now)
@@ -211,6 +219,17 @@
                    nil)
                (invalid-certificate-chain () t))
              "critical name constraints reject unsupported SAN types"))
+    (dolist (range '(#(128 1 1) #(129 1 0)))
+      (let ((bytes (concatenate '(vector (unsigned-byte 8))
+                                #(48 14 48 12 130 7 97 108 108 111 119 101 100)
+                                range)))
+        (multiple-value-bind (sequence end)
+            (cl-tls-kit.x509::%read-der bytes)
+          (check (= end (length bytes)) "Name Constraints fixture is complete")
+          (check (handler-case
+                     (progn (cl-tls-kit.x509::%general-subtrees sequence) nil)
+                   (cl-tls-kit.x509:x509-error () t))
+                "Name Constraints reject non-zero minimum and present maximum"))))
     (let* ((now (get-universal-time))
            (leaf (cl-tls-kit.x509::make-x509-certificate
                   :issuer "root" :subject "leaf"

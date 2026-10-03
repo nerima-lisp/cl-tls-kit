@@ -75,6 +75,14 @@ read and write TLS records. `tls13-client-driver-connect`, `-write`, `-close`,
 and `-key-update` provide the blocking stream lifecycle; cryptographic key
 exchange and certificate-signature verification remain provider callbacks.
 
+The lower-level `make-tls-client` boundary requires a
+`:verify-certificate` callback whenever a peer certificate is received; a
+missing callback rejects the certificate. A caller-provided trust anchor is
+explicitly trusted and is not revalidated as an issued certificate, so its
+CA constraint, key usage, and self-signature are outside this policy. All
+certificates below the trust anchor remain subject to chain, signature,
+validity, and usage checks.
+
 ## QUIC TLS boundary
 
 `make-quic-tls-boundary` handles TLS handshake bytes carried in QUIC CRYPTO
