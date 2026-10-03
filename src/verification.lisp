@@ -161,8 +161,16 @@ Return the offered uint16 scheme identifiers in wire order."
           (:ed25519 (funcall constructor
                              (cl-tls-kit.x509:x509-ed25519-public-key-point public-key)))))))
 
+(defparameter *tls13-crypto-signature-scheme-names*
+  '((#x0403 . :ecdsa-p256-sha256)
+    (#x0503 . :ecdsa-p384-sha384)
+    (#x0804 . :rsa-pss-rsae-sha256)
+    (#x0805 . :rsa-pss-rsae-sha384)
+    (#x0806 . :rsa-pss-rsae-sha512)
+    (#x0807 . :ed25519)))
+
 (defun %tls13-crypto-scheme (scheme)
-  (or (cdr (assoc scheme *tls13-signature-scheme-names*))
+  (or (cdr (assoc scheme *tls13-crypto-signature-scheme-names*))
       (%tls13-verification-fail 'tls13-signature-algorithm-mismatch
                                 :unsupported-signature-scheme
                                 "unsupported CertificateVerify signature scheme #x~4,'0X"

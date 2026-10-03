@@ -41,11 +41,16 @@
     (declare (ignore error-output))
     (values output exit-code)))
 
-(defun %openssl-e2e-certificate (openssl path key-name common-name days &key ca)
+(defun %openssl-e2e-certificate (openssl path key-name common-name days
+                                  &key ca (key-type :rsa))
   (multiple-value-bind (output exit-code)
       (%openssl-e2e-run
        openssl
-       (list "req" "-x509" "-newkey" "rsa:2048" "-nodes"
+       (append (list "req" "-x509")
+               (if (eq key-type :ecdsa)
+                   (list "-newkey" "ec" "-pkeyopt" "ec_paramgen_curve:P-256")
+                   (list "-newkey" "rsa:2048"))
+               (list "-nodes"
              "-days" (princ-to-string days) "-subj"
              (format nil "/CN=~A" common-name)
              "-addext" (format nil "subjectAltName=DNS:~A" common-name)
@@ -56,7 +61,7 @@
                             "keyUsage=critical,keyCertSign,digitalSignature"
                             "keyUsage=critical,digitalSignature")
              "-addext" "extendedKeyUsage=serverAuth"
-             "-keyout" key-name "-out" path))
+             "-keyout" key-name "-out" path)))
     (declare (ignore output))
     (unless (zerop exit-code)
       (error "OpenSSL certificate generation failed"))))
@@ -146,6 +151,8 @@
          (other-key (namestring (merge-pathnames "other.key" directory)))
          (anchor-certificate (namestring (merge-pathnames "anchor.crt" directory)))
          (anchor-key (namestring (merge-pathnames "anchor.key" directory)))
+         (ecdsa-certificate (namestring (merge-pathnames "ecdsa.crt" directory)))
+         (ecdsa-key (namestring (merge-pathnames "ecdsa.key" directory)))
          (provider (cl-tls-kit:make-cl-crypto-kit-provider))
          (selected 0)
          (assertions 0))
@@ -219,6 +226,8 @@
            (%openssl-e2e-certificate openssl wrong-certificate wrong-key "wrong.local" 1)
            (%openssl-e2e-certificate openssl other-certificate other-key "other.local" 1)
            (%openssl-e2e-certificate openssl anchor-certificate anchor-key "localhost" 1 :ca t)
+           (%openssl-e2e-certificate openssl ecdsa-certificate ecdsa-key "localhost" 1
+                                     :key-type :ecdsa)
            (incf selected)
            (%openssl-e2e-with-server
             openssl "TLS_AES_128_GCM_SHA256" "X25519" anchor-certificate anchor-key
@@ -234,6 +243,29 @@
                        (check (eq (cl-tls-kit::tls13-client-driver-state driver)
                                   :connected)
                               "TLS 1.3 accepts a self-signed CA trust anchor with localhost SAN"))
+                  (cl-tls-kit:tls13-client-driver-close driver)))))
+           (incf selected)
+           (%openssl-e2e-with-server
+            openssl "TLS_AES_128_GCM_SHA256" "X25519" ecdsa-certificate ecdsa-key
+            (lambda (port)
+              (let ((driver (%openssl-e2e-driver
+                             "127.0.0.1" port provider #x1301 '(#x001d)
+                             :trust-anchors
+                             (list (%openssl-e2e-pem-certificate ecdsa-certificate)))))
+                (unwind-protect
+                     (progn
+                       (cl-tls-kit:tls13-client-driver-connect driver)
+                       (incf assertions)
+                       (check (eq (cl-tls-kit::tls13-client-driver-state driver)
+                                  :connected)
+                              "TLS 1.3 completes with an ECDSA P-256 certificate")
+                       (cl-tls-kit:tls13-client-driver-write
+                        driver (%openssl-e2e-http-request))
+                       (incf assertions)
+                       (check (search "HTTP/1.0"
+                                      (map 'string #'code-char
+                                           (%openssl-e2e-read-application driver)))
+                              "OpenSSL accepts application data after ECDSA CertificateVerify"))
                   (cl-tls-kit:tls13-client-driver-close driver)))))
            (let ((anchor (%openssl-e2e-pem-certificate certificate))
                  (future (+ (get-universal-time) (* 3 86400))))
@@ -265,4 +297,6 @@
       (ignore-errors (delete-file other-certificate))
       (ignore-errors (delete-file other-key))
       (ignore-errors (delete-file anchor-certificate))
-      (ignore-errors (delete-file anchor-key)))))
+      (ignore-errors (delete-file anchor-key))
+      (ignore-errors (delete-file ecdsa-certificate))
+      (ignore-errors (delete-file ecdsa-key)))))
