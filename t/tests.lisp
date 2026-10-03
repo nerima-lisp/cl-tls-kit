@@ -83,6 +83,19 @@
                (progn (cl-tls-kit.x509::%read-der #(31 1 0)) nil)
              (cl-tls-kit.x509:x509-error () t))
            "unsupported high-tag DER is rejected")
+    (dolist (bytes '(#(1 1 1)                    ; non-canonical BOOLEAN
+                     #(3 2 3 1)                  ; non-zero unused BIT STRING bits
+                     #(6 2 #x80 0)               ; non-minimal OID subidentifier
+                     #(34 0)                     ; constructed INTEGER
+                     #(49 6 2 1 2 2 1 1)))      ; unsorted SET members
+      (check (handler-case
+                 (multiple-value-bind (node ignored)
+                     (cl-tls-kit.x509::%read-der bytes)
+                   (declare (ignore ignored))
+                   (cl-tls-kit.x509::%validate-der-tree node)
+                   nil)
+               (cl-tls-kit.x509:x509-error () t))
+             "non-canonical DER primitive is rejected"))
     (check (handler-case
                (progn (cl-tls-kit.x509::%pem-octets
                        "-----BEGIN CERTIFICATE-----\n!!!!\n-----END CERTIFICATE-----") nil)
@@ -236,4 +249,22 @@
                (invalid-key-usage () t)
                (condition () nil))
              "leaf key usage requires digitalSignature for TLS server authentication"))
+    (let* ((leaf (list :issuer "root" :subject "leaf"
+                       :not-before 0 :not-after (1+ (get-universal-time))
+                       :signature-algorithm :rsa-pkcs1-sha256))
+           (root (list :subject "root" :self-signed t
+                       :not-before 0 :not-after (1+ (get-universal-time))
+                       :basic-constraints '(:ca t))))
+      (check (handler-case
+                 (progn
+                   (verify-certificate-chain
+                    (list leaf root) :trust-anchors (list root)
+                    :verify-signature (lambda (&rest arguments)
+                                        (declare (ignore arguments))
+                                        (error "provider internal failure")))
+                   nil)
+               (certificate-signature-provider-unavailable () t)
+               (bad-signature () nil)
+               (condition () nil))
+             "provider errors are not converted to bad signatures"))
     t))

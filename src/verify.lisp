@@ -133,14 +133,17 @@
   (let ((function (or verify-signature (%crypto-verify-function))))
     (unless (and function (or (functionp function) (fboundp function)))
       (error 'certificate-signature-provider-unavailable :certificate certificate))
-    (unless (handler-case
-                (funcall function
+    (handler-case
+        (unless (funcall function
                          (%signature-scheme certificate issuer)
                          (%crypto-public-key (%field issuer :public-key))
                          (%field certificate :tbs-certificate)
                          (%field certificate :signature))
-              (error () nil))
-      (error 'bad-signature :certificate certificate))))
+          (error 'bad-signature :certificate certificate))
+      (certificate-verification-error (condition)
+        (error condition))
+      (error ()
+        (error 'certificate-signature-provider-unavailable :certificate certificate)))))
 
 (defun %basic-constraint (certificate key &optional default)
   (let ((constraints (%field certificate :basic-constraints nil)))
