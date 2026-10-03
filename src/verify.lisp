@@ -22,6 +22,9 @@
 (define-condition invalid-certificate-chain (certificate-verification-error) ())
 (define-condition certificate-signature-provider-unavailable (certificate-verification-error) ())
 
+(defparameter +max-certificate-chain-length+ 16)
+(defparameter +max-certificate-chain-bytes+ (* 4 1024 1024))
+
 (defun %field (object key &optional default)
   (cond ((hash-table-p object) (gethash key object default))
         ((and (listp object) (or (null object) (keywordp (first object))))
@@ -89,6 +92,12 @@
           ((string= algorithm "1.3.101.112") :ed25519)
           (t (error 'bad-signature :certificate certificate))))))
 
+(defun %same-signature-algorithm-p (certificate)
+  (let ((outer (%field certificate :signature-algorithm))
+        (tbs (and (typep certificate 'cl-tls-kit.x509:x509-certificate)
+                  (cl-tls-kit.x509:x509-certificate-tbs-signature-algorithm certificate))))
+    (or (null tbs) (equalp outer tbs))))
+
 (defun %crypto-public-key (key)
   (if (not (typep key 'cl-tls-kit.x509:x509-public-key))
       key
@@ -119,6 +128,8 @@
                              (cl-tls-kit.x509:x509-ed25519-public-key-point key)))))))
 
 (defun %verify-signature (certificate issuer verify-signature)
+  (unless (%same-signature-algorithm-p certificate)
+    (error 'bad-signature :certificate certificate))
   (let ((function (or verify-signature (%crypto-verify-function))))
     (unless (and function (or (functionp function) (fboundp function)))
       (error 'certificate-signature-provider-unavailable :certificate certificate))
@@ -169,6 +180,11 @@
          (permitted (and constraints (getf constraints :permitted-subtrees)))
          (excluded (and constraints (getf constraints :excluded-subtrees))))
     (when constraints
+      (when (and (getf constraints :critical)
+                 (or (some (lambda (entry) (eq (first entry) :unsupported)) permitted)
+                     (some (lambda (entry) (eq (first entry) :unsupported)) excluded)
+                     (some (lambda (san) (not (member (first san) '(:dns :ip)))) names)))
+        (error 'invalid-certificate-chain :certificate certificate))
       (when (some (lambda (entry) (some (lambda (san) (%constraint-match-p entry san)) names))
                   excluded)
         (error 'invalid-certificate-chain :certificate certificate))
@@ -213,6 +229,14 @@
   "Verify a leaf-first CHAIN using crypto-kit's common VERIFY-SIGNATURE API.
 VERIFY-SIGNATURE, when supplied, has the same four-argument contract."
   (unless chain (error 'untrusted-root :certificate nil))
+  (when (> (length chain) +max-certificate-chain-length+)
+    (error 'invalid-certificate-chain :certificate (first chain)))
+  (let ((bytes 0))
+    (dolist (certificate chain)
+      (incf bytes (length (or (%field certificate :tbs-certificate) #())))
+      (incf bytes (length (or (%field certificate :signature) #())))
+      (when (> bytes +max-certificate-chain-bytes+)
+        (error 'invalid-certificate-chain :certificate certificate))))
   (loop for certificate in chain
         for issuer in (append (rest chain) '(nil))
         for index from 0

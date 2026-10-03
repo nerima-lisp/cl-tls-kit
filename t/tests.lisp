@@ -59,6 +59,48 @@
                (progn (cl-tls-kit.x509::%read-der #(48)) nil)
              (cl-tls-kit.x509:x509-error () t))
            "truncated X.509 DER has a domain error")
+    (check (handler-case
+               (progn (cl-tls-kit.x509::%read-der #(48 129 127)) nil)
+             (cl-tls-kit.x509:x509-error () t))
+           "non-minimal DER length is rejected")
+    (check (handler-case
+               (progn (cl-tls-kit.x509::%read-der #(48 131 16 0 1)) nil)
+             (cl-tls-kit.x509:x509-error () t))
+           "oversized DER length is rejected")
+    (check (handler-case
+               (let ((bytes #(5 0)))
+                 (dotimes (i 40)
+                   (setf bytes (concatenate '(vector (unsigned-byte 8))
+                                            (vector 48 (length bytes)) bytes)))
+                 (multiple-value-bind (root ignored)
+                     (cl-tls-kit.x509::%read-der bytes)
+                   (declare (ignore ignored))
+                   (cl-tls-kit.x509::%children root))
+                 nil)
+             (cl-tls-kit.x509:x509-error () t))
+           "DER nesting depth is bounded")
+    (check (handler-case
+               (progn (cl-tls-kit.x509::%read-der #(31 1 0)) nil)
+             (cl-tls-kit.x509:x509-error () t))
+           "unsupported high-tag DER is rejected")
+    (check (handler-case
+               (progn (cl-tls-kit.x509::%pem-octets
+                       "-----BEGIN CERTIFICATE-----\n!!!!\n-----END CERTIFICATE-----") nil)
+             (cl-tls-kit.x509:x509-error () t))
+           "invalid PEM base64 is rejected")
+    (check (handler-case
+               (progn (verify-certificate-chain (make-list 17)) nil)
+             (invalid-certificate-chain () t))
+           "certificate chain count is bounded")
+    (check (handler-case
+               (progn
+                 (verify-certificate-chain
+                  (list (list :tbs-certificate
+                              (make-array (1+ (* 4 1024 1024))
+                                          :element-type '(unsigned-byte 8)))))
+                 nil)
+             (invalid-certificate-chain () t))
+           "certificate chain byte size is bounded")
     (let ((utc (cl-tls-kit.x509::make-der
                 :tag #x17 :content (map 'vector #'char-code "991231235959Z"))))
       (check (= (cl-tls-kit.x509::%time utc)
@@ -138,6 +180,43 @@
               :verify-signature (lambda (&rest arguments)
                                   (declare (ignore arguments)) t))
              "ancestor name constraints permit a valid leaf"))
+    (let* ((leaf (list :issuer "root" :subject "leaf"
+                       :not-before 0 :not-after (1+ (get-universal-time))
+                       :subject-alternative-names '((:uri "https://outside.example"))))
+           (root (list :subject "root" :self-signed t
+                       :not-before 0 :not-after (1+ (get-universal-time))
+                       :basic-constraints '(:ca t)
+                       :name-constraints '(:critical t
+                                           :permitted-subtrees ((:dns "allowed.example")))))
+           (chain (list leaf root)))
+      (check (handler-case
+                 (progn
+                   (verify-certificate-chain
+                    chain :trust-anchors (list root)
+                    :verify-signature (lambda (&rest arguments)
+                                        (declare (ignore arguments)) t))
+                   nil)
+               (invalid-certificate-chain () t))
+             "critical name constraints reject unsupported SAN types"))
+    (let* ((now (get-universal-time))
+           (leaf (cl-tls-kit.x509::make-x509-certificate
+                  :issuer "root" :subject "leaf"
+                  :not-before 0 :not-after (1+ now)
+                  :signature-algorithm :rsa-pkcs1-sha256
+                  :tbs-signature-algorithm :ecdsa-p256-sha256
+                  :tbs-certificate #(1) :signature #(2)))
+           (root (list :subject "root" :self-signed t
+                       :not-before 0 :not-after (1+ now)
+                       :basic-constraints '(:ca t))))
+      (check (handler-case
+                 (progn
+                   (verify-certificate-chain
+                    (list leaf root) :trust-anchors (list root)
+                    :verify-signature (lambda (&rest arguments)
+                                        (declare (ignore arguments)) t))
+                   nil)
+               (bad-signature () t))
+             "TBSCertificate signature algorithm must match outer algorithm"))
     (let* ((leaf (list :issuer "root" :subject "leaf"
                        :not-before 0 :not-after (1+ (get-universal-time))
                        :signature-algorithm :rsa-pkcs1-sha256

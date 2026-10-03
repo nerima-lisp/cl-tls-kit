@@ -173,5 +173,6 @@
    #:x509-public-key-parameters #:x509-public-key-data
    #:x509-rsa-public-key-modulus #:x509-rsa-public-key-exponent
    #:x509-ec-public-key-curve #:x509-ec-public-key-point
-   #:x509-ed25519-public-key-point #:parse-x509-certificate
+   #:x509-ed25519-public-key-point #:x509-certificate-tbs-signature-algorithm
+   #:parse-x509-certificate
    #:parse-certificate #:parse-certificate-der #:x509-name-string))
