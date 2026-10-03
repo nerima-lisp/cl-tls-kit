@@ -41,7 +41,7 @@
     (declare (ignore error-output))
     (values output exit-code)))
 
-(defun %openssl-e2e-certificate (openssl path key-name common-name days)
+(defun %openssl-e2e-certificate (openssl path key-name common-name days &key ca)
   (multiple-value-bind (output exit-code)
       (%openssl-e2e-run
        openssl
@@ -49,8 +49,12 @@
              "-days" (princ-to-string days) "-subj"
              (format nil "/CN=~A" common-name)
              "-addext" (format nil "subjectAltName=DNS:~A" common-name)
-             "-addext" "basicConstraints=critical,CA:FALSE"
-             "-addext" "keyUsage=critical,digitalSignature"
+             "-addext" (if ca
+                            "basicConstraints=critical,CA:TRUE"
+                            "basicConstraints=critical,CA:FALSE")
+             "-addext" (if ca
+                            "keyUsage=critical,keyCertSign,digitalSignature"
+                            "keyUsage=critical,digitalSignature")
              "-addext" "extendedKeyUsage=serverAuth"
              "-keyout" key-name "-out" path))
     (declare (ignore output))
@@ -140,6 +144,8 @@
          (wrong-key (namestring (merge-pathnames "wrong.key" directory)))
          (other-certificate (namestring (merge-pathnames "other.crt" directory)))
          (other-key (namestring (merge-pathnames "other.key" directory)))
+         (anchor-certificate (namestring (merge-pathnames "anchor.crt" directory)))
+         (anchor-key (namestring (merge-pathnames "anchor.key" directory)))
          (provider (cl-tls-kit:make-cl-crypto-kit-provider))
          (selected 0)
          (assertions 0))
@@ -212,6 +218,23 @@
                          "cl-tls-kit sends close_notify")))))
            (%openssl-e2e-certificate openssl wrong-certificate wrong-key "wrong.local" 1)
            (%openssl-e2e-certificate openssl other-certificate other-key "other.local" 1)
+           (%openssl-e2e-certificate openssl anchor-certificate anchor-key "localhost" 1 :ca t)
+           (incf selected)
+           (%openssl-e2e-with-server
+            openssl "TLS_AES_128_GCM_SHA256" "X25519" anchor-certificate anchor-key
+            (lambda (port)
+              (let ((driver (%openssl-e2e-driver
+                             "127.0.0.1" port provider #x1301 '(#x001d)
+                             :trust-anchors
+                             (list (%openssl-e2e-pem-certificate anchor-certificate)))))
+                (unwind-protect
+                     (progn
+                       (cl-tls-kit:tls13-client-driver-connect driver)
+                       (incf assertions)
+                       (check (eq (cl-tls-kit::tls13-client-driver-state driver)
+                                  :connected)
+                              "TLS 1.3 accepts a self-signed CA trust anchor with localhost SAN"))
+                  (cl-tls-kit:tls13-client-driver-close driver)))))
            (let ((anchor (%openssl-e2e-pem-certificate certificate))
                  (future (+ (get-universal-time) (* 3 86400))))
              (incf selected)
@@ -240,4 +263,6 @@
       (ignore-errors (delete-file wrong-certificate))
       (ignore-errors (delete-file wrong-key))
       (ignore-errors (delete-file other-certificate))
-      (ignore-errors (delete-file other-key)))))
+      (ignore-errors (delete-file other-key))
+      (ignore-errors (delete-file anchor-certificate))
+      (ignore-errors (delete-file anchor-key)))))
