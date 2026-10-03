@@ -145,6 +145,7 @@
    #:make-quic-tls-boundary #:quic-tls-boundary-p
    #:quic-tls-boundary-role #:quic-tls-boundary-transport-parameters
    #:quic-tls-boundary-received-transport-parameters
+   #:quic-tls-boundary-cipher-suite #:quic-tls-boundary-alpn
    #:quic-tls-boundary-transcript #:quic-tls-boundary-selected-group
    #:quic-tls-boundary-cookie #:quic-tls-transport-parameters-extension
    #:quic-tls-boundary-send #:quic-tls-boundary-send-message
@@ -152,6 +153,7 @@
    #:quic-tls-boundary-send-with-transport-parameters
    #:quic-tls-boundary-feed-crypto #:quic-tls-boundary-send-client-hello
    #:quic-tls-boundary-send-hrr #:quic-tls-boundary-emit-secret
+   #:quic-tls-boundary-emit-cipher-suite #:quic-tls-boundary-emit-alpn
    #:quic-tls-boundary-send-alert #:quic-tls-boundary-send-close-notify
    #:quic-tls-boundary-send-key-update #:quic-tls-boundary-close-notify-p
    #:quic-tls-boundary-alert-p #:quic-tls-boundary-key-update-p))

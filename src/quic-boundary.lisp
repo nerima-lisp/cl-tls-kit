@@ -44,7 +44,8 @@
                    (%quic-octets parameters)))
 
 (defstruct (quic-tls-boundary (:constructor %make-quic-tls-boundary))
-  role on-crypto on-secret on-transport-parameters hash-function
+  role on-crypto on-secret on-cipher-suite on-alpn on-transport-parameters
+  hash-function
   ;; RFC 9001 carries TLS bytes in an independently offset CRYPTO stream at
   ;; each encryption level, so sequential input needs one pending buffer per
   ;; level as well.
@@ -53,36 +54,79 @@
   (crypto-fragments '())
   (crypto-delivered '())
   (transcript '())
-  transport-parameters received-transport-parameters
+  transport-parameters received-transport-parameters cipher-suite alpn
   (hrr-seen-p nil) selected-group cookie)
 
 (defun make-quic-tls-boundary (&key (role :client) on-crypto on-secret
+                                    on-cipher-suite on-alpn
                                     on-transport-parameters hash-function
                                     transport-parameters)
   (unless (member role '(:client :server))
     (error 'quic-tls-boundary-error :message "role must be :client or :server"))
   (%make-quic-tls-boundary :role role :on-crypto on-crypto :on-secret on-secret
+                           :on-cipher-suite on-cipher-suite :on-alpn on-alpn
                            :on-transport-parameters on-transport-parameters
                            :hash-function hash-function
                            :transport-parameters
                            (and transport-parameters (%quic-octets transport-parameters))))
 
-(defun %quic-level-p (level)
-  (member level '(:initial :handshake :0-rtt :1-rtt)))
+(defun %quic-level (level)
+  (case level
+    ((:initial :handshake :application) level)
+    (:1-rtt :application)
+    (otherwise nil)))
 (defun %quic-direction-p (direction)
   (member direction '(:read :write)))
 (defun %quic-emit (boundary level wire)
-  (when (quic-tls-boundary-on-crypto boundary)
-    (funcall (quic-tls-boundary-on-crypto boundary) boundary level wire))
+  (let ((level (%quic-level level)))
+    (when (quic-tls-boundary-on-crypto boundary)
+      (funcall (quic-tls-boundary-on-crypto boundary) boundary level wire)))
   wire)
+
+(defun quic-tls-boundary-emit-cipher-suite (boundary cipher-suite)
+  "Record and notify the TLS cipher suite selected for QUIC.
+
+The boundary does not negotiate this value.  A TLS handshake implementation
+calls this function after validating the peer's ServerHello."
+  (unless (and (typep cipher-suite '(unsigned-byte 16))
+               (tls13-cipher-suite-name cipher-suite))
+    (error 'quic-tls-boundary-error :message "unsupported TLS cipher suite"))
+  (when (and (quic-tls-boundary-cipher-suite boundary)
+             (/= (quic-tls-boundary-cipher-suite boundary) cipher-suite))
+    (error 'quic-tls-boundary-error :message "conflicting TLS cipher suite"))
+  (setf (quic-tls-boundary-cipher-suite boundary) cipher-suite)
+  (when (quic-tls-boundary-on-cipher-suite boundary)
+    (funcall (quic-tls-boundary-on-cipher-suite boundary)
+             boundary cipher-suite))
+  cipher-suite)
+
+(defun quic-tls-boundary-emit-alpn (boundary alpn)
+  "Record and notify the negotiated ALPN protocol.
+
+The boundary does not select or validate protocol policy; the TLS handshake
+implementation supplies the already negotiated protocol name."
+  (unless (and (stringp alpn) (> (length alpn) 0))
+    (error 'quic-tls-boundary-error :message "ALPN must be a non-empty string"))
+  (when (and (quic-tls-boundary-alpn boundary)
+             (not (string= (quic-tls-boundary-alpn boundary) alpn)))
+    (error 'quic-tls-boundary-error :message "conflicting negotiated ALPN"))
+  (setf (quic-tls-boundary-alpn boundary) alpn)
+  (when (quic-tls-boundary-on-alpn boundary)
+    (funcall (quic-tls-boundary-on-alpn boundary) boundary alpn))
+  alpn)
+
 (defun quic-tls-boundary-emit-secret (boundary level direction secret)
-  "Forward one QUIC encryption-level secret without deriving or protecting it."
-  (unless (and (%quic-level-p level) (%quic-direction-p direction))
-    (error 'quic-tls-boundary-error :message "invalid QUIC secret level or direction"))
-  (let ((secret (%quic-octets secret)))
-    (when (quic-tls-boundary-on-secret boundary)
-      (funcall (quic-tls-boundary-on-secret boundary) boundary level direction secret))
-    secret))
+  "Forward one established QUIC encryption-level secret.
+
+The TLS implementation must derive SECRET.  This boundary only validates
+the level and forwards the opaque value to the QUIC packet implementation."
+  (let ((level (%quic-level level)))
+    (unless (and level (%quic-direction-p direction))
+      (error 'quic-tls-boundary-error :message "invalid QUIC secret level or direction"))
+    (let ((secret (%quic-octets secret)))
+      (when (quic-tls-boundary-on-secret boundary)
+        (funcall (quic-tls-boundary-on-secret boundary) boundary level direction secret))
+      secret)))
 
 (defun %quic-transcript-bytes (boundary)
   (apply #'%quic-cat (nreverse (copy-list (quic-tls-boundary-transcript boundary)))))
@@ -260,18 +304,19 @@
 BODY is the handshake message body, not a TLS record fragment.  The returned
 octets include the four-byte TLS handshake header and are passed unchanged to
 the ON-CRYPTO callback."
-  (unless (%quic-level-p level)
-    (error 'quic-tls-boundary-error :message "invalid QUIC encryption level"))
-  (unless (typep type '(integer 0 255))
-    (error 'quic-tls-boundary-error :message "invalid TLS handshake type"))
-  (let* ((body (%quic-octets body))
-         (body-length (length body))
-         (wire (progn
-                 (when (> body-length #xffffff)
-                   (error 'quic-tls-boundary-error :message "TLS handshake body is too long"))
-                 (%quic-cat (vector type) (%quic-u24 body-length) body))))
-    (%quic-transcript-add boundary wire)
-    (%quic-emit boundary level wire)))
+  (let ((level (%quic-level level)))
+    (unless level
+      (error 'quic-tls-boundary-error :message "invalid QUIC encryption level"))
+    (unless (typep type '(integer 0 255))
+      (error 'quic-tls-boundary-error :message "invalid TLS handshake type"))
+    (let* ((body (%quic-octets body))
+           (body-length (length body))
+           (wire (progn
+                   (when (> body-length #xffffff)
+                     (error 'quic-tls-boundary-error :message "TLS handshake body is too long"))
+                   (%quic-cat (vector type) (%quic-u24 body-length) body))))
+      (%quic-transcript-add boundary wire)
+      (%quic-emit boundary level wire))))
 
 (defun quic-tls-boundary-send-message (boundary level type message)
   "Encode MESSAGE and send it through the direct QUIC CRYPTO boundary.
@@ -288,11 +333,12 @@ This uses the existing TLS handshake codecs and does not create a TLS record."
 
 (defun quic-tls-boundary-feed (boundary level bytes &key offset)
   "Consume CRYPTO payload bytes, retaining an incomplete handshake message."
-  (unless (%quic-level-p level)
-    (error 'quic-tls-boundary-error :message "invalid QUIC encryption level"))
-  (if offset
-      (%quic-feed-offset boundary level offset bytes)
-      (%quic-feed-sequential boundary level (%quic-octets bytes))))
+  (let ((level (%quic-level level)))
+    (unless level
+      (error 'quic-tls-boundary-error :message "invalid QUIC encryption level"))
+    (if offset
+        (%quic-feed-offset boundary level offset bytes)
+        (%quic-feed-sequential boundary level (%quic-octets bytes)))))
 (defun quic-tls-boundary-receive (boundary level bytes &key offset)
   "Receive direct QUIC CRYPTO data, optionally identified by its OFFSET.
 
@@ -351,9 +397,9 @@ parameters value; this function only wraps it in the TLS extension."
 
 (defun quic-tls-boundary-send-alert (boundary level description &key (fatal-p nil))
   "Emit a TLS alert as raw CRYPTO data; alerts are not TLS records in QUIC."
-  (let ((wire (vector (if fatal-p 2 1) description)))
-    (unless (and (typep description '(integer 0 255))
-                 (member level '(:handshake :1-rtt :initial)))
+  (let ((level (%quic-level level))
+        (wire (vector (if fatal-p 2 1) description)))
+    (unless (and (typep description '(integer 0 255)) level)
       (error 'quic-tls-boundary-error :message "invalid QUIC TLS alert"))
     (%quic-emit boundary level wire)))
 
@@ -378,6 +424,7 @@ parameters value; this function only wraps it in the TLS extension."
           make-quic-tls-boundary quic-tls-boundary-p
           quic-tls-boundary-role quic-tls-boundary-transport-parameters
           quic-tls-boundary-received-transport-parameters
+          quic-tls-boundary-cipher-suite quic-tls-boundary-alpn
           quic-tls-boundary-transcript quic-tls-boundary-selected-group
           quic-tls-boundary-cookie
           quic-tls-transport-parameters-extension quic-tls-boundary-send
@@ -385,7 +432,8 @@ parameters value; this function only wraps it in the TLS extension."
           quic-tls-boundary-receive quic-tls-boundary-send-with-transport-parameters
           quic-tls-boundary-feed-crypto
           quic-tls-boundary-send-client-hello quic-tls-boundary-send-hrr
-          quic-tls-boundary-emit-secret quic-tls-boundary-send-alert
+          quic-tls-boundary-emit-secret quic-tls-boundary-emit-cipher-suite
+          quic-tls-boundary-emit-alpn quic-tls-boundary-send-alert
           quic-tls-boundary-send-close-notify quic-tls-boundary-send-key-update
           quic-tls-boundary-close-notify-p quic-tls-boundary-alert-p
           quic-tls-boundary-key-update-p))

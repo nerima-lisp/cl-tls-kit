@@ -119,10 +119,7 @@ the crypto provider supplies hash, HKDF, HMAC, and AEAD primitives."
          (share (%driver-key-share driver group))
          (random (or (and (listp (tls13-client-driver-key-exchange driver))
                           (getf (tls13-client-driver-key-exchange driver) :random))
-                     (lambda (length)
-                       (declare (ignore length))
-                       (make-array 32 :element-type '(unsigned-byte 8)
-                                   :initial-element 0))))
+                     #'%tls-client-csprng-octets))
          (client (make-tls13-client-hello
                   #x0303
                   (funcall random 32)
@@ -271,6 +268,19 @@ Returns DRIVER; outgoing messages are delivered to ON-SEND."
     (typecase message
       (tls13-server-hello
        (%tls-client-check-server-hello nil message)
+       (handler-case
+           (tls-client-check-server-random nil
+                                           (tls13-server-hello-random message))
+         (tls12-downgrade-sentinel (condition)
+           (declare (ignore condition))
+           (%driver-fail :downgrade-sentinel)))
+       (unless (member (tls13-server-hello-cipher-suite message)
+                       (coerce (tls13-client-driver-cipher-suites driver) 'list))
+         (%driver-fail :unoffered-cipher-suite))
+       (let ((server-share (%driver-server-key-share message)))
+         (unless (member (car server-share)
+                         (tls13-client-driver-supported-groups driver))
+           (%driver-fail :unrequested-key-share-group)))
        (setf (tls13-client-driver-suite driver)
              (tls13-server-hello-cipher-suite message)
              (tls13-client-driver-hash driver)

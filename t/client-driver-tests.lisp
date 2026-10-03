@@ -55,5 +55,51 @@
              "driver includes SNI")
       (check (find 51 (tls13-client-hello-extensions hello)
                    :key #'tls-extension-type)
-             "driver includes key_share"))
+             "driver includes key_share")
+      (check (not (every #'zerop (tls13-client-hello-random hello)))
+             "driver ClientHello random uses CSPRNG")
+      (check (not (every #'zerop (tls13-client-hello-session-id hello)))
+             "driver ClientHello session ID uses CSPRNG"))
+    (let ((bad-suite (make-tls13-server-hello
+                      #x0303 (make-array 32 :element-type '(unsigned-byte 8)) #()
+                      #x1305 (list (make-tls-extension 43 #(3 4))
+                                   (make-tls-extension
+                                    51 (encode-key-share-server-extension
+                                        #x001d #(1 2)))))))
+      (check (handler-case
+                 (progn (tls13-client-driver-step
+                         driver (encode-handshake 2 bad-suite)) nil)
+               (tls13-client-driver-error (condition)
+                 (eq (tls13-client-driver-error-reason condition)
+                     :unoffered-cipher-suite)))
+             "driver rejects an unoffered cipher suite"))
+    (let ((bad-group (make-tls13-server-hello
+                      #x0303 (make-array 32 :element-type '(unsigned-byte 8)) #()
+                      #x1301 (list (make-tls-extension 43 #(3 4))
+                                   (make-tls-extension
+                                    51 (encode-key-share-server-extension
+                                        #x0019 #(1 2)))))))
+      (check (handler-case
+                 (progn (tls13-client-driver-step
+                         driver (encode-handshake 2 bad-group)) nil)
+               (tls13-client-driver-error (condition)
+                 (eq (tls13-client-driver-error-reason condition)
+                     :unrequested-key-share-group)))
+             "driver rejects an unrequested key-share group"))
+    (let ((downgrade (make-array 32 :element-type '(unsigned-byte 8)
+                                 :initial-element 0)))
+      (replace downgrade #(68 79 87 78 71 82 68 1) :start1 24)
+      (let ((bad-random (make-tls13-server-hello
+                         #x0303 downgrade #() #x1301
+                         (list (make-tls-extension 43 #(3 4))
+                               (make-tls-extension
+                                51 (encode-key-share-server-extension
+                                    #x001d #(1 2)))))))
+        (check (handler-case
+                   (progn (tls13-client-driver-step
+                           driver (encode-handshake 2 bad-random)) nil)
+                 (tls13-client-driver-error (condition)
+                   (eq (tls13-client-driver-error-reason condition)
+                       :downgrade-sentinel)))
+               "driver rejects a downgrade sentinel")))
   t))

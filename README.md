@@ -78,11 +78,19 @@ exchange and certificate-signature verification remain provider callbacks.
 ## QUIC TLS boundary
 
 `make-quic-tls-boundary` handles TLS handshake bytes carried in QUIC CRYPTO
-streams. It accepts `:initial`, `:handshake`, `:0-rtt`, and `:1-rtt` levels,
-supports sequential input and RFC 9001 offset-aware `feed-crypto` input,
+streams. Its contract levels are `:initial`, `:handshake`, and `:application`;
+the former `:1-rtt` name remains accepted and is normalized to `:application`
+for compatibility. `:0-rtt` is rejected because this boundary does not expose
+0-RTT TLS secrets. It supports sequential input and RFC 9001 offset-aware
+`feed-crypto` input,
 tracks the TLS transcript and HelloRetryRequest state, and forwards emitted
-handshake bytes through `on-crypto`. `on-secret` receives encryption-level
-read/write secrets without deriving keys or protecting QUIC packets.
+handshake bytes through `on-crypto`. `on-secret` receives established
+encryption-level read/write secrets without deriving keys or protecting QUIC
+packets. A TLS handshake/provider that has validated the negotiated values
+calls `quic-tls-boundary-emit-cipher-suite` and
+`quic-tls-boundary-emit-alpn`; those values are also available through
+`quic-tls-boundary-cipher-suite` and `quic-tls-boundary-alpn`. The boundary
+does not claim to derive secrets or perform cipher-suite/ALPN negotiation.
 Transport parameters are supplied as opaque RFC 9001 bytes and can be added to
 ClientHello from a client boundary or EncryptedExtensions from a server
 boundary. `quic-tls-boundary-send-message` and

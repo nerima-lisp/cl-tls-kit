@@ -4,10 +4,13 @@
   (dolist (name '(make-quic-tls-boundary quic-tls-boundary-send
                   quic-tls-boundary-send-message quic-tls-boundary-feed
                   quic-tls-boundary-receive quic-tls-boundary-feed-crypto
-                  quic-tls-boundary-send-with-transport-parameters))
+                  quic-tls-boundary-send-with-transport-parameters
+                  quic-tls-boundary-emit-secret quic-tls-boundary-emit-cipher-suite
+                  quic-tls-boundary-emit-alpn quic-tls-boundary-cipher-suite
+                  quic-tls-boundary-alpn))
     (check (eq (nth-value 1 (find-symbol (symbol-name name) :cl-tls-kit)) :external)
            "QUIC boundary is public from cl-tls-kit"))
-  (let ((crypto '()) (secrets '()) (transport '()))
+  (let ((crypto '()) (secrets '()) (transport '()) (suites '()) (alpns '()))
     (let ((boundary
             (make-quic-tls-boundary
              :role :client :transport-parameters #(1 2 3)
@@ -15,6 +18,10 @@
                           (declare (ignore boundary)) (push (list level bytes) crypto))
              :on-secret (lambda (boundary level direction secret)
                           (declare (ignore boundary)) (push (list level direction secret) secrets))
+             :on-cipher-suite (lambda (boundary suite)
+                                (declare (ignore boundary)) (push suite suites))
+             :on-alpn (lambda (boundary alpn)
+                        (declare (ignore boundary)) (push alpn alpns))
              :on-transport-parameters (lambda (boundary bytes)
                                         (declare (ignore boundary)) (push bytes transport)))))
       (let* ((hello (make-tls13-client-hello
@@ -70,6 +77,29 @@
       (quic-tls-boundary-emit-secret boundary :handshake :write #(9 8))
       (check (equalp (first secrets) '(:handshake :write #(9 8)))
              "secret callback retains encryption level and direction")
+      (quic-tls-boundary-emit-secret boundary :1-rtt :read #(7))
+      (check (equalp (first secrets) '(:application :read #(7)))
+             "legacy :1-rtt secret notification is normalized to :application")
+      (quic-tls-boundary-emit-cipher-suite boundary #x1301)
+      (quic-tls-boundary-emit-alpn boundary "h3")
+      (check (equalp (first suites) #x1301) "cipher suite establishment is notified")
+      (check (string= (first alpns) "h3") "ALPN establishment is notified")
+      (check (= (quic-tls-boundary-cipher-suite boundary) #x1301)
+             "selected cipher suite is retained")
+      (check (string= (quic-tls-boundary-alpn boundary) "h3")
+             "negotiated ALPN is retained")
+      (check (handler-case
+                 (progn (quic-tls-boundary-emit-secret boundary :0-rtt :read #(1)) nil)
+               (quic-tls-boundary-error () t))
+             "unsupported :0-rtt boundary level is rejected")
+      (check (handler-case
+                 (progn (quic-tls-boundary-emit-cipher-suite boundary #xffff) nil)
+               (quic-tls-boundary-error () t))
+             "unknown cipher suite is rejected")
+      (check (handler-case
+                 (progn (quic-tls-boundary-emit-alpn boundary "h2") nil)
+               (quic-tls-boundary-error () t))
+             "conflicting ALPN is rejected")
       (check (equalp (quic-tls-boundary-send-close-notify boundary :1-rtt) #(1 0))
              "close_notify is raw QUIC CRYPTO alert data")
       (check (quic-tls-boundary-close-notify-p #(1 0)) "close_notify classifier")

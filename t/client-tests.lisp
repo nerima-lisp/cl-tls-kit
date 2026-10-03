@@ -52,6 +52,42 @@
              (tls-kit::tls12-downgrade-sentinel () t)) "TLS 1.2 downgrade sentinel is rejected")
     (check (handler-case (progn (tls-kit::tls-client-start client) nil)
              (tls-kit::tls-client-state-error () t)) "missing provider is rejected"))
+  (let* ((client (tls-kit::make-tls-client))
+         (hello (tls-kit::tls-client-make-client-hello client)))
+    (check (not (every #'zerop (tls13-client-hello-random hello)))
+           "default ClientHello random uses CSPRNG")
+    (check (not (every #'zerop (tls13-client-hello-session-id hello)))
+           "default ClientHello session ID uses CSPRNG"))
+  (let ((client nil))
+    (setf client
+          (tls-kit::make-tls-client
+           :provider
+           (list :client-hello
+                 (lambda (ignored)
+                   (declare (ignore ignored))
+                   (tls-kit::tls-client-make-client-hello
+                    client :random (make-array 32 :element-type '(unsigned-byte 8))
+                    :session-id #() :cipher-suites #( #x1301)
+                    :supported-groups '(#x001d)
+                    :key-share (list (cons #x001d #(1)))))
+                 :handshake
+                 (lambda (ignored input)
+                   (declare (ignore ignored input))
+                   '(:state :awaiting-input)))))
+    (tls-kit::tls-client-start client)
+    (let ((server-hello
+            (make-tls13-server-hello
+             #x0303 (make-array 32 :element-type '(unsigned-byte 8)) #()
+             #x1302
+             (list (make-tls-extension 43 #(3 4))
+                   (make-tls-extension 51
+                                       (encode-key-share-server-extension
+                                        #x001d #(2)))))))
+      (check (handler-case
+                 (progn (tls-kit::tls-client-step client server-hello) nil)
+               (tls13-negotiation-error (condition)
+                 (eq (tls13-negotiation-error-field condition) :cipher-suite)))
+             "client rejects an unoffered ServerHello cipher suite")))
   (let ((client (tls-kit::make-tls-client
                  :provider (list :handshake
                                  (lambda (client input)

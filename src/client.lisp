@@ -112,6 +112,13 @@ record to pass to the transport write callback."
     (error 'type-error :datum value :expected-type '(vector (unsigned-byte 8))))
   value)
 
+(defun %tls-client-csprng-octets (length)
+  (let* ((package (find-package '#:crypto-kit))
+         (symbol (and package (find-symbol "RANDOM-OCTETS" package))))
+    (unless (and symbol (fboundp symbol))
+      (error 'tls-client-error :client nil :reason :missing-csprng))
+    (%octet-vector (funcall symbol length))))
+
 (defun tls-client-check-server-random (client server-random &key (version :tls-1.3))
   "Reject the RFC 8446 TLS 1.2/1.1 downgrade sentinels for TLS 1.3."
   (let ((random (%octet-vector server-random)))
@@ -128,7 +135,10 @@ record to pass to the transport write callback."
     (error 'tls13-negotiation-error :client client :reason :legacy-version
            :field :legacy-version))
   (unless (member (tls13-server-hello-cipher-suite hello)
-                  '(#x1301 #x1302 #x1303 #x1304 #x1305))
+                  (if (and client (tls-client-client-hello client))
+                      (coerce (tls13-client-hello-cipher-suites
+                               (tls-client-client-hello client)) 'list)
+                      '(#x1301 #x1302 #x1303 #x1304 #x1305)))
     (error 'tls13-negotiation-error :client client :reason :cipher-suite
            :field :cipher-suite))
   (let ((versions (remove-if-not
@@ -138,6 +148,28 @@ record to pass to the transport write callback."
                  (equalp (tls-extension-data (first versions)) #(3 4)))
       (error 'tls13-negotiation-error :client client :reason :supported-version
              :field :supported-version)))
+  (when (and client (tls-client-client-hello client))
+    (let* ((extension (find +tls13-extension-supported-groups+
+                            (tls13-client-hello-extensions
+                             (tls-client-client-hello client))
+                            :key #'tls-extension-type))
+           (requested (and extension
+                            (let ((bytes (tls-extension-data extension)))
+                              (multiple-value-bind (raw end)
+                                  (%read-vector bytes 0 2)
+                                (declare (ignore end))
+                                (loop for position from 0 below (length raw) by 2
+                                      collect (+ (ash (aref raw position) 8)
+                                                 (aref raw (1+ position)))))))))
+      (let ((key-share (find +tls13-extension-key-share+
+                             (tls13-server-hello-extensions hello)
+                             :key #'tls-extension-type)))
+        (unless (and requested key-share
+                     (member (car (decode-key-share-server-extension
+                                   (tls-extension-data key-share)))
+                             requested))
+          (error 'tls13-negotiation-error :client client
+                 :reason :key-share-group :field :key-share-group)))))
   t)
 
 (defun tls-client-start (client)
@@ -367,9 +399,8 @@ The KEY-SHARE value is supplied by the crypto/provider integration."
       (push (make-tls-extension +tls13-extension-signature-algorithms+
                                 (%client-u16-list signature-algorithms)) extensions))
     (make-tls13-client-hello #x0303
-                             (or random (make-array 32 :element-type '(unsigned-byte 8)
-                                                     :initial-element 0))
-                             (or session-id #())
+                             (or random (%tls-client-csprng-octets 32))
+                             (or session-id (%tls-client-csprng-octets 32))
                              (or cipher-suites #( #x1301 #x1303))
                              (nreverse extensions))))
 
