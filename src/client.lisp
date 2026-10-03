@@ -56,6 +56,7 @@
   transport-close
   provider record-protect record-unprotect key-schedule
   verify-certificate hostname alpn-offered alpn peer-certificate
+  certificate-message-received
   client-hello (client-hello-count 0)
   quic-message-callback quic-secret-callback
   (state :new) expected-message
@@ -306,8 +307,13 @@ provided before a peer certificate can be accepted."
            :expected (tls-client-expected-message client)))
   (case (and (listp result) (getf result :state))
     (:awaiting-input (setf (tls-client-state client) :awaiting-server))
-    (:connected (setf (tls-client-state client) :connected
-                      (tls-client-expected-message client) nil))
+    (:connected
+     (when (and (tls-client-certificate-message-received client)
+                (null (tls-client-peer-certificate client)))
+       (error 'tls-client-verification-error :client client
+              :certificate nil :cause :missing-peer-certificate))
+     (setf (tls-client-state client) :connected
+           (tls-client-expected-message client) nil))
     (:failed (%client-fail client :step :provider-failure)))
   client)
 
@@ -330,6 +336,8 @@ provided before a peer certificate can be accepted."
                                          (tls13-server-hello-random input)))
       (when (typep input 'tls13-certificate-request)
         (setf (tls-client-expected-message client) :certificate))
+      (when (typep input 'tls13-certificate)
+        (setf (tls-client-certificate-message-received client) t))
       (when (typep input 'tls13-encrypted-extensions)
         (let ((extension (find +tls13-extension-application-layer-protocol-negotiation+
                                 (tls13-encrypted-extensions-extensions input)

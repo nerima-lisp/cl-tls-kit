@@ -98,6 +98,14 @@
                (eq (tls-kit::tls-client-verification-cause condition)
                    :missing-verification-callback)))
            "peer certificates are rejected without a verification callback"))
+  (let ((client (tls-kit::make-tls-client)))
+    (setf (tls-kit::tls-client-certificate-message-received client) t)
+    (check (handler-case
+               (progn (tls-kit::%apply-provider-result client '(:state :connected)) nil)
+             (tls-kit::tls-client-verification-error (condition)
+               (eq (tls-kit::tls-client-verification-cause condition)
+                   :missing-peer-certificate)))
+           "a certificate message cannot be bypassed by connecting without a peer certificate"))
   (let ((client (tls-kit::make-tls-client
                  :provider (list :handshake
                                  (lambda (client input)

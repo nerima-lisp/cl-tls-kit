@@ -230,6 +230,16 @@
                      (progn (cl-tls-kit.x509::%general-subtrees sequence) nil)
                    (cl-tls-kit.x509:x509-error () t))
                 "Name Constraints reject non-zero minimum and present maximum"))))
+    (dolist (bytes '(#(48 0)
+                     #(48 17 48 15 130 7 97 108 108 111 119 101 100 128 1 0 128 1 0)
+                     #(48 8 48 6 135 4 1 2 3 4)))
+      (check (handler-case
+                 (progn
+                   (cl-tls-kit.x509::%general-subtrees
+                    (nth-value 0 (cl-tls-kit.x509::%read-der bytes)))
+                   nil)
+               (cl-tls-kit.x509:x509-error () t))
+             "Name Constraints reject empty, duplicate, and malformed IP subtrees"))
     (let* ((now (get-universal-time))
            (leaf (cl-tls-kit.x509::make-x509-certificate
                   :issuer "root" :subject "leaf"

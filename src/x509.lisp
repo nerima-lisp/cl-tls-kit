@@ -323,11 +323,17 @@
     (nreverse result)))
 
 (defun %general-subtrees (sequence)
-  (mapcar (lambda (subtree)
+  (let ((subtrees (%children sequence)))
+    (unless subtrees
+      (%fail "GeneralSubtrees must not be empty"))
+    (mapcar (lambda (subtree)
             (let* ((parts (%children subtree))
                    (base (first parts))
                    (range (rest parts)))
               (unless (and base
+                           (<= (length range) 2)
+                           (= (count #x80 range :key #'der-tag) (if (find #x80 range :key #'der-tag) 1 0))
+                           (zerop (count #x81 range :key #'der-tag))
                            (every (lambda (field)
                                    (case (der-tag field)
                                      (#x80 (and (= (length (der-content field)) 1)
@@ -337,9 +343,11 @@
                 (%fail "GeneralSubtree minimum must be zero and maximum must be absent"))
               (case (der-tag base)
                 (#x82 (list :dns (%string base)))
-                (#x87 (list :ip (der-content base)))
+                (#x87 (if (member (length (der-content base)) '(8 32))
+                          (list :ip (der-content base))
+                          (%fail "IP GeneralSubtree base must contain an address and mask")))
                 (t (list :unsupported base)))))
-          (%children sequence)))
+          subtrees)))
 
 (defun %name-constraints (sequence critical)
   (let ((permitted nil) (excluded nil))

@@ -81,7 +81,7 @@ missing callback rejects the certificate. A caller-provided trust anchor is
 explicitly trusted and is not revalidated as an issued certificate, so its
 CA constraint, key usage, and self-signature are outside this policy. All
 certificates below the trust anchor remain subject to chain, signature,
-validity, and usage checks.
+validity, and usage checks; the anchor's validity interval is still checked.
 
 ## QUIC TLS boundary
 
