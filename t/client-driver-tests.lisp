@@ -90,7 +90,11 @@
                          driver (encode-handshake 2 bad-suite)) nil)
                (tls13-client-driver-error (condition)
                  (eq (tls13-client-driver-error-reason condition)
-                     :unoffered-cipher-suite)))
+                     :unoffered-cipher-suite))
+               (tls13-negotiation-error (condition)
+                 (and (eq (cl-tls-kit::tls-client-error-reason condition) :cipher-suite)
+                      (eq (tls13-negotiation-error-field condition)
+                          :cipher-suite))))
              "driver rejects an unoffered cipher suite"))
     (let ((bad-group (make-tls13-server-hello
                       #x0303 (make-array 32 :element-type '(unsigned-byte 8)) #()
@@ -133,14 +137,23 @@
                  (eq (tls13-client-driver-error-reason condition)
                      :unexpected-message)))
              "driver rejects CCS outside the compatibility window"))
-    (let ((allowed-driver
-            (cl-tls-kit::%make-tls13-client-driver
-             :state :awaiting-encrypted-extensions
-             :transport-read (lambda (ignored)
-                               (declare (ignore ignored))
-                               #(20 3 1 0 1 1)))))
-      (check (null (tls13-client-driver-read-record allowed-driver))
-             "driver ignores a valid compatibility CCS"))
+    (let ((records (list #(20 3 1 0 1 1)
+                         #(20 3 1 0 1 1)
+                         #(20 3 1 0 1 1))))
+      (let ((allowed-driver
+              (cl-tls-kit::%make-tls13-client-driver
+               :state :awaiting-encrypted-extensions
+               :transport-read (lambda (ignored)
+                                 (declare (ignore ignored))
+                                 (pop records)))))
+        (check (null (tls13-client-driver-read-record allowed-driver))
+               "driver ignores the first valid compatibility CCS")
+        (check (handler-case
+                   (progn (tls13-client-driver-read-record allowed-driver) nil)
+                 (tls13-client-driver-error (condition)
+                   (eq (tls13-client-driver-error-reason condition)
+                       :unexpected-message)))
+               "driver rejects a repeated compatibility CCS")))
     (let* ((secret (make-array 32 :element-type '(unsigned-byte 8)
                                :initial-element 9))
            (sender (cl-tls-kit::make-tls13-traffic-state
@@ -206,4 +219,75 @@
                          :decode-error)))
                  "handshake body limit rejects one byte over the boundary"))
         ))
+    (let* ((body-length cl-tls-kit::+tls13-max-handshake-body-length+)
+           (header (vector 1 (ldb (byte 8 16) body-length)
+                           (ldb (byte 8 8) body-length)
+                           (ldb (byte 8 0) body-length)))
+           (fragments (cons #(1 #x10)
+                            (loop repeat 65
+                                  collect (make-array 16384
+                                                      :element-type '(unsigned-byte 8)
+                                                      :initial-element 0))))
+           (records (loop for fragment in fragments
+                          collect (encode-tls-plaintext
+                                   (make-tls-plaintext
+                                    cl-tls-kit::+tls-content-type-handshake+
+                                    fragment))))
+           (driver (cl-tls-kit::%make-tls13-client-driver
+                    :state :awaiting-server-hello
+                    :transport-read (lambda (ignored)
+                                      (declare (ignore ignored))
+                                      (pop records)))))
+      (setf (first records) (encode-tls-plaintext
+                             (make-tls-plaintext
+                              cl-tls-kit::+tls-content-type-handshake+
+                              (concatenate 'vector header #(0)))))
+      (check (handler-case
+                 (loop while records
+                       do (tls13-client-driver-read-record driver))
+                 (tls13-client-driver-error (condition)
+                   (eq (tls13-client-driver-error-reason condition)
+                       :decode-error)))
+             "public record path rejects oversized fragmented handshake"))
+    (when (uiop:getenv "OPENSSL")
+      (let* ((directory (merge-pathnames "cl-tls-kit-r6-certificate/"
+                                        (uiop:temporary-directory)))
+             (certificate-path (namestring (merge-pathnames "certificate.pem" directory)))
+             (key-path (namestring (merge-pathnames "certificate.key" directory))))
+        (ensure-directories-exist directory)
+        (%openssl-e2e-certificate (or (uiop:getenv "OPENSSL") "openssl")
+                                   certificate-path key-path "example.test" 1 :ca t)
+        (let* ((der (cl-tls-kit:pem-block-der
+                     (first (cl-tls-kit:pem-decode
+                             (uiop:read-file-string certificate-path)))))
+               (certificate (cl-tls-kit.x509:parse-certificate-der der))
+               (extension-data (make-array 60000 :element-type '(unsigned-byte 8)
+                                           :initial-element 0))
+               (extensions (list (make-tls-extension 1 extension-data)))
+               (message (make-tls13-certificate
+                         #() (loop repeat 8
+                                   collect (make-tls13-certificate-entry der extensions))))
+               (wire (encode-handshake 11 message))
+               (records (loop for start from 0 below (length wire) by 16380
+                              for end = (min (length wire) (+ start 16380))
+                              collect (encode-tls-plaintext
+                                       (make-tls-plaintext
+                                        cl-tls-kit::+tls-content-type-handshake+
+                                        (subseq wire start end)))))
+               (driver (cl-tls-kit::%make-tls13-client-driver
+                        :state :awaiting-certificate
+                        :trust-anchors (list certificate)
+                        :now (1+ (cl-tls-kit.x509:x509-certificate-not-before
+                                  certificate))
+                        :transport-read (lambda (ignored)
+                                          (declare (ignore ignored))
+                                          (pop records)))))
+          (check (> (length wire) 300000)
+                 "certificate fixture is several hundred KiB")
+          (check (< (length wire) cl-tls-kit::+tls13-max-handshake-body-length+)
+                 "certificate fixture stays below the handshake limit")
+          (loop while records do (tls13-client-driver-read-record driver))
+          (check (eq (cl-tls-kit::tls13-client-driver-state driver)
+                     :awaiting-certificate-verify)
+                 "public record path accepts a large Certificate message"))))
   t))

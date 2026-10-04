@@ -17,6 +17,7 @@
   client-finished-key server-finished-key
   handshake-read-state handshake-write-state
   application-read-state application-write-state
+  compatibility-ccs-state (compatibility-ccs-count 0)
   (pending-handshake (make-array 0 :element-type '(unsigned-byte 8)))
   close-notify-received)
 
@@ -99,7 +100,10 @@ progression. KEY-EXCHANGE supplies :GENERATE and :SHARED-SECRET functions;
 the crypto provider supplies hash, HKDF, HMAC, and AEAD primitives."
   (unless (typep provider 'tls13-crypto-provider) (%driver-fail :provider))
   (let* ((offered-suites (coerce
-                          (remove #x1305 (coerce cipher-suites 'list))
+                          (remove-if-not
+                           (lambda (suite)
+                             (member suite '(#x1301 #x1302 #x1303 #x1304)))
+                           (coerce cipher-suites 'list))
                           'vector))
          (suite (and (plusp (length offered-suites))
                      (aref offered-suites 0))))
@@ -449,6 +453,12 @@ and marks the driver closed after a peer close_notify."
                    (= (aref wire 4) 1)
                    (= (aref wire 5) 1))
         (%driver-fail :unexpected-message))
+      (let ((state (tls13-client-driver-state driver)))
+        (when (eq state (tls13-client-driver-compatibility-ccs-state driver))
+          (when (plusp (tls13-client-driver-compatibility-ccs-count driver))
+            (%driver-fail :unexpected-message)))
+        (setf (tls13-client-driver-compatibility-ccs-state driver) state
+              (tls13-client-driver-compatibility-ccs-count driver) 1))
       (return-from tls13-client-driver-read-record nil))
     (let ((plaintext (if (and (eq (tls13-client-driver-state driver) :awaiting-server-hello)
                               (not (tls13-client-driver-handshake-read-state driver)))
