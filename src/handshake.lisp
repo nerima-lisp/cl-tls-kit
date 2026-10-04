@@ -67,44 +67,37 @@
 (defconstant +tls13-cipher-suite-aes-256-gcm-sha384+ #x1302)
 (defconstant +tls13-cipher-suite-chacha20-poly1305-sha256+ #x1303)
 (defconstant +tls13-cipher-suite-aes-128-ccm-sha256+ #x1304)
-(defconstant +tls13-cipher-suite-aes-128-ccm-8-sha256+ #x1305)
 (defconstant +tls13-cipher-suite-aes-128-gcm-sha256-name+ :aes-128-gcm-sha256)
 (defconstant +tls13-cipher-suite-aes-256-gcm-sha384-name+ :aes-256-gcm-sha384)
 (defconstant +tls13-cipher-suite-chacha20-poly1305-sha256-name+ :chacha20-poly1305-sha256)
 (defconstant +tls13-cipher-suite-aes-128-ccm-sha256-name+ :aes-128-ccm-sha256)
-(defconstant +tls13-cipher-suite-aes-128-ccm-8-sha256-name+ :aes-128-ccm-8-sha256)
 (defconstant +tls13-cipher-suite-aes-128-gcm-sha256-hash+ :sha256)
 (defconstant +tls13-cipher-suite-aes-256-gcm-sha384-hash+ :sha384)
 (defconstant +tls13-cipher-suite-chacha20-poly1305-sha256-hash+ :sha256)
 (defconstant +tls13-cipher-suite-aes-128-ccm-sha256-hash+ :sha256)
-(defconstant +tls13-cipher-suite-aes-128-ccm-8-sha256-hash+ :sha256)
 (defconstant +tls13-cipher-suite-aes-128-gcm-sha256-key-length+ 16)
 (defconstant +tls13-cipher-suite-aes-256-gcm-sha384-key-length+ 32)
 (defconstant +tls13-cipher-suite-chacha20-poly1305-sha256-key-length+ 32)
 (defconstant +tls13-cipher-suite-aes-128-ccm-sha256-key-length+ 16)
-(defconstant +tls13-cipher-suite-aes-128-ccm-8-sha256-key-length+ 16)
 
 (defun tls13-cipher-suite-name (suite)
   (case suite
     (#x1301 +tls13-cipher-suite-aes-128-gcm-sha256-name+)
     (#x1302 +tls13-cipher-suite-aes-256-gcm-sha384-name+)
     (#x1303 +tls13-cipher-suite-chacha20-poly1305-sha256-name+)
-    (#x1304 +tls13-cipher-suite-aes-128-ccm-sha256-name+)
-    (#x1305 +tls13-cipher-suite-aes-128-ccm-8-sha256-name+)))
+    (#x1304 +tls13-cipher-suite-aes-128-ccm-sha256-name+)))
 (defun tls13-cipher-suite-hash (suite)
   (case suite
     (#x1301 +tls13-cipher-suite-aes-128-gcm-sha256-hash+)
     (#x1302 +tls13-cipher-suite-aes-256-gcm-sha384-hash+)
     (#x1303 +tls13-cipher-suite-chacha20-poly1305-sha256-hash+)
-    (#x1304 +tls13-cipher-suite-aes-128-ccm-sha256-hash+)
-    (#x1305 +tls13-cipher-suite-aes-128-ccm-8-sha256-hash+)))
+    (#x1304 +tls13-cipher-suite-aes-128-ccm-sha256-hash+)))
 (defun tls13-cipher-suite-key-length (suite)
   (case suite
     (#x1301 +tls13-cipher-suite-aes-128-gcm-sha256-key-length+)
     (#x1302 +tls13-cipher-suite-aes-256-gcm-sha384-key-length+)
     (#x1303 +tls13-cipher-suite-chacha20-poly1305-sha256-key-length+)
-    (#x1304 +tls13-cipher-suite-aes-128-ccm-sha256-key-length+)
-    (#x1305 +tls13-cipher-suite-aes-128-ccm-8-sha256-key-length+)))
+    (#x1304 +tls13-cipher-suite-aes-128-ccm-sha256-key-length+)))
 
 (defconstant +tls13-extension-server-name+ 0)
 (defconstant +tls13-extension-application-layer-protocol-negotiation+ 16)
@@ -196,22 +189,18 @@
           +tls13-cipher-suite-aes-256-gcm-sha384+
           +tls13-cipher-suite-chacha20-poly1305-sha256+
           +tls13-cipher-suite-aes-128-ccm-sha256+
-          +tls13-cipher-suite-aes-128-ccm-8-sha256+
           +tls13-cipher-suite-aes-128-gcm-sha256-name+
           +tls13-cipher-suite-aes-256-gcm-sha384-name+
           +tls13-cipher-suite-chacha20-poly1305-sha256-name+
           +tls13-cipher-suite-aes-128-ccm-sha256-name+
-          +tls13-cipher-suite-aes-128-ccm-8-sha256-name+
           +tls13-cipher-suite-aes-128-gcm-sha256-hash+
           +tls13-cipher-suite-aes-256-gcm-sha384-hash+
           +tls13-cipher-suite-chacha20-poly1305-sha256-hash+
           +tls13-cipher-suite-aes-128-ccm-sha256-hash+
-          +tls13-cipher-suite-aes-128-ccm-8-sha256-hash+
           +tls13-cipher-suite-aes-128-gcm-sha256-key-length+
           +tls13-cipher-suite-aes-256-gcm-sha384-key-length+
           +tls13-cipher-suite-chacha20-poly1305-sha256-key-length+
           +tls13-cipher-suite-aes-128-ccm-sha256-key-length+
-          +tls13-cipher-suite-aes-128-ccm-8-sha256-key-length+
           tls13-cipher-suite-name tls13-cipher-suite-hash
           tls13-cipher-suite-key-length
           +tls13-extension-server-name+

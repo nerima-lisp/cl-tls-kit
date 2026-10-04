@@ -36,7 +36,6 @@ The exported cipher-suite constants and helpers cover these RFC 8446 suites:
 - `TLS_AES_256_GCM_SHA384` (`0x1302`)
 - `TLS_CHACHA20_POLY1305_SHA256` (`0x1303`)
 - `TLS_AES_128_CCM_SHA256` (`0x1304`)
-- `TLS_AES_128_CCM_8_SHA256` (`0x1305`)
 
 The implementation passes supported-group IDs through ClientHello and key
 share helpers. The built-in client defaults are X25519 (`0x001d`) in

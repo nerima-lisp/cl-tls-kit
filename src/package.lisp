@@ -57,22 +57,18 @@
    #:+tls13-cipher-suite-aes-256-gcm-sha384+
    #:+tls13-cipher-suite-chacha20-poly1305-sha256+
    #:+tls13-cipher-suite-aes-128-ccm-sha256+
-   #:+tls13-cipher-suite-aes-128-ccm-8-sha256+
    #:+tls13-cipher-suite-aes-128-gcm-sha256-name+
    #:+tls13-cipher-suite-aes-256-gcm-sha384-name+
    #:+tls13-cipher-suite-chacha20-poly1305-sha256-name+
    #:+tls13-cipher-suite-aes-128-ccm-sha256-name+
-   #:+tls13-cipher-suite-aes-128-ccm-8-sha256-name+
    #:+tls13-cipher-suite-aes-128-gcm-sha256-hash+
    #:+tls13-cipher-suite-aes-256-gcm-sha384-hash+
    #:+tls13-cipher-suite-chacha20-poly1305-sha256-hash+
    #:+tls13-cipher-suite-aes-128-ccm-sha256-hash+
-   #:+tls13-cipher-suite-aes-128-ccm-8-sha256-hash+
    #:+tls13-cipher-suite-aes-128-gcm-sha256-key-length+
    #:+tls13-cipher-suite-aes-256-gcm-sha384-key-length+
    #:+tls13-cipher-suite-chacha20-poly1305-sha256-key-length+
    #:+tls13-cipher-suite-aes-128-ccm-sha256-key-length+
-   #:+tls13-cipher-suite-aes-128-ccm-8-sha256-key-length+
    #:tls13-cipher-suite-name #:tls13-cipher-suite-hash
    #:tls13-cipher-suite-key-length
    #:+tls13-extension-server-name+

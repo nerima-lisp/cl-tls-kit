@@ -140,7 +140,7 @@ provided before a peer certificate can be accepted."
                   (if (and client (tls-client-client-hello client))
                       (coerce (tls13-client-hello-cipher-suites
                                (tls-client-client-hello client)) 'list)
-                      '(#x1301 #x1302 #x1303 #x1304 #x1305)))
+                      '(#x1301 #x1302 #x1303 #x1304)))
     (error 'tls13-negotiation-error :client client :reason :cipher-suite
            :field :cipher-suite))
   (let ((versions (remove-if-not
