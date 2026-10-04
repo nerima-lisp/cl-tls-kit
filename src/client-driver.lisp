@@ -438,12 +438,7 @@ Returns DRIVER; outgoing messages are delivered to ON-SEND."
 Returns application plaintext, NIL for a consumed handshake or KeyUpdate,
 and marks the driver closed after a peer close_notify."
   (let* ((wire (%driver-read-record driver))
-         (ignore-eof (unless wire (%driver-fail :eof)))
-         (plaintext (if (or (= (aref wire 0) +tls-content-type-change-cipher-spec+)
-                            (and (eq (tls13-client-driver-state driver) :awaiting-server-hello)
-                            (not (tls13-client-driver-handshake-read-state driver))))
-                        (decode-tls-plaintext wire)
-                        (%driver-decrypt-record driver wire))))
+         (ignore-eof (unless wire (%driver-fail :eof))))
     (when (= (aref wire 0) +tls-content-type-change-cipher-spec+)
       (unless (and (member (tls13-client-driver-state driver)
                            '(:awaiting-server-hello :awaiting-encrypted-extensions
@@ -455,27 +450,31 @@ and marks the driver closed after a peer close_notify."
                    (= (aref wire 5) 1))
         (%driver-fail :unexpected-message))
       (return-from tls13-client-driver-read-record nil))
-    (cond
-      ((= (tls-plaintext-content-type plaintext)
-          +tls-content-type-change-cipher-spec+)
-       (%driver-fail :unexpected-message))
-      ((tls-close-notify-p plaintext)
+    (let ((plaintext (if (and (eq (tls13-client-driver-state driver) :awaiting-server-hello)
+                              (not (tls13-client-driver-handshake-read-state driver)))
+                         (decode-tls-plaintext wire)
+                         (%driver-decrypt-record driver wire))))
+      (cond
+        ((= (tls-plaintext-content-type plaintext)
+            +tls-content-type-change-cipher-spec+)
+         (%driver-fail :unexpected-message))
+        ((tls-close-notify-p plaintext)
        (setf (tls13-client-driver-close-notify-received driver) t
              (tls13-client-driver-state driver) :closed)
        nil)
-      ((and (= (tls-plaintext-content-type plaintext) +tls-content-type-alert+)
-            (= (length (tls-plaintext-fragment plaintext)) 2))
-       (%driver-fail (list :peer-alert
-                           (aref (tls-plaintext-fragment plaintext) 0)
-                           (aref (tls-plaintext-fragment plaintext) 1))))
-      ((= (tls-plaintext-content-type plaintext) +tls-content-type-handshake+)
-       (%driver-feed-handshake driver (tls-plaintext-fragment plaintext))
-       nil)
-      ((and (eq (tls13-client-driver-state driver) :connected)
-            (= (tls-plaintext-content-type plaintext)
-               +tls-content-type-application-data+))
-       plaintext)
-      (t (%driver-fail :unexpected-record)))))
+        ((and (= (tls-plaintext-content-type plaintext) +tls-content-type-alert+)
+              (= (length (tls-plaintext-fragment plaintext)) 2))
+         (%driver-fail (list :peer-alert
+                             (aref (tls-plaintext-fragment plaintext) 0)
+                             (aref (tls-plaintext-fragment plaintext) 1))))
+        ((= (tls-plaintext-content-type plaintext) +tls-content-type-handshake+)
+         (%driver-feed-handshake driver (tls-plaintext-fragment plaintext))
+         nil)
+        ((and (eq (tls13-client-driver-state driver) :connected)
+              (= (tls-plaintext-content-type plaintext)
+                 +tls-content-type-application-data+))
+         plaintext)
+        (t (%driver-fail :unexpected-record))))))
 
 (defun tls13-client-driver-connect (driver)
   "Start DRIVER and block until the TLS 1.3 handshake reaches :CONNECTED."

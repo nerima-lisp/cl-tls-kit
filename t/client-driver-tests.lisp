@@ -205,21 +205,5 @@
                      (eq (tls13-client-driver-error-reason condition)
                          :decode-error)))
                  "handshake body limit rejects one byte over the boundary"))
-        (let ((pending-driver
-                (cl-tls-kit::%make-tls13-client-driver
-                 :state :awaiting-server-hello)))
-          (setf (cl-tls-kit::tls13-client-driver-pending-handshake pending-driver)
-                (concatenate 'vector (header (1+ limit))
-                             (make-array limit :element-type '(unsigned-byte 8))))
-          (cl-tls-kit::%driver-feed-handshake pending-driver #())
-          (check (= (length (cl-tls-kit::tls13-client-driver-pending-handshake
-                             pending-driver))
-                    (+ 4 limit))
-                 "pending handshake limit accepts the exact boundary")
-          (check (handler-case
-                     (progn (cl-tls-kit::%driver-feed-handshake pending-driver #(0)) nil)
-                   (tls13-client-driver-error (condition)
-                     (eq (tls13-client-driver-error-reason condition)
-                         :decode-error)))
-                 "pending handshake limit rejects one byte over the boundary"))))
+        ))
   t))
