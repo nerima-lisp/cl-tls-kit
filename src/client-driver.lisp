@@ -20,6 +20,10 @@
   (pending-handshake (make-array 0 :element-type '(unsigned-byte 8)))
   close-notify-received)
 
+;; Certificate chains and their per-certificate extensions fit within this
+;; policy limit while fragmented input cannot consume the uint24 wire maximum.
+(defconstant +tls13-max-handshake-body-length+ (* 1024 1024))
+
 (defun %driver-fail (reason)
   (error 'tls13-client-driver-error :reason reason))
 
@@ -403,14 +407,19 @@ Returns DRIVER; outgoing messages are delivered to ON-SEND."
         (decode-tls-plaintext wire))))
 
 (defun %driver-feed-handshake (driver bytes)
-  (setf (tls13-client-driver-pending-handshake driver)
-        (concatenate '(vector (unsigned-byte 8))
-                     (tls13-client-driver-pending-handshake driver) bytes))
+  (let ((pending (tls13-client-driver-pending-handshake driver)))
+    (when (> (+ (length pending) (length bytes))
+             (+ 4 +tls13-max-handshake-body-length+))
+      (%driver-fail :decode-error))
+    (setf (tls13-client-driver-pending-handshake driver)
+          (concatenate '(vector (unsigned-byte 8)) pending bytes)))
   (loop for pending = (tls13-client-driver-pending-handshake driver)
         while (>= (length pending) 4)
         for length = (+ (ash (aref pending 1) 16)
                         (ash (aref pending 2) 8)
                         (aref pending 3))
+        do (when (> length +tls13-max-handshake-body-length+)
+             (%driver-fail :decode-error))
         while (>= (length pending) (+ 4 length))
         do (let ((message-wire (subseq pending 0 (+ 4 length))))
              (setf (tls13-client-driver-pending-handshake driver)
