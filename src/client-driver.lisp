@@ -62,7 +62,6 @@
     (#x1302 :aes-256-gcm)
     (#x1303 :chacha20-poly1305)
     (#x1304 :aes-128-ccm)
-    (#x1305 :aes-128-ccm-8)
     (otherwise (%driver-fail :unsupported-cipher-suite))))
 
 (defun %driver-make-traffic-state (driver secret)
@@ -95,22 +94,27 @@ The driver owns handshake message sequencing and transcript/key-schedule
 progression. KEY-EXCHANGE supplies :GENERATE and :SHARED-SECRET functions;
 the crypto provider supplies hash, HKDF, HMAC, and AEAD primitives."
   (unless (typep provider 'tls13-crypto-provider) (%driver-fail :provider))
-  (let* ((suite (aref cipher-suites 0))
-         (driver (%make-tls13-client-driver
-                  :provider provider :key-exchange key-exchange :on-send on-send
-                  :transport-read (or transport-read (getf transport :read))
-                  :transport-write (or transport-write (getf transport :write))
-                  :transport-close (or transport-close (getf transport :close))
-                  :verify-certificate-verify verify-certificate-verify
-                  :hostname hostname :alpn alpn :cipher-suites cipher-suites
-                  :supported-groups supported-groups
-                  :signature-algorithms signature-algorithms
-                  :trust-anchors trust-anchors :now now
-                  :verify-signature verify-signature :suite suite
-                  :hash (tls13-cipher-suite-hash suite) :state :new)))
-    (setf (tls13-client-driver-early-secret driver)
-          (tls13-early-secret provider (tls13-client-driver-hash driver)))
-    driver))
+  (let* ((offered-suites (coerce
+                          (remove #x1305 (coerce cipher-suites 'list))
+                          'vector))
+         (suite (and (plusp (length offered-suites))
+                     (aref offered-suites 0))))
+    (unless suite (%driver-fail :unsupported-cipher-suite))
+    (let ((driver (%make-tls13-client-driver
+                   :provider provider :key-exchange key-exchange :on-send on-send
+                   :transport-read (or transport-read (getf transport :read))
+                   :transport-write (or transport-write (getf transport :write))
+                   :transport-close (or transport-close (getf transport :close))
+                   :verify-certificate-verify verify-certificate-verify
+                   :hostname hostname :alpn alpn :cipher-suites offered-suites
+                   :supported-groups supported-groups
+                   :signature-algorithms signature-algorithms
+                   :trust-anchors trust-anchors :now now
+                   :verify-signature verify-signature :suite suite
+                   :hash (tls13-cipher-suite-hash suite) :state :new)))
+      (setf (tls13-client-driver-early-secret driver)
+            (tls13-early-secret provider (tls13-client-driver-hash driver)))
+      driver)))
 
 (defun tls13-client-driver-start (driver)
   (unless (eq (tls13-client-driver-state driver) :new)
@@ -431,7 +435,6 @@ and marks the driver closed after a peer close_notify."
                             (not (tls13-client-driver-handshake-read-state driver))))
                         (decode-tls-plaintext wire)
                         (%driver-decrypt-record driver wire))))
-    (declare (ignore ignore-eof))
     (cond
       ((= (tls-plaintext-content-type plaintext)
           +tls-content-type-change-cipher-spec+)

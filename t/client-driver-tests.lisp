@@ -27,18 +27,24 @@
               (declare (ignore algorithm key nonce aad))
               (subseq ciphertext 0 (- (length ciphertext) 16)))
             (lambda (left right) (equalp left right))))
+         (key-exchange
+           (list :random
+                 (lambda (length)
+                   (make-array length :element-type '(unsigned-byte 8)
+                               :initial-element 7))
+                 :generate
+                 (lambda (group)
+                   (declare (ignore group))
+                   (values (make-array 32 :element-type '(unsigned-byte 8))
+                           (make-array 32 :element-type '(unsigned-byte 8))))
+                 :shared-secret
+                 (lambda (group private public)
+                   (declare (ignore group private public))
+                   (make-array 32 :element-type '(unsigned-byte 8)))))
          (driver
            (cl-tls-kit:make-tls13-client-driver
             :provider provider
-            :key-exchange (list :generate
-                                (lambda (group)
-                                  (declare (ignore group))
-                                  (values (make-array 32 :element-type '(unsigned-byte 8))
-                                          (make-array 32 :element-type '(unsigned-byte 8))))
-                                :shared-secret
-                                (lambda (group private public)
-                                  (declare (ignore group private public))
-                                  (make-array 32 :element-type '(unsigned-byte 8))))
+            :key-exchange key-exchange
             :hostname "example.test"
             :alpn '("h2")
             :on-send (lambda (ignored wire)
@@ -60,6 +66,19 @@
              "driver ClientHello random uses CSPRNG")
       (check (not (every #'zerop (tls13-client-hello-session-id hello)))
              "driver ClientHello session ID uses CSPRNG"))
+    (let ((explicit-driver
+            (cl-tls-kit:make-tls13-client-driver
+             :provider provider :key-exchange key-exchange
+             :cipher-suites #( #x1305 #x1301)
+             :on-send (lambda (ignored wire)
+                        (declare (ignore ignored))
+                        (setf sent (list wire))))))
+      (cl-tls-kit:tls13-client-driver-start explicit-driver)
+      (let ((hello (decode-handshake (first sent))))
+        (check (not (member #x1305
+                            (coerce (tls13-client-hello-cipher-suites hello)
+                                    'list)))
+               "ClientHello omits unsupported CCM-8")))
     (let ((bad-suite (make-tls13-server-hello
                       #x0303 (make-array 32 :element-type '(unsigned-byte 8)) #()
                       #x1305 (list (make-tls-extension 43 #(3 4))
