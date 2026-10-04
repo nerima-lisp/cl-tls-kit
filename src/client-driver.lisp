@@ -17,7 +17,7 @@
   client-finished-key server-finished-key
   handshake-read-state handshake-write-state
   application-read-state application-write-state
-  compatibility-ccs-state (compatibility-ccs-count 0)
+  compatibility-ccs-flight (compatibility-ccs-count 0)
   (pending-handshake (make-array 0 :element-type '(unsigned-byte 8)))
   close-notify-received)
 
@@ -269,6 +269,8 @@ Returns DRIVER; outgoing messages are delivered to ON-SEND."
                  (cons (make-tls-extension 51 (encode-key-share-extension (list share)))
                        (remove 51 (tls13-client-hello-extensions hello)
                                :key #'tls-extension-type)))))
+        (setf (tls13-client-driver-compatibility-ccs-flight driver) :hello-retry-request
+              (tls13-client-driver-compatibility-ccs-count driver) 0)
         (%driver-send driver 1 (tls13-client-driver-client-hello driver))
       (return-from tls13-client-driver-step driver)))
     (unless (member (tls13-client-driver-state driver)
@@ -322,7 +324,9 @@ Returns DRIVER; outgoing messages are delivered to ON-SEND."
                (%driver-make-traffic-state driver server-secret)
                (tls13-client-driver-handshake-write-state driver)
                (%driver-make-traffic-state driver client-secret)))
-       (setf (tls13-client-driver-state driver) :awaiting-encrypted-extensions))
+       (setf (tls13-client-driver-compatibility-ccs-flight driver) :server-hello
+             (tls13-client-driver-compatibility-ccs-count driver) 0
+             (tls13-client-driver-state driver) :awaiting-encrypted-extensions))
       (tls13-encrypted-extensions
        (let ((extension (find +tls13-extension-application-layer-protocol-negotiation+
                               (tls13-encrypted-extensions-extensions message)
@@ -412,9 +416,6 @@ Returns DRIVER; outgoing messages are delivered to ON-SEND."
 
 (defun %driver-feed-handshake (driver bytes)
   (let ((pending (tls13-client-driver-pending-handshake driver)))
-    (when (> (+ (length pending) (length bytes))
-             (+ 4 +tls13-max-handshake-body-length+))
-      (%driver-fail :decode-error))
     (setf (tls13-client-driver-pending-handshake driver)
           (concatenate '(vector (unsigned-byte 8)) pending bytes)))
   (loop for pending = (tls13-client-driver-pending-handshake driver)
@@ -424,18 +425,23 @@ Returns DRIVER; outgoing messages are delivered to ON-SEND."
                         (aref pending 3))
         do (when (> length +tls13-max-handshake-body-length+)
              (%driver-fail :decode-error))
-        while (>= (length pending) (+ 4 length))
-        do (let ((message-wire (subseq pending 0 (+ 4 length))))
-             (setf (tls13-client-driver-pending-handshake driver)
-                   (subseq pending (+ 4 length)))
-             (if (and (eq (tls13-client-driver-state driver) :connected)
-                      (= (aref message-wire 0) 24))
-                 (let ((message (decode-handshake message-wire)))
-                   (tls13-update-traffic-secret
-                    (tls13-client-driver-application-read-state driver))
-                   (when (= (tls13-key-update-request message) 1)
-                     (tls13-client-driver-key-update driver 0)))
-                 (tls13-client-driver-step driver message-wire)))))
+        if (< (length pending) (+ 4 length))
+          do (progn
+               (when (> (length pending) (+ 4 +tls13-max-handshake-body-length+))
+                 (%driver-fail :decode-error))
+               (return))
+        else
+          do (let ((message-wire (subseq pending 0 (+ 4 length))))
+               (setf (tls13-client-driver-pending-handshake driver)
+                     (subseq pending (+ 4 length)))
+               (if (and (eq (tls13-client-driver-state driver) :connected)
+                        (= (aref message-wire 0) 24))
+                   (let ((message (decode-handshake message-wire)))
+                     (tls13-update-traffic-secret
+                      (tls13-client-driver-application-read-state driver))
+                     (when (= (tls13-key-update-request message) 1)
+                       (tls13-client-driver-key-update driver 0)))
+                   (tls13-client-driver-step driver message-wire)))))
 
 (defun tls13-client-driver-read-record (driver)
   "Read one blocking TLS record and process handshake/control records.
@@ -453,12 +459,11 @@ and marks the driver closed after a peer close_notify."
                    (= (aref wire 4) 1)
                    (= (aref wire 5) 1))
         (%driver-fail :unexpected-message))
-      (let ((state (tls13-client-driver-state driver)))
-        (when (eq state (tls13-client-driver-compatibility-ccs-state driver))
-          (when (plusp (tls13-client-driver-compatibility-ccs-count driver))
-            (%driver-fail :unexpected-message)))
-        (setf (tls13-client-driver-compatibility-ccs-state driver) state
-              (tls13-client-driver-compatibility-ccs-count driver) 1))
+      (unless (and (member (tls13-client-driver-compatibility-ccs-flight driver)
+                           '(:server-hello :hello-retry-request))
+                   (zerop (tls13-client-driver-compatibility-ccs-count driver)))
+        (%driver-fail :unexpected-message))
+      (incf (tls13-client-driver-compatibility-ccs-count driver))
       (return-from tls13-client-driver-read-record nil))
     (let ((plaintext (if (and (eq (tls13-client-driver-state driver) :awaiting-server-hello)
                               (not (tls13-client-driver-handshake-read-state driver)))

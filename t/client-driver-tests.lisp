@@ -138,22 +138,47 @@
                      :unexpected-message)))
              "driver rejects CCS outside the compatibility window"))
     (let ((records (list #(20 3 1 0 1 1)
-                         #(20 3 1 0 1 1)
                          #(20 3 1 0 1 1))))
       (let ((allowed-driver
               (cl-tls-kit::%make-tls13-client-driver
                :state :awaiting-encrypted-extensions
+               :compatibility-ccs-flight :server-hello
                :transport-read (lambda (ignored)
                                  (declare (ignore ignored))
                                  (pop records)))))
         (check (null (tls13-client-driver-read-record allowed-driver))
                "driver ignores the first valid compatibility CCS")
+        (setf (cl-tls-kit::tls13-client-driver-state allowed-driver)
+              :awaiting-certificate)
         (check (handler-case
                    (progn (tls13-client-driver-read-record allowed-driver) nil)
                  (tls13-client-driver-error (condition)
                    (eq (tls13-client-driver-error-reason condition)
                        :unexpected-message)))
                "driver rejects a repeated compatibility CCS")))
+    (let ((records (list #(20 3 1 0 1 1)
+                         #(20 3 1 0 1 1)))
+          (hrr-driver driver))
+      (setf (cl-tls-kit::tls13-client-driver-state hrr-driver)
+            :awaiting-server-hello
+            (cl-tls-kit::tls13-client-driver-compatibility-ccs-flight hrr-driver)
+            :server-hello
+            (cl-tls-kit::tls13-client-driver-compatibility-ccs-count hrr-driver)
+            0
+            (cl-tls-kit::tls13-client-driver-transport-read hrr-driver)
+            (lambda (ignored)
+              (declare (ignore ignored))
+              (pop records)))
+      (check (null (tls13-client-driver-read-record hrr-driver))
+             "driver accepts one compatibility CCS after ServerHello")
+      (tls13-client-driver-step
+       hrr-driver
+       (let ((body (encode-hello-retry-request
+                    (make-tls13-hello-retry-request #x0303 #x0017 '()))))
+         (concatenate '(vector (unsigned-byte 8))
+                      #(2) (cl-tls-kit::%u24 (length body)) body)))
+      (check (null (tls13-client-driver-read-record hrr-driver))
+             "driver accepts one compatibility CCS after HRR"))
     (let* ((secret (make-array 32 :element-type '(unsigned-byte 8)
                                :initial-element 9))
            (sender (cl-tls-kit::make-tls13-traffic-state
@@ -219,7 +244,26 @@
                          :decode-error)))
                  "handshake body limit rejects one byte over the boundary"))
         ))
-    (let* ((body-length cl-tls-kit::+tls13-max-handshake-body-length+)
+    (let* ((ticket (make-tls13-new-session-ticket
+                    1 #() (make-array 60000 :element-type '(unsigned-byte 8)
+                                       :initial-element 3)
+                    (list (make-tls-extension
+                           1 (make-array 60000 :element-type '(unsigned-byte 8)
+                                         :initial-element 4)))
+                    0))
+           (message (encode-handshake 4 ticket))
+           (bytes (apply #'concatenate '(vector (unsigned-byte 8))
+                         (loop repeat 9 collect message)))
+           (driver (cl-tls-kit::%make-tls13-client-driver :state :connected)))
+      (check (> (length bytes) (+ 4 cl-tls-kit::+tls13-max-handshake-body-length+))
+             "concatenated handshake input crosses the buffer policy limit")
+      (check (handler-case
+                 (progn (cl-tls-kit::%driver-feed-handshake driver bytes) t)
+               (tls13-client-driver-error () nil))
+             "driver processes complete messages before checking the next message")
+      (check (zerop (length (cl-tls-kit::tls13-client-driver-pending-handshake driver)))
+             "driver drains concatenated complete handshake messages"))
+    (let* ((body-length (1+ cl-tls-kit::+tls13-max-handshake-body-length+))
            (header (vector 1 (ldb (byte 8 16) body-length)
                            (ldb (byte 8 8) body-length)
                            (ldb (byte 8 0) body-length)))
@@ -252,21 +296,65 @@
     (when (uiop:getenv "OPENSSL")
       (let* ((directory (merge-pathnames "cl-tls-kit-r6-certificate/"
                                         (uiop:temporary-directory)))
-             (certificate-path (namestring (merge-pathnames "certificate.pem" directory)))
-             (key-path (namestring (merge-pathnames "certificate.key" directory))))
+             (root-path (namestring (merge-pathnames "root.pem" directory)))
+             (root-key-path (namestring (merge-pathnames "root.key" directory)))
+             (intermediate-path (namestring (merge-pathnames "intermediate.pem" directory)))
+             (intermediate-key-path (namestring (merge-pathnames "intermediate.key" directory)))
+             (intermediate-csr-path (namestring (merge-pathnames "intermediate.csr" directory)))
+             (intermediate-ext-path (namestring (merge-pathnames "intermediate.ext" directory)))
+             (leaf-path (namestring (merge-pathnames "leaf.pem" directory)))
+             (leaf-key-path (namestring (merge-pathnames "leaf.key" directory)))
+             (leaf-csr-path (namestring (merge-pathnames "leaf.csr" directory)))
+             (leaf-ext-path (namestring (merge-pathnames "leaf.ext" directory))))
         (ensure-directories-exist directory)
-        (%openssl-e2e-certificate (or (uiop:getenv "OPENSSL") "openssl")
-                                   certificate-path key-path "example.test" 1 :ca t)
-        (let* ((der (cl-tls-kit:pem-block-der
-                     (first (cl-tls-kit:pem-decode
-                             (uiop:read-file-string certificate-path)))))
-               (certificate (cl-tls-kit.x509:parse-certificate-der der))
-               (extension-data (make-array 60000 :element-type '(unsigned-byte 8)
-                                           :initial-element 0))
-               (extensions (list (make-tls-extension 1 extension-data)))
+        (let ((openssl (or (uiop:getenv "OPENSSL") "openssl")))
+          (labels ((run (arguments)
+                     (multiple-value-bind (output error-output exit-code)
+                         (uiop:run-program (cons openssl arguments)
+                                           :output :string :error-output :string
+                                           :ignore-error-status t)
+                       (declare (ignore output error-output))
+                       (check (zerop exit-code)
+                              "OpenSSL generates the real certificate chain")))
+                   (write-file (path contents)
+                     (with-open-file (stream path :direction :output :if-exists :supersede)
+                       (write-string contents stream)))
+                   (der (path)
+                     (cl-tls-kit:pem-block-der
+                      (first (cl-tls-kit:pem-decode
+                              (uiop:read-file-string path))))))
+            (write-file intermediate-ext-path
+                   (format nil "[v3_ca]~%basicConstraints=critical,CA:TRUE,pathlen:0~%keyUsage=critical,keyCertSign,cRLSign~%subjectKeyIdentifier=hash~%authorityKeyIdentifier=keyid,issuer~%"))
+            (write-file leaf-ext-path
+                   (format nil "[v3_leaf]~%basicConstraints=critical,CA:FALSE~%keyUsage=critical,digitalSignature~%extendedKeyUsage=serverAuth~%subjectAltName=DNS:example.test~%subjectKeyIdentifier=hash~%authorityKeyIdentifier=keyid,issuer~%"))
+            (run (list "req" "-x509" "-newkey" "rsa:2048" "-nodes"
+                       "-days" "1" "-subj" "/CN=R7 Root"
+                       "-addext" "basicConstraints=critical,CA:TRUE,pathlen:1"
+                       "-addext" "keyUsage=critical,keyCertSign,cRLSign"
+                       "-keyout" root-key-path "-out" root-path))
+            (run (list "req" "-new" "-newkey" "rsa:2048" "-nodes"
+                       "-subj" "/CN=R7 Intermediate"
+                       "-keyout" intermediate-key-path "-out" intermediate-csr-path))
+            (run (list "x509" "-req" "-in" intermediate-csr-path
+                       "-CA" root-path "-CAkey" root-key-path "-set_serial" "2"
+                       "-days" "1" "-extfile" intermediate-ext-path "-extensions" "v3_ca"
+                       "-out" intermediate-path))
+            (run (list "req" "-new" "-newkey" "rsa:2048" "-nodes"
+                       "-subj" "/CN=example.test"
+                       "-keyout" leaf-key-path "-out" leaf-csr-path))
+            (run (list "x509" "-req" "-in" leaf-csr-path
+                       "-CA" intermediate-path "-CAkey" intermediate-key-path "-set_serial" "3"
+                       "-days" "1" "-extfile" leaf-ext-path "-extensions" "v3_leaf"
+                       "-out" leaf-path))
+            (let* ((root-der (der root-path))
+                   (intermediate-der (der intermediate-path))
+                   (leaf-der (der leaf-path))
+                   (root (cl-tls-kit.x509:parse-certificate-der root-der))
+                   (leaf (cl-tls-kit.x509:parse-certificate-der leaf-der))
                (message (make-tls13-certificate
-                         #() (loop repeat 8
-                                   collect (make-tls13-certificate-entry der extensions))))
+                         #() (list (make-tls13-certificate-entry leaf-der '())
+                                   (make-tls13-certificate-entry intermediate-der '())
+                                   (make-tls13-certificate-entry root-der '()))))
                (wire (encode-handshake 11 message))
                (records (loop for start from 0 below (length wire) by 16380
                               for end = (min (length wire) (+ start 16380))
@@ -276,18 +364,18 @@
                                         (subseq wire start end)))))
                (driver (cl-tls-kit::%make-tls13-client-driver
                         :state :awaiting-certificate
-                        :trust-anchors (list certificate)
-                        :now (1+ (cl-tls-kit.x509:x509-certificate-not-before
-                                  certificate))
+                        :trust-anchors (list root)
+                        :now (1+ (max (cl-tls-kit.x509:x509-certificate-not-before root)
+                                      (cl-tls-kit.x509:x509-certificate-not-before leaf)))
                         :transport-read (lambda (ignored)
                                           (declare (ignore ignored))
                                           (pop records)))))
-          (check (> (length wire) 300000)
-                 "certificate fixture is several hundred KiB")
+          (check (> (length wire) 1000)
+                 "certificate fixture contains the real three-certificate chain")
           (check (< (length wire) cl-tls-kit::+tls13-max-handshake-body-length+)
                  "certificate fixture stays below the handshake limit")
           (loop while records do (tls13-client-driver-read-record driver))
           (check (eq (cl-tls-kit::tls13-client-driver-state driver)
                      :awaiting-certificate-verify)
-                 "public record path accepts a large Certificate message"))))
-  t))
+                 "public record path accepts a real leaf-intermediate-root chain")))))
+  t)))
