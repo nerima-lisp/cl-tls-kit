@@ -121,4 +121,63 @@
                    (eq (tls13-client-driver-error-reason condition)
                        :downgrade-sentinel)))
                "driver rejects a downgrade sentinel")))
+    (let ((new-driver
+            (cl-tls-kit::%make-tls13-client-driver
+             :state :new
+             :transport-read (lambda (ignored)
+                               (declare (ignore ignored))
+                               #(20 3 3 0 1 1)))))
+      (check (handler-case
+                 (progn (tls13-client-driver-read-record new-driver) nil)
+               (tls13-client-driver-error (condition)
+                 (eq (tls13-client-driver-error-reason condition)
+                     :unexpected-message)))
+             "driver rejects CCS outside the compatibility window"))
+    (let ((allowed-driver
+            (cl-tls-kit::%make-tls13-client-driver
+             :state :awaiting-encrypted-extensions
+             :transport-read (lambda (ignored)
+                               (declare (ignore ignored))
+                               #(20 3 1 0 1 1)))))
+      (check (null (tls13-client-driver-read-record allowed-driver))
+             "driver ignores a valid compatibility CCS"))
+    (let* ((secret (make-array 32 :element-type '(unsigned-byte 8)
+                               :initial-element 9))
+           (sender (cl-tls-kit::make-tls13-traffic-state
+                    provider :sha256 :aes-128-gcm secret 16 12))
+           (receiver (cl-tls-kit::make-tls13-traffic-state
+                      provider :sha256 :aes-128-gcm secret 16 12))
+           (wire (cl-tls-kit::encrypt-tls13-traffic-record
+                  (make-tls-plaintext cl-tls-kit::+tls-content-type-change-cipher-spec+
+                                      #(1))
+                  sender))
+           (encrypted-ccs-driver
+             (cl-tls-kit::%make-tls13-client-driver
+              :state :awaiting-encrypted-extensions
+              :handshake-read-state receiver
+              :transport-read (lambda (ignored)
+                                (declare (ignore ignored))
+                                wire))))
+      (check (handler-case
+                 (progn (tls13-client-driver-read-record encrypted-ccs-driver) nil)
+               (tls13-client-driver-error (condition)
+                 (eq (tls13-client-driver-error-reason condition)
+                     :unexpected-message)))
+             "driver rejects an encrypted-boundary CCS"))
+    (dolist (fragment '(#() #(0) #(1 1)))
+      (let ((bad-driver
+              (cl-tls-kit::%make-tls13-client-driver
+               :state :awaiting-encrypted-extensions
+               :transport-read (lambda (ignored)
+                                 (declare (ignore ignored))
+                                 (encode-tls-plaintext
+                                  (make-tls-plaintext
+                                   cl-tls-kit::+tls-content-type-change-cipher-spec+
+                                   fragment))))))
+        (check (handler-case
+                   (progn (tls13-client-driver-read-record bad-driver) nil)
+                 (tls13-client-driver-error (condition)
+                   (eq (tls13-client-driver-error-reason condition)
+                       :unexpected-message)))
+               "driver rejects malformed compatibility CCS")))
   t))

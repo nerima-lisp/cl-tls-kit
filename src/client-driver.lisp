@@ -435,10 +435,21 @@ and marks the driver closed after a peer close_notify."
                             (not (tls13-client-driver-handshake-read-state driver))))
                         (decode-tls-plaintext wire)
                         (%driver-decrypt-record driver wire))))
+    (when (= (aref wire 0) +tls-content-type-change-cipher-spec+)
+      (unless (and (member (tls13-client-driver-state driver)
+                           '(:awaiting-server-hello :awaiting-encrypted-extensions
+                             :awaiting-certificate :awaiting-certificate-verify
+                             :awaiting-finished))
+                   (= (length wire) 6)
+                   (= (aref wire 3) 0)
+                   (= (aref wire 4) 1)
+                   (= (aref wire 5) 1))
+        (%driver-fail :unexpected-message))
+      (return-from tls13-client-driver-read-record nil))
     (cond
       ((= (tls-plaintext-content-type plaintext)
           +tls-content-type-change-cipher-spec+)
-       nil)
+       (%driver-fail :unexpected-message))
       ((tls-close-notify-p plaintext)
        (setf (tls13-client-driver-close-notify-received driver) t
              (tls13-client-driver-state driver) :closed)
