@@ -32,7 +32,7 @@
 
 (defun %require-octets (value name)
   (unless (%octets-p value)
-    (%tls13-error "~A must be a vector of octets, got ~S" name value))
+    (%tls13-error "~A must be a vector of octets" name))
   value)
 
 (defun %concat-octets (&rest vectors)

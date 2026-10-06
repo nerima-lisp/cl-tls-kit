@@ -82,6 +82,17 @@ CA constraint, key usage, and self-signature are outside this policy. All
 certificates below the trust anchor remain subject to chain, signature,
 validity, and usage checks; the anchor's validity interval is still checked.
 
+`make-cl-crypto-kit-provider` returns a TLS 1.3 provider backed by the loaded
+`cl-crypto-kit` package. `load-trust-anchors` accepts either a PEM bundle path
+or an octet vector containing PEM text and returns parsed X.509 trust anchors:
+
+```lisp
+(let* ((ca-file "/path/to/ca-bundle.pem")
+       (provider (cl-tls-kit:make-cl-crypto-kit-provider))
+       (trust-anchors (cl-tls-kit:load-trust-anchors ca-file)))
+  (list :provider provider :trust-anchors trust-anchors))
+```
+
 ## QUIC TLS boundary
 
 `make-quic-tls-boundary` handles TLS handshake bytes carried in QUIC CRYPTO

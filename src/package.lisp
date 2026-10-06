@@ -22,6 +22,7 @@
    #:certificate-signature-provider-unavailable
    #:default-trust-store-path
    #:load-trust-store
+   #:load-trust-anchors
    #:tls13-crypto-provider #:make-cl-crypto-kit-provider
    #:tls13-hkdf-extract #:tls13-hkdf-expand-label #:tls13-derive-secret
    #:tls13-early-secret #:tls13-handshake-secret #:tls13-master-secret

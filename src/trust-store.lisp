@@ -1,6 +1,9 @@
 (in-package #:cl-tls-kit)
 
-(export '(default-trust-store-path load-trust-store *default-ca-paths*))
+(export '(default-trust-store-path load-trust-store load-trust-anchors
+          *default-ca-paths*))
+
+(defparameter +max-trust-store-bytes+ (* 16 1024 1024))
 
 (defparameter *default-ca-paths*
   '("/etc/ssl/cert.pem" "/etc/ssl/certs/ca-certificates.crt"
@@ -40,3 +43,52 @@ from its crypto dependency; this module intentionally does not parse PEM."
     (when loader-supplied-p
       (return-from load-trust-store (funcall loader path)))
     path))
+
+(defun %read-trust-store-octets (source)
+  (cond
+    ((typep source '(vector (unsigned-byte 8)))
+     (when (> (length source) +max-trust-store-bytes+)
+       (error 'pem-error :message "CA trust store is too large"))
+     source)
+    ((or (stringp source) (pathnamep source))
+     (let ((path (pathname source)))
+       (unless (and (probe-file path)
+                    (not (uiop:directory-pathname-p path)))
+         (error 'pem-error :message "CA trust store path does not name a file"))
+       (with-open-file (stream path :direction :input
+                                    :element-type '(unsigned-byte 8))
+         (let ((size (file-length stream)))
+           (unless (and (integerp size) (<= 0 size) (<= size +max-trust-store-bytes+))
+             (error 'pem-error :message "CA trust store is too large"))
+           (let ((octets (make-array size :element-type '(unsigned-byte 8))))
+             (unless (= (read-sequence octets stream) size)
+               (error 'pem-error :message "CA trust store ended before its declared size"))
+             octets)))))
+    (t
+     (error 'type-error :datum source
+            :expected-type '(or string pathname (vector (unsigned-byte 8)))))))
+
+(defun %trust-store-text (octets)
+  (map 'string
+       (lambda (octet)
+         (if (< octet #x80)
+             (code-char octet)
+             (error 'pem-error :message "CA trust store is not ASCII PEM")))
+       octets))
+
+(defun load-trust-anchors (source)
+  "Return X.509 trust anchors from a PEM bundle supplied as bytes or a path.
+SOURCE must be a byte vector containing PEM text, or a pathname/string naming
+a PEM file. Every CERTIFICATE block is parsed and malformed blocks are
+rejected instead of being ignored."
+  (let* ((text (%trust-store-text (%read-trust-store-octets source)))
+         (blocks (pem-decode text))
+         (certificate-blocks
+           (remove-if-not (lambda (block)
+                            (string= (pem-block-label block) "CERTIFICATE"))
+                          blocks)))
+    (unless certificate-blocks
+      (error 'invalid-certificate-chain :certificate nil))
+    (mapcar (lambda (block)
+              (cl-tls-kit.x509:parse-certificate-der (pem-block-der block)))
+            certificate-blocks)))

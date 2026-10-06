@@ -51,6 +51,19 @@
               (push (list key scheme input received) calls)
               t))
            "provider boundary accepts a valid mock result")
+    (let ((secret "provider-secret-must-not-escape"))
+      (check (handler-case
+                 (progn
+                   (cl-tls-kit::tls13-verify-certificate-verify
+                    hello :server :key #x0804 signature hash
+                    (lambda (key scheme input received)
+                      (declare (ignore key scheme input received))
+                      (error "~A" secret)))
+                   nil)
+               (cl-tls-kit::tls13-verification-provider-error (condition)
+                 (not (search secret
+                              (cl-tls-kit::tls13-verification-error-message condition)))))
+             "provider failure does not expose provider condition text"))
     (check (= (length calls) 1) "provider is called once")
     (check (equalp (third (first calls))
                    (cl-tls-kit::tls13-certificate-verify-signature-input :server hash))

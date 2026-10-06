@@ -9,7 +9,7 @@
     };
     # The crypto kit is consumed by the certificate verifier when available.
     cl-crypto-kit = {
-      url = "github:nerima-lisp/cl-crypto-kit";
+      url = "github:nerima-lisp/cl-crypto-kit/bb93f974b2d81c67a21b4f87206c81d051eee518";
       flake = false;
     };
   };

@@ -197,11 +197,10 @@ the loaded crypto provider, and must return true for a valid signature."
                      (funcall verify-signature (%tls13-crypto-scheme scheme)
                               (%tls13-certificate-public-key public-key) input signature)
                    (tls13-verification-error (condition) (error condition))
-                   (error (condition)
+                   (error ()
                      (%tls13-verification-fail 'tls13-verification-provider-error
                                                :provider-failure
-                                               "verify-signature failed: ~A"
-                                               condition)))))
+                                               "verify-signature failed")))))
     (unless (typep result 'boolean)
       (%tls13-verification-fail 'tls13-verification-provider-error
                                 :invalid-provider-result

@@ -153,7 +153,8 @@
            (intermediate (list :issuer "root" :subject "intermediate"
                                :not-before 0 :not-after (1+ now)
                                :signature-algorithm :rsa-pkcs1-sha256
-                               :basic-constraints '(:ca t)))
+                               :basic-constraints '(:ca t)
+                               :extended-key-usage '(:server-auth)))
            (root (list :subject "root" :not-before 0 :not-after (1+ now)
                        :self-signed t
                        :basic-constraints '(:ca t :path-length 0)))
@@ -171,9 +172,20 @@
         (setf (getf (getf root :basic-constraints) :path-length) 1)
         (check (verify-certificate-chain
                 chain :trust-anchors (list root)
-                :verify-signature (lambda (&rest arguments)
-                                    (declare (ignore arguments)) t))
-               "pathLen permits the configured subordinate CA depth")))
+               :verify-signature (lambda (&rest arguments)
+                                   (declare (ignore arguments)) t))
+               "pathLen permits the configured subordinate CA depth")
+        (setf (getf intermediate :extended-key-usage) '(:client-auth))
+        (check (handler-case
+                   (progn
+                     (verify-certificate-chain
+                      chain :trust-anchors (list root)
+                      :verify-signature (lambda (&rest arguments)
+                                          (declare (ignore arguments)) t))
+                     nil)
+                 (invalid-extended-key-usage () t)
+                 (condition () nil))
+               "intermediate EKU constrains server certificate validation")))
     (let* ((leaf (list :issuer "root" :subject "leaf"
                        :not-before 0 :not-after (1+ (get-universal-time))
                        :signature-algorithm :rsa-pkcs1-sha256

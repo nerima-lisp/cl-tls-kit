@@ -326,6 +326,12 @@
                    (write-file (path contents)
                      (with-open-file (stream path :direction :output :if-exists :supersede)
                        (write-string contents stream)))
+                   (read-bytes (path)
+                     (with-open-file (stream path :element-type '(unsigned-byte 8))
+                       (let* ((size (file-length stream))
+                              (bytes (make-array size :element-type '(unsigned-byte 8))))
+                         (read-sequence bytes stream)
+                         bytes)))
                    (der (path)
                      (cl-tls-kit:pem-block-der
                       (first (cl-tls-kit:pem-decode
@@ -354,9 +360,13 @@
                        "-days" "1" "-extfile" leaf-ext-path "-extensions" "v3_leaf"
                        "-out" leaf-path))
             (let* ((root-der (der root-path))
+                   (root-pem-bytes (read-bytes root-path))
                    (intermediate-der (der intermediate-path))
                    (leaf-der (der leaf-path))
                    (root (cl-tls-kit.x509:parse-certificate-der root-der))
+                   (root-anchors (cl-tls-kit:load-trust-anchors root-path))
+                   (root-anchors-from-bytes
+                     (cl-tls-kit:load-trust-anchors root-pem-bytes))
                    (leaf (cl-tls-kit.x509:parse-certificate-der leaf-der))
                (message (make-tls13-certificate
                          #() (list (make-tls13-certificate-entry leaf-der '())
@@ -379,6 +389,16 @@
                                           (pop records)))))
           (check (> (length wire) 1000)
                  "certificate fixture contains the real three-certificate chain")
+          (check (and (= (length root-anchors) 1)
+                      (equalp (cl-tls-kit.x509:x509-certificate-subject
+                               (first root-anchors))
+                              (cl-tls-kit.x509:x509-certificate-subject root)))
+                 "PEM path produces a trust anchor")
+          (check (and (= (length root-anchors-from-bytes) 1)
+                      (equalp (cl-tls-kit.x509:x509-certificate-subject
+                               (first root-anchors-from-bytes))
+                              (cl-tls-kit.x509:x509-certificate-subject root)))
+                 "PEM bytes produce a trust anchor")
           (check (< (length wire) cl-tls-kit::+tls13-max-handshake-body-length+)
                  "certificate fixture stays below the handshake limit")
           (loop while records do (tls13-client-driver-read-record driver))

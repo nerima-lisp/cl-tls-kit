@@ -198,18 +198,8 @@ the crypto provider supplies hash, HKDF, HMAC, and AEAD primitives."
 (defun %driver-trust-anchors (driver)
   (or (tls13-client-driver-trust-anchors driver)
       (handler-case
-          (let ((path (load-trust-store))
-                (anchors nil))
-            (dolist (block (pem-decode (uiop:read-file-string path)))
-              (when (string= (pem-block-label block) "CERTIFICATE")
-                (handler-case
-                    (push (cl-tls-kit.x509:parse-certificate-der
-                           (pem-block-der block))
-                          anchors)
-                  (error () nil))))
-            (unless anchors
-              (error 'untrusted-root :certificate nil))
-            (setf (tls13-client-driver-trust-anchors driver) anchors))
+          (setf (tls13-client-driver-trust-anchors driver)
+                (load-trust-anchors (load-trust-store)))
         (certificate-verification-error (condition)
           (error condition))
         (error (condition)
