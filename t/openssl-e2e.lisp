@@ -41,6 +41,29 @@
     (declare (ignore error-output))
     (values output exit-code)))
 
+(defun %openssl-e2e-temp-directory ()
+  (multiple-value-bind (output exit-code)
+      (%openssl-e2e-run
+       "mktemp"
+       (list "-d" (namestring
+                   (merge-pathnames "cl-tls-kit-openssl-e2e.XXXXXXXX"
+                                    (uiop:temporary-directory)))))
+    (unless (zerop exit-code)
+      (error "OpenSSL E2E temporary directory creation failed"))
+    (uiop:ensure-directory-pathname
+     (string-trim '(#\Space #\Newline #\Return) output))))
+
+(defun %openssl-e2e-cleanup-directory (directory files)
+  (let ((failures nil))
+    (dolist (file files)
+      (handler-case
+          (when (probe-file file) (delete-file file))
+        (error (condition) (push condition failures))))
+    (handler-case
+        (uiop:delete-empty-directory directory)
+      (error (condition) (push condition failures)))
+    (nreverse failures)))
+
 (defun %openssl-e2e-certificate (openssl path key-name common-name days
                                   &key ca (key-type :rsa))
   (multiple-value-bind (output exit-code)
@@ -66,12 +89,13 @@
     (unless (zerop exit-code)
       (error "OpenSSL certificate generation failed"))))
 
-(defun %openssl-e2e-start (openssl port certificate key suite groups)
+(defun %openssl-e2e-start (openssl port certificate key suite groups &key chain)
   (uiop:launch-program
-   (list openssl "s_server" "-accept" (princ-to-string port)
-         "-cert" certificate "-key" key "-tls1_3"
-         "-ciphersuites" suite "-groups" groups "-alpn" "http/1.1"
-         "-no_ticket" "-www" "-quiet")
+   (append (list openssl "s_server" "-accept" (princ-to-string port)
+                 "-cert" certificate "-key" key "-tls1_3"
+                 "-ciphersuites" suite "-groups" groups "-alpn" "http/1.1"
+                 "-no_ticket" "-www" "-quiet")
+           (when chain (list "-cert_chain" chain)))
    :output *standard-output* :error-output *error-output*
    :wait nil))
 
@@ -106,12 +130,13 @@
         finally (error "OpenSSL did not return application data")))
 
 (defun %openssl-e2e-with-server
-    (openssl suite groups certificate key function)
+    (openssl suite groups certificate key function &key chain)
   (let* ((port (prog1 *openssl-e2e-port* (incf *openssl-e2e-port*)))
          (server nil))
     (unwind-protect
          (progn
-           (setf server (%openssl-e2e-start openssl port certificate key suite groups))
+           (setf server (%openssl-e2e-start openssl port certificate key suite groups
+                                          :chain chain))
            (sleep 1)
            (funcall function port))
       (when server
@@ -141,8 +166,8 @@
   (unless (find-package "CRYPTO-KIT")
     (error "OpenSSL E2E requires cl-crypto-kit in the canonical test process"))
   (let* ((openssl (or (uiop:getenv "OPENSSL") "openssl"))
-         (directory (merge-pathnames "cl-tls-kit-openssl-e2e/"
-                                     (uiop:temporary-directory)))
+         (provider (cl-tls-kit:make-cl-crypto-kit-provider))
+         (directory (%openssl-e2e-temp-directory))
          (certificate (namestring (merge-pathnames "server.crt" directory)))
          (key (namestring (merge-pathnames "server.key" directory)))
          (wrong-certificate (namestring (merge-pathnames "wrong.crt" directory)))
@@ -153,12 +178,16 @@
          (anchor-key (namestring (merge-pathnames "anchor.key" directory)))
          (ecdsa-certificate (namestring (merge-pathnames "ecdsa.crt" directory)))
          (ecdsa-key (namestring (merge-pathnames "ecdsa.key" directory)))
-         (provider (cl-tls-kit:make-cl-crypto-kit-provider))
+         (files (list certificate key wrong-certificate wrong-key
+                      other-certificate other-key anchor-certificate anchor-key
+                      ecdsa-certificate ecdsa-key))
+         (body-failure nil)
+         (cleanup-failures nil)
          (selected 0)
          (assertions 0))
-    (ensure-directories-exist directory)
     (unwind-protect
-         (progn
+         (handler-case
+          (progn
            (%openssl-e2e-certificate openssl certificate key "localhost" 1)
            (dolist (suite '(#x1301 #x1302 #x1303))
              (dolist (group '((#x001d) (#x0017)))
@@ -207,7 +236,7 @@
                        (incf assertions)
                        (check (eq (cl-tls-kit::tls13-client-driver-state driver)
                                   :connected)
-                              "cl-tls-kit completes an OpenSSL HelloRetryRequest"))
+                              "cl-tls-kit completes an OpenSSL HelloRetryRequest")
                        (incf assertions)
                        (check (string= (cl-tls-kit:tls13-client-driver-negotiated-alpn driver)
                                        "http/1.1")
@@ -218,7 +247,7 @@
                        (check (search "HTTP/1.0"
                                       (map 'string #'code-char
                                            (%openssl-e2e-read-application driver)))
-                              "OpenSSL accepts application data after HelloRetryRequest")
+                              "OpenSSL accepts application data after HelloRetryRequest"))
                   (cl-tls-kit:tls13-client-driver-close driver)
                   (incf assertions)
                   (check (eq (cl-tls-kit::tls13-client-driver-state driver) :closed)
@@ -285,18 +314,30 @@
               openssl provider other-certificate other-key anchor
               (get-universal-time) 'cl-tls-kit:untrusted-root)
              (incf assertions))
+           (multiple-value-bind (chain-selected chain-assertions)
+               (run-openssl-chain-tests openssl provider)
+             (incf selected chain-selected)
+             (incf assertions chain-assertions))
+           (incf assertions (run-pss-signature-tests))
            (check (plusp selected) "OpenSSL E2E selected at least one case")
            (check (plusp assertions) "OpenSSL E2E executed at least one assertion")
-           (format t "OpenSSL E2E: selected test count: ~D; assertions: ~D~%"
-                   selected assertions)
+           (incf assertions 2)
            t)
-      (ignore-errors (delete-file certificate))
-      (ignore-errors (delete-file key))
-      (ignore-errors (delete-file wrong-certificate))
-      (ignore-errors (delete-file wrong-key))
-      (ignore-errors (delete-file other-certificate))
-      (ignore-errors (delete-file other-key))
-      (ignore-errors (delete-file anchor-certificate))
-      (ignore-errors (delete-file anchor-key))
-      (ignore-errors (delete-file ecdsa-certificate))
-      (ignore-errors (delete-file ecdsa-key)))))
+          (error (condition) (setf body-failure condition)))
+      (setf cleanup-failures (%openssl-e2e-cleanup-directory directory files)))
+    (when body-failure
+      (when cleanup-failures
+        (format *error-output* "OpenSSL E2E cleanup also failed: ~{~A~^; ~}~%"
+                cleanup-failures))
+      (error body-failure))
+    (when cleanup-failures
+      (error "OpenSSL E2E cleanup failed: ~{~A~^; ~}" cleanup-failures))
+    (incf assertions)
+    (check (every (lambda (file) (not (probe-file file))) files)
+           "OpenSSL E2E removes all temporary certificates and private keys")
+    (incf assertions)
+    (check (not (uiop:directory-exists-p directory))
+           "OpenSSL E2E removes its temporary directory")
+    (format t "OpenSSL E2E: selected test count: ~D; assertions: ~D~%"
+            selected assertions)
+    t))

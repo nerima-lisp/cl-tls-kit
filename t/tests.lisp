@@ -4,6 +4,9 @@
   (unless condition (error "Test failed: ~A" message)))
 
 (defun run-basic-tests ()
+  (run-pss-parameters-tests)
+  (run-chain-boundary-tests)
+  (run-self-issued-chain-tests)
   (let* ((integer (make-der-integer 127))
          (sequence (make-der-sequence integer (make-der-null)))
          (encoded (der-encode sequence))
@@ -296,4 +299,113 @@
                (bad-signature () nil)
                (condition () nil))
              "provider errors are not converted to bad signatures"))
+    t))
+
+(defun run-self-issued-chain-tests ()
+  (let* ((root (list :subject "rollover" :issuer "rollover"
+                     :basic-constraints '(:ca t :path-length 0)
+                     :name-constraints '(:permitted-subtrees ((:dns "example.test")))))
+         (rollover (list :subject "rollover" :issuer "rollover"
+                         :basic-constraints '(:ca t)
+                         :signature-algorithm :rsa-pkcs1-sha256
+                         :subject-alternative-names '((:dns "outside.test"))))
+         (leaf (list :subject "leaf" :issuer "rollover"
+                     :signature-algorithm :rsa-pkcs1-sha256
+                     :subject-alternative-names '((:dns "good.example.test"))))
+         (calls 0)
+         (verifier (lambda (&rest arguments)
+                     (declare (ignore arguments))
+                     (incf calls)
+                     t)))
+    (check (verify-certificate-chain (list leaf rollover root)
+                                    :trust-anchors (list root)
+                                    :verify-signature verifier)
+           "self-issued CA rollover is exempt from ancestor names and path length")
+    (check (= calls 2) "self-issued CA rollover still requires both signatures")
+    (setf (getf leaf :subject) "rollover"
+          (getf leaf :subject-alternative-names) '((:dns "outside.test")))
+    (check (handler-case
+               (progn (verify-certificate-chain (list leaf rollover root)
+                                                 :trust-anchors (list root)
+                                                 :verify-signature verifier)
+                      nil)
+             (invalid-certificate-chain () t))
+           "a self-issued final certificate is not exempt from name constraints")
+    (check (not (cl-tls-kit::%self-issued-p '(:basic-constraints (:ca t))))
+           "absent issuer and subject do not establish a self-issued certificate")
+    t))
+
+(defun run-chain-boundary-tests ()
+  (let* ((now (get-universal-time))
+         (root (list :subject "root" :issuer "root"
+                     :not-before 0 :not-after (1+ now)
+                     :basic-constraints '(:ca t)
+                     :name-constraints '(:permitted-subtrees ((:dns "example.test")))))
+         (intermediate (list :subject "intermediate" :issuer "root"
+                             :not-before 0 :not-after (1+ now)
+                             :basic-constraints '(:ca t)
+                             :signature-algorithm :rsa-pkcs1-sha256))
+         (leaf (list :subject "leaf" :issuer "intermediate"
+                     :not-before 0 :not-after (1+ now)
+                     :signature-algorithm :rsa-pkcs1-sha256
+                     :subject-alternative-names '((:dns "good.example.test"))))
+         (verified 0)
+         (verifier (lambda (&rest arguments)
+                     (declare (ignore arguments))
+                     (incf verified)
+                     t)))
+    (check (verify-certificate-chain (list leaf intermediate)
+                                    :trust-anchors (list root)
+                                    :hostname "good.example.test"
+                                    :verify-signature verifier)
+           "complete an omitted root from explicit trust anchors")
+    (check (= verified 2) "verify both signatures through the selected anchor")
+    (setf verified 0)
+    (check (verify-certificate-chain (list leaf intermediate root)
+                                    :trust-anchors (list root)
+                                    :verify-signature verifier)
+           "DNS constraints do not reject intermediates without DNS names")
+    (check (= verified 2) "included anchors do not require self-signature verification")
+    (setf (getf leaf :subject-alternative-names)
+          '((:dns "good.example.test") (:dns "outside.test")))
+    (check (handler-case
+               (progn (verify-certificate-chain (list leaf intermediate root)
+                                                 :trust-anchors (list root)
+                                                 :hostname "outside.test"
+                                                 :verify-signature verifier)
+                      nil)
+             (invalid-certificate-chain () t))
+           "every DNS SAN must satisfy permitted constraints")
+    (setf (getf root :name-constraints)
+          '(:permitted-subtrees ((:ip #(192 0 2 0 255 255 255 0)))))
+    (setf (getf leaf :subject-alternative-names) '((:ip #(192 0 2 4))))
+    (check (verify-certificate-chain (list leaf intermediate root)
+                                    :trust-anchors (list root)
+                                    :verify-signature verifier)
+           "IPv4 name constraints use address plus mask octets")
+    (setf (getf leaf :subject-alternative-names) '((:ip #(192 0 3 4))))
+    (check (handler-case
+               (progn (verify-certificate-chain (list leaf intermediate root)
+                                                 :trust-anchors (list root)
+                                                 :verify-signature verifier)
+                      nil)
+             (invalid-certificate-chain () t))
+           "reject IPv4 addresses outside the permitted subnet")
+    (setf (getf root :name-constraints) nil)
+    (check (handler-case
+               (progn (verify-certificate-chain (list leaf intermediate)
+                                                 :trust-anchors (list root)
+                                                 :verify-signature
+                                                 (lambda (&rest arguments)
+                                                   (declare (ignore arguments)) nil))
+                      nil)
+             (bad-signature () t))
+           "an anchor name match never substitutes for signature verification")
+    (check (handler-case
+               (progn (verify-certificate-chain (list leaf intermediate)
+                                                 :trust-anchors nil
+                                                 :verify-signature verifier)
+                      nil)
+             (untrusted-root () t))
+           "chain completion requires an explicit trust anchor")
     t))

@@ -1,0 +1,91 @@
+(in-package #:cl-tls-kit/test)
+
+(defun run-pss-parameters-tests ()
+  (let ((assertions 0))
+    (labels ((check-pss (condition message)
+               (incf assertions)
+               (unless condition (error "PSS parameter test failed: ~A" message)))
+             (encoded (tag &rest values)
+               (let ((content (apply #'concatenate '(vector (unsigned-byte 8)) values)))
+                 (concatenate '(vector (unsigned-byte 8)) (vector tag)
+                              (cl-tls-kit::%encode-length (length content)) content)))
+             (oid (value)
+               (der-encode
+                (make-der-oid
+                 (loop for start = 0 then (1+ end)
+                       for end = (position #\. value :start start)
+                       collect (parse-integer value :start start :end end)
+                       while end))))
+             (integer-der (value) (der-encode (make-der-integer value)))
+             (hash-alg (hash &optional (parameters #(5 0)))
+               (encoded #x30 (oid hash) parameters))
+             (parameters (hash &key (mgf-hash hash) (salt 32) (trailer 1))
+               (encoded #x30
+                        (encoded #xa0 (hash-alg hash))
+                        (encoded #xa1 (encoded #x30 (oid "1.2.840.113549.1.1.8")
+                                               (hash-alg mgf-hash)))
+                        (encoded #xa2 (integer-der salt))
+                        (encoded #xa3 (integer-der trailer))))
+             (algorithm (&rest params)
+               (apply #'encoded #x30 (oid "1.2.840.113549.1.1.10") params))
+             (decode (bytes)
+               (cl-tls-kit.x509::%signature-parameters
+                (nth-value 0 (cl-tls-kit.x509::%read-der bytes))))
+             (rejected (bytes)
+               (handler-case (progn (decode bytes) nil)
+                 (cl-tls-kit.x509:x509-error () t))))
+      (dolist (case '(("2.16.840.1.101.3.4.2.1" :sha256 32)
+                      ("2.16.840.1.101.3.4.2.2" :sha384 48)
+                      ("2.16.840.1.101.3.4.2.3" :sha512 64)))
+        (destructuring-bind (hash keyword salt) case
+          (check-pss (equal (decode (algorithm (parameters hash :salt salt)))
+                            (list :hash keyword :mgf-hash keyword
+                                  :salt-length salt :trailer-field 1))
+                     "supported PSS parameters retain all fields")
+          (check-pss
+           (equal (decode
+                   (algorithm
+                    (encoded #x30
+                             (encoded #xa0 (hash-alg hash #()))
+                             (encoded #xa1
+                                      (encoded #x30 (oid "1.2.840.113549.1.1.8")
+                                               (hash-alg hash #())))
+                             (encoded #xa2 (integer-der salt)))))
+                  (list :hash keyword :mgf-hash keyword
+                        :salt-length salt :trailer-field 1))
+           "absent digest NULL parameters and default trailer are accepted")))
+      (let ((sha256 "2.16.840.1.101.3.4.2.1")
+            (sha384 "2.16.840.1.101.3.4.2.2"))
+        (dolist (bytes
+                 (list
+                  (algorithm)
+                  (algorithm #(5 0))
+                  (algorithm (encoded #x30))
+                  (algorithm (parameters "1.3.14.3.2.26" :salt 20))
+                  (algorithm (parameters sha256 :mgf-hash sha384))
+                  (algorithm (parameters sha256 :salt 20))
+                  (algorithm (parameters sha256 :trailer 2))
+                  (algorithm (parameters "1.2.3.4"))
+                  (algorithm (encoded #x30 (encoded #xa0 (hash-alg sha256))))
+                  (algorithm (encoded #x30 (encoded #xa0)
+                                             (encoded #xa2 (integer-der 32))))
+                  (algorithm (encoded #x30 (encoded #xa0 (hash-alg sha256)
+                                                        (hash-alg sha256))))
+                  (algorithm (encoded #x30 (encoded #xa0 (hash-alg sha256))
+                                             (encoded #xa0 (hash-alg sha256))))
+                  (algorithm (encoded #x30 (encoded #xa2 (integer-der 32))
+                                             (encoded #xa0 (hash-alg sha256))))
+                  (algorithm (encoded #x30 (encoded #xa4 (integer-der 1))))
+                  (algorithm (encoded #x30 (encoded #x80 (integer-der 1))))
+                  (algorithm (encoded #x30 (encoded #xa0 (hash-alg sha256 #(4 0)))))
+                  (algorithm (encoded #x30 (encoded #xa1
+                                                      (encoded #x30 (oid "1.2.3.4")
+                                                               (hash-alg sha256)))))
+                  (algorithm (encoded #x30 (encoded #xa1
+                                                      (encoded #x30 (oid "1.2.840.113549.1.1.8")))))
+                  (algorithm (parameters sha256) #(5 0))))
+          (check-pss (rejected bytes) "malformed or unsupported PSS parameters reject")))
+      (check-pss (null (decode (encoded #x30 (oid "1.2.840.113549.1.1.11") #(5 0))))
+                 "non-PSS algorithms retain compatibility")
+      (format t "PSS parameter assertions: ~D~%" assertions)
+      assertions)))

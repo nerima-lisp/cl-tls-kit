@@ -1,5 +1,5 @@
 {
-  description = "Strict DER and PEM building blocks for Common Lisp TLS tooling.";
+  description = "TLS 1.3 client, certificate verification, and QUIC TLS boundaries for Common Lisp.";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
@@ -36,7 +36,7 @@
         system: pkgs: {
           default = pkgs.stdenvNoCC.mkDerivation {
             pname = "cl-tls-kit";
-            version = "0.1.0";
+            version = "0.1.1";
             src = self;
             dontBuild = true;
             installPhase = ''
@@ -61,7 +61,7 @@
         system: pkgs: {
           default = pkgs.stdenvNoCC.mkDerivation {
             pname = "cl-tls-kit-tests";
-            version = "0.1.0";
+            version = "0.1.1";
             src = self;
             nativeBuildInputs = [ pkgs.sbcl pkgs.openssl ];
             dontConfigure = true;

@@ -24,6 +24,11 @@ verification API signals conditions such as `certificate-expired`,
 `certificate-hostname-mismatch`, `untrusted-root`, `bad-signature`, and
 `invalid-certificate-chain`.
 
+RSA-PSS certificate signatures support SHA-256, SHA-384, and SHA-512. Their
+parameters must use the same hash for MGF1, a salt length equal to the digest
+length, and trailer field 1. Certificate parsing rejects a mismatch between
+the TBSCertificate and outer signature AlgorithmIdentifier encodings.
+
 OCSP and CRL processing are intentionally out of scope. Certificate parsing
 and chain checks do not fetch or evaluate revocation status, and there are no
 OCSP or CRL APIs.
@@ -47,37 +52,100 @@ SNI and ALPN are optional ClientHello extensions. `make-tls-client` accepts
 `hostname` and `alpn-offered`; `tls-client-make-client-hello` encodes them
 with `encode-sni-extension` and `encode-alpn-extension`. The driver accepts
 `hostname` and `alpn` and includes the same extensions. The negotiated ALPN
-value is available through `tls-client-alpn` after provider input is applied.
+value is available through `tls-client-alpn` after provider input is applied,
+or `tls13-client-driver-negotiated-alpn` for the handshake driver.
 
 ## Client and stream boundaries
 
-`make-tls-client` is a boundary around callbacks, not an independent
-provider-neutral handshake implementation. A provider is a function or a
-property list of callbacks such as `:client-hello`, `:handshake`,
-`:key-update`, and `:close-notify`; the client invokes these with the client
-and callback-specific input. `transport-read` returns one encoded TLS record
-or `nil`, and `transport-write` receives the client and encoded bytes.
-`tls-client-read` and `tls-client-write` operate only after the client is
-connected. `make-tls-client-over-tcp` supplies a blocking SBCL TCP stream
-adapter; other implementations must provide transport callbacks directly.
+### Callback client
+
+`make-tls-client` is a provider-defined boundary, not a complete handshake
+implementation. Its `provider` can be a function used for all three operations
+below, or a property list selecting a separate function for each:
+
+- `:client-hello` receives `(client)` and returns a `tls13-client-hello`, or a
+  plist with that object under `:message` on the initial call. A retry call
+  requires the ClientHello object directly.
+- `:handshake` receives `(client input)`, where input is `:start` or the input
+  supplied to `tls-client-step` (encoded handshake bytes are decoded first),
+  and returns a result plist.
+- `:key-update` receives `(client request)`, where request is 0 or 1, and
+  returns a result plist.
+
+Result plists can supply an `:outgoing` list of encoded handshake messages or
+`(type . payload)` pairs, `:peer-certificate` for verification, `:alpn`, and
+`:state` (`:awaiting-input`, `:connected`, or `:failed`). The client validates
+handshake ordering before applying provider
+input. `tls-client-connect` only starts the handshake; the application must
+drive `tls-client-step` until `tls-client-state` is `:connected`.
+
+`transport-read` receives `(client)` and returns an encoded TLS record or nil.
+`transport-write` receives `(client bytes)`; handshake output is encoded
+handshake bytes, not TLS records. For connected application I/O,
+`record-protect` receives `(client plaintext)` and returns bytes for the
+writer; `record-unprotect` receives `(client record)` and returns the value
+that `tls-client-read` returns. Without these adapters, data passes through
+unchanged. Control records are processed only when unprotect returns a
+`tls-plaintext`. A provider plist can additionally contain `:close-notify`,
+which receives `(client)` and returns an encoded alert record or nil.
+`transport-close` receives `(client)`.
+
+`tls-client-read` and `tls-client-write` require a connected client.
+`make-tls-client-over-tcp` supplies blocking SBCL socket I/O, but does not
+supply the handshake provider or record adapters. Other implementations must
+provide transport callbacks directly.
+
+### TLS 1.3 handshake driver
 
 `make-tls13-client-driver` is the more prescriptive callback-driven TLS 1.3
-handshake sequence. It requires a `tls13-crypto-provider`, a key-exchange
-plist containing `:generate` and `:shared-secret`, and sends encoded
-handshake messages to its `on-send` callback. It sequences ClientHello,
+handshake sequence. After loading `cl-crypto-kit` with ASDF,
+`make-cl-crypto-kit-provider` creates the required `tls13-crypto-provider`
+for hashing, HKDF, HMAC, and AEAD. Key exchange is a separate plist:
+`:generate` receives `(group-id)` and returns private key and public octets as
+two values; `:shared-secret` receives `(group-id private-key peer-public-octets)`
+and returns shared-secret octets.
+
+The optional `on-send` callback receives `(driver handshake-bytes)` as a
+notification. It is not the socket writer: the driver separately wraps and
+protects these bytes as TLS records. It sequences ClientHello,
 HelloRetryRequest, ServerHello, EncryptedExtensions, Certificate,
-CertificateVerify, and Finished. When `trust-anchors` is supplied, it parses
-the peer certificate chain, applies the hostname and chain policy, and verifies
-CertificateVerify through the provider. Supply `transport-read` and
-`transport-write` callbacks, or use `make-tls13-client-driver-over-tcp`, to
-read and write TLS records. `tls13-client-driver-connect`, `-write`, `-close`,
-and `-key-update` provide the blocking stream lifecycle; cryptographic key
-exchange and certificate-signature verification remain provider callbacks.
+CertificateVerify, and Finished, rejecting messages out of sequence before
+adding them to the transcript. Its `verify` argument defaults to `:required`;
+`:optional` applies the same certificate-chain, hostname, and trust policy.
+Supply `trust-anchors` explicitly or let the driver load the platform trust
+store. `verify nil` skips those certificate-policy checks, but the driver
+still parses the peer certificate and cryptographically verifies
+CertificateVerify. Signature verification uses `verify-signature`, called as
+`(scheme public-key input signature)` and returning a boolean, or the loaded
+crypto implementation when omitted. This is separate from the key-schedule
+provider. `verify-certificate-verify` receives the parsed message as a hook;
+it cannot replace mandatory signature verification. Use `verify nil` only
+for deliberately unauthenticated test connections.
+
+`transport-read` receives `(driver)` and returns one encoded TLS record or nil;
+`transport-write` receives `(driver record-bytes)`; `transport-close` receives
+`(driver)`. `make-tls13-client-driver-over-tcp` supplies these callbacks on
+SBCL. `tls13-client-driver-connect` blocks until connected and returns the
+driver. `tls13-client-driver-write` accepts application octets.
+`tls13-client-driver-read-record` returns application data as `tls-plaintext`;
+use `tls-plaintext-fragment` for its bytes. It returns nil for a consumed
+handshake, KeyUpdate, compatibility CCS, peer close_notify, or an already
+closed driver. Transport EOF before close_notify signals an error, so nil
+from this API does not by itself mean transport EOF.
+
+`tls13-client-driver-close-notify-received-p` distinguishes a peer's
+close_notify from transport EOF. Receiving close_notify marks the driver
+closed and stops application-data reads. `tls13-client-driver-close` closes
+the transport once, including when sending the local close_notify fails;
+calling it again does not send another alert or close the transport again.
 
 The lower-level `make-tls-client` boundary requires a
-`:verify-certificate` callback whenever a peer certificate is received; a
-missing callback rejects the certificate. A caller-provided trust anchor is
-explicitly trusted and is not revalidated as an issued certificate, so its
+`:verify-certificate` callback whenever a peer certificate is received. It
+receives `(certificate)` and must return true; a missing callback or false
+result rejects the certificate.
+
+In the chain verification API, a caller-provided trust anchor is explicitly
+trusted and is not revalidated as an issued certificate, so its
 CA constraint, key usage, and self-signature are outside this policy. All
 certificates below the trust anchor remain subject to chain, signature,
 validity, and usage checks; the anchor's validity interval is still checked.
@@ -116,14 +184,12 @@ ClientHello extensions built with `encode-sni-extension`,
 `encode-alpn-extension`, and `make-tls13-client-hello-extensions`; QUIC
 transport parameters are a separate extension and are not SNI or ALPN.
 
-The project supports TLS 1.3 only. It does not negotiate TLS 1.2 or fall back
-to it. OCSP and CRL fetching or revocation-status evaluation are outside the
-scope of certificate parsing and chain verification.
-
 ## Public API
 
-The `cl-tls-kit` package, also available as `tls-kit`, exports the DER, PEM,
-`cl-tls-kit.x509`, certificate verification, TLS 1.3 record/handshake/key
-schedule, callback client, handshake driver, and QUIC boundary APIs described
-above. Public API names and documentation are English. The project is MIT
+The `cl-tls-kit` package, also nicknamed `tls-kit`, exports DER and PEM helpers,
+certificate verification, TLS 1.3 record/handshake/key-schedule APIs, callback
+clients, the handshake driver, and QUIC boundaries. The separate
+`cl-tls-kit.x509` package exports `parse-x509-certificate`,
+`parse-certificate`, `parse-certificate-der`, and the `x509-certificate-*`
+readers. Public API names and documentation are English. The project is MIT
 licensed.

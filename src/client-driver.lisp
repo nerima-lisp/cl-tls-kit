@@ -8,15 +8,17 @@
 
 (defstruct (tls13-client-driver (:constructor %make-tls13-client-driver))
   provider key-exchange on-send verify-certificate-verify
-  transport-read transport-write transport-close
+  transport-read transport-write transport-close transport-closed-p
   hostname alpn negotiated-alpn cipher-suites supported-groups signature-algorithms
   client-hello private-key selected-group hash suite state
   certificate-chain peer-certificate trust-anchors now verify-signature
+  (verify :required)
   (transcript (make-array 0 :element-type '(unsigned-byte 8)))
   early-secret handshake-secret master-secret handshake-traffic-secret
   client-finished-key server-finished-key
   handshake-read-state handshake-write-state
   application-read-state application-write-state
+  hello-retry-request-received
   compatibility-ccs-flight (compatibility-ccs-count 0)
   (pending-handshake (make-array 0 :element-type '(unsigned-byte 8)))
   close-notify-received)
@@ -89,7 +91,7 @@
 (defun make-tls13-client-driver
     (&key provider key-exchange on-send verify-certificate-verify
           transport-read transport-write transport-close transport hostname alpn
-          trust-anchors (now (get-universal-time)) verify-signature
+          trust-anchors (now (get-universal-time)) verify-signature (verify :required)
           (cipher-suites #( #x1301 #x1302 #x1303))
           (supported-groups '(#x001d #x0017))
           (signature-algorithms #( #x0804 #x0805 #x0806 #x0403 #x0503)))
@@ -99,6 +101,7 @@ The driver owns handshake message sequencing and transcript/key-schedule
 progression. KEY-EXCHANGE supplies :GENERATE and :SHARED-SECRET functions;
 the crypto provider supplies hash, HKDF, HMAC, and AEAD primitives."
   (unless (typep provider 'tls13-crypto-provider) (%driver-fail :provider))
+  (unless (member verify '(nil :optional :required)) (%driver-fail :invalid-verify))
   (let* ((offered-suites (coerce
                           (remove-if-not
                            (lambda (suite)
@@ -118,7 +121,7 @@ the crypto provider supplies hash, HKDF, HMAC, and AEAD primitives."
                    :supported-groups supported-groups
                    :signature-algorithms signature-algorithms
                    :trust-anchors trust-anchors :now now
-                   :verify-signature verify-signature :suite suite
+                   :verify-signature verify-signature :verify verify :suite suite
                    :hash (tls13-cipher-suite-hash suite) :state :new)))
       (setf (tls13-client-driver-early-secret driver)
             (tls13-early-secret provider (tls13-client-driver-hash driver)))
@@ -217,6 +220,8 @@ the crypto provider supplies hash, HKDF, HMAC, and AEAD primitives."
           (error 'invalid-certificate-chain :certificate nil)))))
 
 (defun %driver-verify-certificate-chain (driver chain)
+  (unless (tls13-client-driver-verify driver)
+    (return-from %driver-verify-certificate-chain t))
   (handler-case
       (verify-certificate-chain
        chain :hostname (tls13-client-driver-hostname driver)
@@ -246,7 +251,8 @@ Returns DRIVER; outgoing messages are delivered to ON-SEND."
                (typep message 'tls13-new-session-ticket))
       (return-from tls13-client-driver-step driver))
     (when (and (= type 2) (typep message 'tls13-hello-retry-request))
-      (unless (eq (tls13-client-driver-state driver) :awaiting-server-hello)
+      (unless (and (eq (tls13-client-driver-state driver) :awaiting-server-hello)
+                   (not (tls13-client-driver-hello-retry-request-received driver)))
         (%driver-fail :unexpected-hrr))
       (setf (tls13-client-driver-transcript driver)
             (concatenate '(vector (unsigned-byte 8))
@@ -269,14 +275,19 @@ Returns DRIVER; outgoing messages are delivered to ON-SEND."
                  (cons (make-tls-extension 51 (encode-key-share-extension (list share)))
                        (remove 51 (tls13-client-hello-extensions hello)
                                :key #'tls-extension-type)))))
-        (setf (tls13-client-driver-compatibility-ccs-flight driver) :hello-retry-request
+        (setf (tls13-client-driver-hello-retry-request-received driver) t
+              (tls13-client-driver-compatibility-ccs-flight driver) :hello-retry-request
               (tls13-client-driver-compatibility-ccs-count driver) 0)
         (%driver-send driver 1 (tls13-client-driver-client-hello driver))
       (return-from tls13-client-driver-step driver)))
-    (unless (member (tls13-client-driver-state driver)
-                    '(:awaiting-server-hello :awaiting-encrypted-extensions
-                      :awaiting-certificate :awaiting-certificate-verify
-                      :awaiting-finished))
+    (unless (case (tls13-client-driver-state driver)
+              (:awaiting-server-hello (typep message 'tls13-server-hello))
+              (:awaiting-encrypted-extensions
+               (typep message 'tls13-encrypted-extensions))
+              (:awaiting-certificate (typep message 'tls13-certificate))
+              (:awaiting-certificate-verify
+               (typep message 'tls13-certificate-verify))
+              (:awaiting-finished (typep message 'tls13-finished)))
       (%driver-fail :unexpected-message))
     (%driver-add-transcript driver bytes)
     (typecase message
@@ -333,8 +344,9 @@ Returns DRIVER; outgoing messages are delivered to ON-SEND."
                               :key #'tls-extension-type)))
          (when extension
            (let ((protocols (decode-alpn-extension (tls-extension-data extension))))
-             (unless (member (first protocols) (tls13-client-driver-alpn driver)
-                             :test #'string=)
+             (unless (and (= (length protocols) 1)
+                          (member (first protocols) (tls13-client-driver-alpn driver)
+                                  :test #'string=))
                (%driver-fail :unexpected-alpn))
              (setf (tls13-client-driver-negotiated-alpn driver)
                    (first protocols)))))
@@ -447,6 +459,8 @@ Returns DRIVER; outgoing messages are delivered to ON-SEND."
   "Read one blocking TLS record and process handshake/control records.
 Returns application plaintext, NIL for a consumed handshake or KeyUpdate,
 and marks the driver closed after a peer close_notify."
+  (when (tls13-client-driver-closed-p driver)
+    (return-from tls13-client-driver-read-record nil))
   (let* ((wire (%driver-read-record driver))
          (ignore-eof (unless wire (%driver-fail :eof))))
     (when (= (aref wire 0) +tls-content-type-change-cipher-spec+)
@@ -495,7 +509,9 @@ and marks the driver closed after a peer close_notify."
   "Start DRIVER and block until the TLS 1.3 handshake reaches :CONNECTED."
   (tls13-client-driver-start driver)
   (loop until (eq (tls13-client-driver-state driver) :connected)
-        do (tls13-client-driver-read-record driver))
+        do (when (tls13-client-driver-closed-p driver)
+             (%driver-fail :connection-closed))
+           (tls13-client-driver-read-record driver))
   driver)
 
 (defun tls13-client-driver-write (driver fragment)
@@ -509,16 +525,32 @@ and marks the driver closed after a peer close_notify."
                                             fragment)
                         (tls13-client-driver-application-write-state driver)))
 
+(defun tls13-client-driver-closed-p (driver)
+  (eq (tls13-client-driver-state driver) :closed))
+
+(defun tls13-client-driver-close-notify-received-p (driver)
+  (not (null (tls13-client-driver-close-notify-received driver))))
+
 (defun tls13-client-driver-close (driver)
   "Send one encrypted close_notify and close the underlying transport."
-  (unless (eq (tls13-client-driver-state driver) :closed)
-    (when (eq (tls13-client-driver-state driver) :connected)
-      (%driver-write-record
-       driver (make-tls-plaintext +tls-content-type-alert+ #(1 0))
-       (tls13-client-driver-application-write-state driver)))
-    (setf (tls13-client-driver-state driver) :closed)
-    (when (tls13-client-driver-transport-close driver)
-      (funcall (tls13-client-driver-transport-close driver) driver)))
+  (unless (tls13-client-driver-transport-closed-p driver)
+    (let ((write-completed-p nil))
+      (unwind-protect
+           (progn
+             (when (eq (tls13-client-driver-state driver) :connected)
+               (%driver-write-record
+                driver (make-tls-plaintext +tls-content-type-alert+ #(1 0))
+                (tls13-client-driver-application-write-state driver)))
+             (setf write-completed-p t))
+        (setf (tls13-client-driver-state driver) :closed
+              (tls13-client-driver-transport-closed-p driver) t)
+        (when (tls13-client-driver-transport-close driver)
+          (if write-completed-p
+              (funcall (tls13-client-driver-transport-close driver) driver)
+              ;; A cleanup failure must not replace the failed alert write.
+              (handler-case
+                  (funcall (tls13-client-driver-transport-close driver) driver)
+                (error () nil)))))))
   driver)
 
 (defun tls13-client-driver-key-update (driver &optional (request 0))

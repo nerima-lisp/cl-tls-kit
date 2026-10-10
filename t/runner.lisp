@@ -20,6 +20,8 @@
         (when (eq result t)
           (incf passed))))
     (let ((rfc8448-result (run-rfc8448-tests)))
+      (unless (member rfc8448-result '(t :skipped))
+        (error "cl-tls-kit RFC 8448 tests did not pass."))
       (when (eq rfc8448-result t)
         (incf passed))
       (format t "cl-tls-kit tests: ~D groups passed; RFC 8448 result: ~A~%"

@@ -38,6 +38,7 @@
            (:subject (cl-tls-kit.x509:x509-certificate-subject object))
            (:public-key (cl-tls-kit.x509:x509-certificate-public-key object))
            (:signature-algorithm (cl-tls-kit.x509:x509-certificate-signature-algorithm object))
+           (:signature-parameters (cl-tls-kit.x509:x509-certificate-signature-parameters object))
            (:tbs-certificate (cl-tls-kit.x509::x509-certificate-tbs-certificate object))
            (:signature (cl-tls-kit.x509::x509-certificate-signature object))
            (:basic-constraints (cl-tls-kit.x509:x509-certificate-basic-constraints object))
@@ -71,6 +72,11 @@
            (string= (cl-tls-kit.x509:x509-name-string left)
                     (cl-tls-kit.x509:x509-name-string right)))))
 
+(defun %self-issued-p (certificate)
+  (let ((issuer (%field certificate :issuer))
+        (subject (%field certificate :subject)))
+    (and issuer subject (%same-name-p issuer subject))))
+
 (defun %crypto-verify-function ()
   (let* ((package (or (find-package "CRYPTO-KIT")
                       (find-package "CL-CRYPTO-KIT")))
@@ -78,6 +84,7 @@
     (and symbol (fboundp symbol) symbol)))
 
 (defun %signature-scheme (certificate issuer)
+  (declare (ignore issuer))
   (let ((algorithm (%field certificate :signature-algorithm)))
     (if (keywordp algorithm)
         algorithm
@@ -85,7 +92,18 @@
           ((string= algorithm "1.2.840.113549.1.1.11") :rsa-pkcs1-sha256)
           ((string= algorithm "1.2.840.113549.1.1.12") :rsa-pkcs1-sha384)
           ((string= algorithm "1.2.840.113549.1.1.13") :rsa-pkcs1-sha512)
-          ((string= algorithm "1.2.840.113549.1.1.10") :rsa-pss-rsae-sha256)
+          ((string= algorithm "1.2.840.113549.1.1.10")
+           (let* ((parameters (%field certificate :signature-parameters))
+                  (hash (getf parameters :hash))
+                  (digest-length (case hash (:sha256 32) (:sha384 48) (:sha512 64))))
+             (unless (and digest-length (eq (getf parameters :mgf-hash) hash)
+                          (eql (getf parameters :salt-length) digest-length)
+                          (eql (getf parameters :trailer-field) 1))
+               (error 'bad-signature :certificate certificate))
+             (ecase hash
+               (:sha256 :rsa-pss-rsae-sha256)
+               (:sha384 :rsa-pss-rsae-sha384)
+               (:sha512 :rsa-pss-rsae-sha512))))
           ((string= algorithm "1.2.840.10045.4.3.2") :ecdsa-p256-sha256)
           ((string= algorithm "1.2.840.10045.4.3.3") :ecdsa-p384-sha384)
           ((string= algorithm "1.2.840.10045.4.3.4") :ecdsa-p521-sha512)
@@ -154,6 +172,11 @@
        (member (length value) '(4 16))
        (every (lambda (octet) (typep octet '(unsigned-byte 8))) value)))
 
+(defun %ip-constraint-octets-p (value)
+  (and (vectorp value) (= (array-rank value) 1)
+       (member (length value) '(8 32))
+       (every (lambda (octet) (typep octet '(unsigned-byte 8))) value)))
+
 (defun %constraint-match-p (entry san)
   (let* ((kind (and (consp entry) (first entry)))
          (constraint (and (consp entry) (second entry)))
@@ -170,7 +193,7 @@
                   (string= name base :start1 (- (length name) (length base)))
                   (char= (char name (- (length name) (length base) 1)) #\.)))))
       ((and (eq kind :ip) (eq san-kind :ip)
-            (%ip-octets-p constraint) (%ip-octets-p value)
+            (%ip-constraint-octets-p constraint) (%ip-octets-p value)
             (= (length constraint) (* 2 (length value))))
        (let ((address (subseq constraint 0 (length value)))
              (mask (subseq constraint (length value))))
@@ -194,16 +217,16 @@
       (dolist (kind '(:dns :ip))
         (let ((rules (remove-if-not (lambda (entry) (eq (first entry) kind)) permitted))
               (values (remove-if-not (lambda (san) (eq (first san) kind)) names)))
-          (when (and rules (not (some (lambda (san)
+          (when (and rules (not (every (lambda (san)
                                         (some (lambda (entry) (%constraint-match-p entry san)) rules))
                                       values)))
             (error 'invalid-certificate-chain :certificate certificate)))))))
 
 (defun %check-chain-name-constraints (chain index certificate)
-  "Apply every ancestor's name constraints to CERTIFICATE."
-  (dolist (issuer (nthcdr (1+ index) chain))
-    (when (%field issuer :name-constraints nil)
-      (%check-name-constraints certificate issuer))))
+  (unless (and (plusp index) (%self-issued-p certificate))
+    (dolist (issuer (nthcdr (1+ index) chain))
+      (when (%field issuer :name-constraints nil)
+        (%check-name-constraints certificate issuer)))))
 
 (defun %check-certificate (certificate issuer ca-depth now verify-signature)
   (unless (%time-ok-p certificate now)
@@ -211,7 +234,6 @@
   (when issuer
     (unless (%same-name-p (%field certificate :issuer nil) (%field issuer :subject nil))
       (error 'invalid-certificate-chain :certificate certificate))
-    (%check-name-constraints certificate issuer)
     (%verify-signature certificate issuer verify-signature)
     (unless (eq t (%basic-constraint issuer :ca nil))
       (error 'not-a-ca :certificate issuer))
@@ -223,8 +245,8 @@
         (error 'path-length-exceeded :certificate issuer)))))
 
 (defun %subordinate-ca-depth (chain issuer-index)
-  "Count CA certificates below the issuer in a leaf-first chain."
-  (count-if (lambda (item) (eq t (%basic-constraint item :ca nil)))
+  (count-if (lambda (item) (and (eq t (%basic-constraint item :ca nil))
+                              (not (%self-issued-p item))))
             (subseq chain 1 (min issuer-index (length chain)))))
 
 (defun verify-certificate-chain (chain &key hostname trust-anchors
@@ -240,6 +262,21 @@ VERIFY-SIGNATURE, when supplied, has the same four-argument contract."
       (incf bytes (length (or (%field certificate :signature) #())))
       (when (> bytes +max-certificate-chain-bytes+)
         (error 'invalid-certificate-chain :certificate certificate))))
+  (let ((root (car (last chain))))
+    (unless (member root trust-anchors :test #'equalp)
+      (let ((failure nil))
+        (dolist (anchor trust-anchors)
+          (when (%same-name-p (%field root :issuer nil) (%field anchor :subject nil))
+            (handler-case
+                (return-from verify-certificate-chain
+                  (verify-certificate-chain (append chain (list anchor))
+                                            :hostname hostname :trust-anchors (list anchor)
+                                            :now now :verify-signature verify-signature))
+              (certificate-signature-provider-unavailable (condition)
+                (error condition))
+              (certificate-verification-error (condition)
+                (unless failure (setf failure condition))))))
+        (when failure (error failure)))))
   (loop for certificate in chain
         for issuer in (append (rest chain) '(nil))
         for index from 0

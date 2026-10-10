@@ -134,6 +134,7 @@
    #:tls13-client-driver-start #:tls13-client-driver-step
    #:tls13-client-driver-connect #:tls13-client-driver-read-record
    #:tls13-client-driver-write #:tls13-client-driver-close
+   #:tls13-client-driver-closed-p #:tls13-client-driver-close-notify-received-p
    #:tls13-client-driver-key-update #:make-tls13-client-driver-over-tcp
    #:tls13-client-driver-negotiated-alpn
    #:tls13-client-driver-error #:tls13-client-driver-error-reason
@@ -162,6 +163,7 @@
    #:x509-certificate-subject #:x509-certificate-issuer
    #:x509-certificate-not-before #:x509-certificate-not-after
    #:x509-certificate-public-key #:x509-certificate-signature-algorithm
+   #:x509-certificate-signature-parameters
    #:x509-certificate-extensions #:x509-certificate-basic-constraints
    #:x509-certificate-key-usage #:x509-certificate-extended-key-usage
    #:x509-certificate-subject-alternative-name #:x509-certificate-name-constraints
@@ -170,5 +172,6 @@
    #:x509-rsa-public-key-modulus #:x509-rsa-public-key-exponent
    #:x509-ec-public-key-curve #:x509-ec-public-key-point
    #:x509-ed25519-public-key-point #:x509-certificate-tbs-signature-algorithm
+   #:x509-certificate-tbs-signature-parameters
    #:parse-x509-certificate
    #:parse-certificate #:parse-certificate-der #:x509-name-string))

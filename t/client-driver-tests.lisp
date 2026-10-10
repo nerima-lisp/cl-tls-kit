@@ -1,6 +1,9 @@
 (in-package #:cl-tls-kit/test)
 
 (defun run-client-driver-tests ()
+  (run-client-driver-lifecycle-tests)
+  (run-client-driver-alpn-tests)
+  (run-client-driver-order-tests)
   (let* ((sent nil)
          (provider
            (cl-tls-kit::%make-tls13-crypto-provider
@@ -50,6 +53,8 @@
             :on-send (lambda (ignored wire)
                        (declare (ignore ignored))
                        (push wire sent)))))
+    (run-client-driver-verification-mode-tests provider key-exchange)
+    (run-client-driver-hrr-tests provider key-exchange)
     (cl-tls-kit:tls13-client-driver-start driver)
     (check (null (cl-tls-kit:tls13-client-driver-negotiated-alpn driver))
            "driver exposes no negotiated ALPN before EncryptedExtensions")
@@ -382,6 +387,7 @@
           (check (< (length wire) cl-tls-kit::+tls13-max-handshake-body-length+)
                  "certificate fixture stays below the handshake limit")
           (loop while records do (tls13-client-driver-read-record driver))
+          (run-client-driver-real-verification-mode-tests root leaf wire)
                   (check (eq (cl-tls-kit::tls13-client-driver-state driver)
                              :awaiting-certificate-verify)
                          "public record path accepts a real leaf-intermediate-root chain"))))
@@ -392,4 +398,273 @@
             (ignore-errors (uiop:delete-directory-tree directory :validate t)))
           (check (not (probe-file directory))
                  "certificate directory is removed after the test")))))
+  t)
+
+(defun run-client-driver-real-verification-mode-tests (root leaf certificate-wire)
+  (let ((provider (make-cl-crypto-kit-provider))
+        (key-exchange
+          (list :random (lambda (length)
+                          (make-array length :element-type '(unsigned-byte 8)))
+                :generate (lambda (group)
+                            (declare (ignore group))
+                            (values (make-array 32 :element-type '(unsigned-byte 8))
+                                    (make-array 32 :element-type '(unsigned-byte 8)))))))
+    (labels ((make-driver (mode hostname anchors)
+               (let ((driver (make-tls13-client-driver
+                              :provider provider :key-exchange key-exchange
+                              :verify mode :hostname hostname :trust-anchors anchors
+                              :now (1+ (max (cl-tls-kit.x509:x509-certificate-not-before root)
+                                            (cl-tls-kit.x509:x509-certificate-not-before leaf))))))
+                 (tls13-client-driver-start driver)
+                 (setf (cl-tls-kit::tls13-client-driver-state driver) :awaiting-certificate)
+                 driver))
+             (rejects-p (driver condition-type)
+               (handler-case
+                   (progn (tls13-client-driver-step driver certificate-wire) nil)
+                 (tls13-client-driver-error (condition)
+                   (let ((reason (tls13-client-driver-error-reason condition)))
+                     (and (consp reason)
+                          (eq (first reason) :certificate-verification-failed)
+                          (typep (getf (rest reason) :condition) condition-type)))))))
+      (dolist (mode '(:required :optional))
+        (let ((driver (make-driver mode "example.test" (list root))))
+          (tls13-client-driver-step driver certificate-wire)
+          (check (eq :awaiting-certificate-verify
+                     (cl-tls-kit::tls13-client-driver-state driver))
+                 "required and optional verify a real trusted certificate chain"))
+        (check (rejects-p (make-driver mode "example.test" (list leaf)) 'untrusted-root)
+               "required and optional reject a real untrusted certificate chain")
+        (check (rejects-p (make-driver mode "wrong.test" (list root))
+                          'certificate-hostname-mismatch)
+               "required and optional reject a real certificate hostname mismatch"))
+      (let ((driver (make-driver nil "wrong.test" nil)))
+        (tls13-client-driver-step driver certificate-wire)
+        (check (eq :awaiting-certificate-verify
+                   (cl-tls-kit::tls13-client-driver-state driver))
+               "explicit NIL accepts an untrusted mismatching real certificate")
+        (check (handler-case
+                   (progn
+                     (tls13-client-driver-step
+                      driver (encode-handshake
+                              15 (make-tls13-certificate-verify
+                                  #x0804 (make-array 256 :element-type '(unsigned-byte 8)))))
+                     nil)
+                 (tls13-client-driver-error (condition)
+                   (equal '(:certificate-verify-failed :bad-signature)
+                          (tls13-client-driver-error-reason condition))))
+               "explicit NIL rejects forged RSA CertificateVerify using the real crypto provider"))))
+  t)
+
+(defun run-client-driver-verification-mode-tests (provider key-exchange)
+  (check (handler-case
+             (progn (make-tls13-client-driver :provider provider :verify :invalid) nil)
+           (tls13-client-driver-error (condition)
+             (eq :invalid-verify (tls13-client-driver-error-reason condition)))
+           (program-error () nil))
+         "public driver rejects invalid verification modes")
+  (let* ((root (list :issuer "root" :subject "root" :not-before 0 :not-after 100
+                     :basic-constraints '(:ca t)))
+         (leaf (list :issuer "root" :subject "leaf" :not-before 0 :not-after 100
+                     :signature-algorithm :rsa-pkcs1-sha256
+                     :subject-alternative-names '((:dns "example.test"))))
+         (chain (list leaf root)))
+    (labels ((make-driver (mode hostname anchors)
+               (make-tls13-client-driver
+                :provider provider :key-exchange key-exchange :verify mode
+                :hostname hostname :trust-anchors anchors :now 50
+                :verify-signature (lambda (&rest arguments)
+                                    (declare (ignore arguments)) t)))
+             (rejects-p (driver condition-type)
+               (handler-case
+                   (progn (cl-tls-kit::%driver-verify-certificate-chain driver chain) nil)
+                 (tls13-client-driver-error (condition)
+                   (let ((reason (tls13-client-driver-error-reason condition)))
+                     (and (consp reason)
+                          (eq (first reason) :certificate-verification-failed)
+                          (typep (getf (rest reason) :condition) condition-type)))))))
+      (check (eq :required
+                 (cl-tls-kit::tls13-client-driver-verify
+                  (make-tls13-client-driver :provider provider)))
+             "public driver defaults to required verification")
+      (dolist (mode '(:required :optional))
+        (check (cl-tls-kit::%driver-verify-certificate-chain
+                (make-driver mode "example.test" (list root)) chain)
+               "required and optional accept trusted matching certificates")
+        (check (rejects-p (make-driver mode "example.test" (list '(:subject "other")))
+                          'untrusted-root)
+               "required and optional reject an untrusted root")
+        (check (rejects-p (make-driver mode "wrong.test" (list root))
+                          'certificate-hostname-mismatch)
+               "required and optional reject a hostname mismatch"))
+      (let ((driver (make-driver nil "wrong.test" nil))
+            (legacy-calls 0))
+        (check (cl-tls-kit::%driver-verify-certificate-chain driver nil)
+               "explicit NIL skips chain policy without loading trust anchors")
+        (tls13-client-driver-start driver)
+        (setf (cl-tls-kit::tls13-client-driver-state driver) :awaiting-certificate-verify
+              (cl-tls-kit::tls13-client-driver-peer-certificate driver)
+              (cl-tls-kit.x509::make-x509-certificate :public-key :test-key)
+              (cl-tls-kit::tls13-client-driver-verify-signature driver)
+              (lambda (&rest arguments) (declare (ignore arguments)) nil)
+              (cl-tls-kit::tls13-client-driver-verify-certificate-verify driver)
+              (lambda (message) (declare (ignore message)) (incf legacy-calls) t))
+        (check (handler-case
+                   (progn (tls13-client-driver-step
+                           driver (encode-handshake
+                                   15 (make-tls13-certificate-verify #x0804 #(1))))
+                          nil)
+                 (tls13-client-driver-error (condition)
+                   (equal '(:certificate-verify-failed :bad-signature)
+                          (tls13-client-driver-error-reason condition))))
+               "explicit NIL still rejects a CertificateVerify signature rejected by the provider")
+        (check (= legacy-calls 1) "a successful legacy callback cannot bypass signature verification")
+        (check (eq :awaiting-certificate-verify (cl-tls-kit::tls13-client-driver-state driver))
+               "a forged CertificateVerify cannot advance the handshake"))))
+  (dolist (valid-p '(t nil))
+    (let* ((sent 0)
+           (verify-data (make-array 32 :element-type '(unsigned-byte 8)))
+           (driver (cl-tls-kit::%make-tls13-client-driver
+                    :state :awaiting-finished :provider provider :hash :sha256 :suite #x1301
+                    :server-finished-key verify-data :client-finished-key verify-data
+                    :handshake-secret verify-data
+                    :on-send (lambda (driver wire)
+                               (declare (ignore driver wire))
+                               (incf sent)))))
+      (unless valid-p (setf (aref verify-data 31) 1))
+      (if valid-p
+          (progn
+            (tls13-client-driver-step driver (encode-handshake 20 (make-tls13-finished verify-data)))
+            (check (eq :connected (cl-tls-kit::tls13-client-driver-state driver))
+                   "a valid Finished completes the handshake")
+            (check (= sent 1) "a valid Finished emits client Finished")
+            (check (and (cl-tls-kit::tls13-client-driver-application-read-state driver)
+                        (cl-tls-kit::tls13-client-driver-application-write-state driver))
+                   "a valid Finished installs application traffic states"))
+          (progn
+            (check (handler-case
+                       (progn
+                         (tls13-client-driver-step driver
+                           (encode-handshake 20 (make-tls13-finished verify-data)))
+                         nil)
+                     (tls13-finished-mismatch () t))
+                   "a tampered Finished is rejected")
+            (check (eq :awaiting-finished (cl-tls-kit::tls13-client-driver-state driver))
+                   "a tampered Finished cannot advance the handshake")
+            (check (zerop sent) "a tampered Finished emits no client Finished")
+            (check (not (or (cl-tls-kit::tls13-client-driver-master-secret driver)
+                            (cl-tls-kit::tls13-client-driver-application-read-state driver)
+                            (cl-tls-kit::tls13-client-driver-application-write-state driver)))
+                   "a tampered Finished installs no application secrets")))))
+  t)
+
+(defun run-client-driver-alpn-tests ()
+  (dolist (protocols '(("h2") ("unoffered") ("h2" "http/1.1")
+                      ("h2" "unoffered")))
+    (let* ((driver (cl-tls-kit::%make-tls13-client-driver
+                    :state :awaiting-encrypted-extensions
+                    :alpn '("h2" "http/1.1")))
+           (wire (encode-handshake
+                  8 (make-tls13-encrypted-extensions
+                     (list (make-tls-extension
+                            cl-tls-kit:+tls13-extension-application-layer-protocol-negotiation+
+                            (encode-alpn-extension protocols))))))
+           (accepted-p (equal protocols '("h2"))))
+      (if accepted-p
+          (progn
+            (tls13-client-driver-step driver wire)
+            (check (string= "h2" (tls13-client-driver-negotiated-alpn driver))
+                   "driver accepts exactly one offered ALPN protocol"))
+          (check (handler-case
+                     (progn (tls13-client-driver-step driver wire) nil)
+                   (tls13-client-driver-error (condition)
+                     (eq :unexpected-alpn
+                         (tls13-client-driver-error-reason condition))))
+                 "driver rejects unoffered or multiple ALPN selections"))))
+  t)
+
+(defun run-client-driver-lifecycle-tests ()
+  (let* ((closed 0)
+         (driver (cl-tls-kit::%make-tls13-client-driver
+                  :state :closed :close-notify-received t
+                  :transport-close (lambda (driver)
+                                     (declare (ignore driver))
+                                     (incf closed)))))
+    (tls13-client-driver-close driver)
+    (tls13-client-driver-close driver)
+    (check (= closed 1) "peer-closed driver releases its transport exactly once")
+    (check (tls13-client-driver-closed-p driver) "public reader reports closed state")
+    (check (tls13-client-driver-close-notify-received-p driver)
+           "public reader reports the peer close_notify"))
+  (let* ((closed 0)
+         (failure (make-condition 'simple-error :format-control "write failed"))
+         (driver (cl-tls-kit::%make-tls13-client-driver
+                  :state :connected
+                  :transport-write (lambda (driver wire)
+                                     (declare (ignore driver wire))
+                                     (error failure))
+                  :transport-close (lambda (driver)
+                                     (declare (ignore driver))
+                                     (incf closed)))))
+    (check (eq failure (handler-case (tls13-client-driver-close driver)
+                         (error (condition) condition)))
+           "close preserves its write failure")
+    (check (= closed 1) "failed close_notify still releases the transport")
+    (check (tls13-client-driver-closed-p driver)
+           "failed close_notify closes the driver")
+    (check (not (tls13-client-driver-close-notify-received-p driver))
+           "local close does not imply an authenticated peer shutdown")
+    (tls13-client-driver-close driver)
+    (check (= closed 1) "failed close remains idempotent"))
+  (let* ((failure (make-condition 'simple-error :format-control "write failed"))
+         (driver (cl-tls-kit::%make-tls13-client-driver
+                  :state :connected
+                  :transport-write (lambda (driver wire)
+                                     (declare (ignore driver wire))
+                                     (error failure))
+                  :transport-close (lambda (driver)
+                                     (declare (ignore driver))
+                                     (error "cleanup failed")))))
+    (check (eq failure (handler-case (tls13-client-driver-close driver)
+                         (error (condition) condition)))
+           "transport cleanup does not replace the original write failure"))
+  (let ((driver (cl-tls-kit::%make-tls13-client-driver
+                 :state :closed :close-notify-received t
+                 :transport-read (lambda (driver)
+                                   (declare (ignore driver))
+                                   (error "read after close_notify")))))
+    (check (null (tls13-client-driver-read-record driver))
+           "closed driver reads do not touch its transport"))
+  (let* ((failure (make-condition 'simple-error :format-control "cleanup failed"))
+         (driver (cl-tls-kit::%make-tls13-client-driver
+                  :state :closed
+                  :transport-close (lambda (driver)
+                                     (declare (ignore driver))
+                                     (error failure)))))
+    (check (eq failure (handler-case (tls13-client-driver-close driver)
+                         (error (condition) condition)))
+           "transport cleanup failure is visible when no write failed"))
+  (let* ((reads 0)
+         (driver
+           (cl-tls-kit::%make-tls13-client-driver
+            :state :new :supported-groups '(#x001d)
+            :cipher-suites #(#x1301) :signature-algorithms #(#x0804)
+            :key-exchange
+            (list :generate (lambda (group)
+                              (declare (ignore group))
+                              (values #(1) #(2)))
+                  :random (lambda (length)
+                            (make-array length :element-type '(unsigned-byte 8))))
+            :transport-read
+            (lambda (driver)
+              (declare (ignore driver))
+              (incf reads)
+              (if (= reads 1)
+                  (encode-tls-plaintext (make-tls-plaintext
+                                         cl-tls-kit::+tls-content-type-alert+ #(1 0)))
+                  (error "read after handshake close_notify"))))))
+    (check (handler-case (progn (tls13-client-driver-connect driver) nil)
+             (tls13-client-driver-error (condition)
+               (eq :connection-closed (tls13-client-driver-error-reason condition))))
+           "close_notify during handshake terminates connect")
+    (check (= reads 1) "handshake close_notify does not restart transport reads"))
   t)

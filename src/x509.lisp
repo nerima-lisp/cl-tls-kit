@@ -8,7 +8,8 @@
 (defstruct der tag content raw)
 (defstruct x509-public-key type algorithm parameters data)
 (defstruct x509-certificate version serial-number issuer subject not-before not-after
-  public-key signature-algorithm tbs-signature-algorithm tbs-certificate signature extensions basic-constraints key-usage
+  public-key signature-algorithm signature-parameters tbs-signature-algorithm
+  tbs-signature-parameters tbs-certificate signature extensions basic-constraints key-usage
   extended-key-usage subject-alternative-name name-constraints)
 
 (defparameter +x509-max-certificate-bytes+ (* 1024 1024))
@@ -281,8 +282,67 @@
                           (%string name) name))))
           (%children sequence)))
 
+(defun %algorithm-fields (d)
+  (unless (and d (= (der-tag d) #x30))
+    (%fail "AlgorithmIdentifier is not a SEQUENCE"))
+  (let ((fields (%children d)))
+    (unless (member (length fields) '(1 2))
+      (%fail "invalid AlgorithmIdentifier fields"))
+    (%oid (first fields))
+    fields))
+
 (defun %algorithm (d)
-  (let ((a (%children d))) (values (%oid (first a)) (and (second a) (der-content (second a))))))
+  (let ((a (%algorithm-fields d)))
+    (values (%oid (first a)) (and (second a) (der-content (second a))))))
+
+(defun %pss-hash (algorithm)
+  (let* ((fields (%algorithm-fields algorithm))
+         (oid (%oid (first fields)))
+         (parameters (second fields)))
+    (unless (or (null parameters)
+                (and (= (der-tag parameters) #x05)
+                     (zerop (length (der-content parameters)))))
+      (%fail "invalid PSS digest parameters"))
+    (cond ((string= oid "2.16.840.1.101.3.4.2.1") :sha256)
+          ((string= oid "2.16.840.1.101.3.4.2.2") :sha384)
+          ((string= oid "2.16.840.1.101.3.4.2.3") :sha512)
+          ((string= oid "1.3.14.3.2.26") :sha1)
+          (t (%fail "unsupported PSS digest ~A" oid)))))
+
+(defun %pss-parameters (parameters)
+  (unless (and parameters (= (der-tag parameters) #x30))
+    (%fail "PSS parameters must be present as a SEQUENCE"))
+  (let ((hash :sha1) (mgf-hash :sha1) (salt-length 20)
+        (trailer-field 1) (previous-tag #x9f))
+    (dolist (field (%children parameters))
+      (let ((tag (der-tag field)))
+        (unless (and (<= #xa0 tag #xa3) (> tag previous-tag))
+          (%fail "invalid PSS parameter field order or tag"))
+        (setf previous-tag tag)
+        (let ((contents (%children field)))
+          (unless (= (length contents) 1)
+            (%fail "PSS parameter field must contain one value"))
+          (case tag
+            (#xa0 (setf hash (%pss-hash (first contents))))
+            (#xa1
+             (let ((mgf (%algorithm-fields (first contents))))
+               (unless (string= (%oid (first mgf)) "1.2.840.113549.1.1.8")
+                 (%fail "unsupported PSS mask generation algorithm"))
+               (setf mgf-hash (%pss-hash (second mgf)))))
+            (#xa2 (setf salt-length (%integer (first contents))))
+            (#xa3 (setf trailer-field (%integer (first contents))))))))
+    (let ((digest-length (case hash (:sha256 32) (:sha384 48) (:sha512 64))))
+      ;; The crypto provider's PSS schemes fix MGF, salt length and trailer.
+      (unless (and digest-length (eq hash mgf-hash)
+                   (= salt-length digest-length) (= trailer-field 1))
+        (%fail "unsupported PSS hash, MGF, salt length or trailer")))
+    (list :hash hash :mgf-hash mgf-hash :salt-length salt-length
+          :trailer-field trailer-field)))
+
+(defun %signature-parameters (algorithm)
+  (let ((fields (%algorithm-fields algorithm)))
+    (when (string= (%oid (first fields)) "1.2.840.113549.1.1.10")
+      (%pss-parameters (second fields)))))
 
 (defun %spki (d)
   (let* ((a (%children d)) (alg (first a)) (bits (second a)))
@@ -390,7 +450,9 @@
           (make-x509-certificate :version version :serial-number serial :issuer (%name issuer)
             :subject (%name subject) :not-before (%time (first v)) :not-after (%time (second v))
             :public-key (%spki spki) :signature-algorithm (multiple-value-bind (o) (%algorithm sigalg) o)
+            :signature-parameters (%signature-parameters sigalg)
             :tbs-signature-algorithm (multiple-value-bind (o) (%algorithm tbs-sigalg) o)
+            :tbs-signature-parameters (%signature-parameters tbs-sigalg)
             :tbs-certificate (der-raw tbs)
             :signature (let ((value (der-content (third parts))))
                          (if (and (plusp (length value)) (zerop (aref value 0)))
