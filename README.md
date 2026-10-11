@@ -134,10 +134,15 @@ closed driver. Transport EOF before close_notify signals an error, so nil
 from this API does not by itself mean transport EOF.
 
 `tls13-client-driver-close-notify-received-p` distinguishes a peer's
-close_notify from transport EOF. Receiving close_notify marks the driver
-closed and stops application-data reads. `tls13-client-driver-close` closes
-the transport once, including when sending the local close_notify fails;
-calling it again does not send another alert or close the transport again.
+close_notify from transport EOF. Receiving close_notify answers with a local
+close_notify, closes the transport, and stops application-data reads. Alert
+levels are ignored as required by TLS 1.3; user_canceled is nonfatal, while
+other error alerts terminate the connection. Malformed records and unexpected
+transport EOF also terminate it. Cleanup releases the driver's key references
+and preserves the triggering error if writing an alert or closing fails.
+`tls13-client-driver-close` closes the transport once, including when sending
+the local close_notify fails; calling it again does not send another alert or
+close the transport again.
 
 The lower-level `make-tls-client` boundary requires a
 `:verify-certificate` callback whenever a peer certificate is received. It

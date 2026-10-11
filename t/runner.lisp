@@ -13,6 +13,8 @@
                     run-client-driver-tests
                     run-verification-tests
                     run-quic-boundary-tests
+                    run-openssl-cleanup-tests
+                    run-openssl-readiness-tests
                     run-openssl-e2e-tests))
       (let ((result (funcall test)))
         (unless (member result '(t :skipped))

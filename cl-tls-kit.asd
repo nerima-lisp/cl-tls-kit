@@ -4,7 +4,7 @@
   :description "TLS 1.3 client, certificate verification, and QUIC TLS boundaries."
   :author "nerima-lisp"
   :license "MIT"
-  :version "0.1.1"
+  :version "0.1.2"
   :depends-on ()
   :weakly-depends-on ("cl-crypto-kit")
   :pathname "src"

@@ -36,7 +36,7 @@
         system: pkgs: {
           default = pkgs.stdenvNoCC.mkDerivation {
             pname = "cl-tls-kit";
-            version = "0.1.1";
+            version = "0.1.2";
             src = self;
             dontBuild = true;
             installPhase = ''
@@ -61,9 +61,12 @@
         system: pkgs: {
           default = pkgs.stdenvNoCC.mkDerivation {
             pname = "cl-tls-kit-tests";
-            version = "0.1.1";
+            version = "0.1.2";
             src = self;
-            nativeBuildInputs = [ pkgs.sbcl pkgs.openssl ];
+            nativeBuildInputs = [
+              pkgs.sbcl
+              pkgs.openssl
+            ];
             dontConfigure = true;
             dontBuild = true;
             doCheck = true;
@@ -74,9 +77,9 @@
               mkdir -p "$HOME" "$XDG_CACHE_HOME"
               export OPENSSL="${pkgs.openssl}/bin/openssl"
               export CL_SOURCE_REGISTRY="$PWD//:${cl-crypto-kit.outPath}/"
-              ${pkgs.sbcl}/bin/sbcl --noinform --non-interactive \
+              ${pkgs.sbcl}/bin/sbcl --noinform --no-userinit --no-sysinit --non-interactive \
                 --load t/crypto-provider-check.lisp
-              ${pkgs.sbcl}/bin/sbcl --noinform --non-interactive \
+              ${pkgs.sbcl}/bin/sbcl --noinform --no-userinit --no-sysinit --non-interactive \
                 --eval '(require :asdf)' \
                 --eval '(asdf:test-system "cl-tls-kit")'
               runHook postCheck
@@ -93,11 +96,14 @@
         let
           test = pkgs.writeShellApplication {
             name = "cl-tls-kit-test";
-            runtimeInputs = [ pkgs.sbcl pkgs.openssl ];
+            runtimeInputs = [
+              pkgs.sbcl
+              pkgs.openssl
+            ];
             text = ''
               export OPENSSL="${pkgs.openssl}/bin/openssl"
               export CL_SOURCE_REGISTRY="$PWD//:${cl-crypto-kit.outPath}/"
-              sbcl --noinform --non-interactive --eval '(require :asdf)' --eval '(asdf:test-system "cl-tls-kit")'
+              sbcl --noinform --no-userinit --no-sysinit --non-interactive --eval '(require :asdf)' --eval '(asdf:test-system "cl-tls-kit")'
             '';
           };
         in

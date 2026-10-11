@@ -13,7 +13,16 @@
           (logxor (aref copy (1- (length copy))) 1))
     copy))
 
+(defun run-record-alert-level-tests ()
+  (dolist (level '(0 1 2 255))
+    (record-test-check (tls-close-notify-p (make-tls-plaintext 21 (vector level 0)))
+                       "TLS 1.3 ignores close_notify alert level"))
+  (record-test-check (not (tls-close-notify-p (make-tls-plaintext 21 #(1 40))))
+                     "error alerts are not closure alerts")
+  t)
+
 (defun run-record-tests ()
+  (run-record-alert-level-tests)
   (let* ((payload #(1 2 3))
          (plain (make-tls-plaintext 23 payload))
          (encoded (encode-tls-plaintext plain))
@@ -71,9 +80,9 @@
     (record-test-check (tls-close-notify-p
                         (make-tls-plaintext 21 #(1 0)))
                        "close_notify format")
-    (record-test-check (not (tls-close-notify-p
-                             (make-tls-plaintext 21 #(2 0))))
-                       "reject fatal close_notify shape")
+    (record-test-check (tls-close-notify-p
+                        (make-tls-plaintext 21 #(2 0)))
+                       "close_notify recognition ignores legacy level")
     (record-test-check (not (tls-close-notify-p
                              (make-tls-plaintext 21 #(1 0 0))))
                        "reject padded close_notify shape")

@@ -1,6 +1,9 @@
 (in-package #:cl-tls-kit/test)
 
 (defun run-client-driver-tests ()
+  (run-client-driver-close-response-tests)
+  (run-client-driver-decode-cleanup-tests)
+  (run-client-driver-alert-tests)
   (run-client-driver-lifecycle-tests)
   (run-client-driver-alpn-tests)
   (run-client-driver-order-tests)
@@ -580,6 +583,205 @@
                      (eq :unexpected-alpn
                          (tls13-client-driver-error-reason condition))))
                  "driver rejects unoffered or multiple ALPN selections"))))
+  t)
+
+(defun run-client-driver-close-response-tests ()
+  (dolist (level '(1 2 255))
+    (let* ((writes nil) (closed 0) (reads 0)
+           (driver (cl-tls-kit::%make-tls13-client-driver
+                    :transport-read (lambda (driver)
+                                      (declare (ignore driver)) (incf reads)
+                                      (encode-tls-plaintext
+                                       (make-tls-plaintext 21 (vector level 0))))
+                    :transport-write (lambda (driver wire)
+                                       (declare (ignore driver)) (push wire writes))
+                    :transport-close (lambda (driver)
+                                       (declare (ignore driver)) (incf closed)))))
+      (setf (cl-tls-kit::tls13-client-driver-state driver) :connected)
+      (check (null (tls13-client-driver-read-record driver)) "peer closure has no data")
+      (check (tls13-client-driver-closed-p driver) "peer closure marks driver closed")
+      (tls13-client-driver-close driver)
+      (tls13-client-driver-close driver)
+      (check (= (length writes) 1) "local close answers peer exactly once")
+      (check (tls-close-notify-p (decode-tls-plaintext (first writes)))
+             "local close sends a close_notify")
+      (check (= closed 1) "local close releases transport once")
+      (check (null (tls13-client-driver-read-record driver)) "closed read returns no data")
+      (check (= reads 1) "closed driver performs no further reads")))
+  (let ((provider (%record-provider)))
+    (when provider
+      (flet ((traffic-state (byte)
+               (cl-tls-kit::make-tls13-traffic-state
+                provider :sha256 :aes-128-gcm
+                (make-array 32 :element-type '(unsigned-byte 8)
+                               :initial-element byte)
+                16 12)))
+        (dolist (state '(:connected :awaiting-finished))
+          (dolist (level '(1 2 255))
+            (let* ((connected-p (eq state :connected))
+                   (read-secret (if connected-p #x33 #x11))
+                   (write-secret (if connected-p #x44 #x22))
+                   (wire (cl-tls-kit::encrypt-tls13-traffic-record
+                          (make-tls-plaintext 21 (vector level 0))
+                          (traffic-state read-secret)))
+                   (response-reader (traffic-state write-secret))
+                   (handshake-reader (traffic-state #x11))
+                   (handshake-writer (traffic-state #x22))
+                   (application-reader (traffic-state #x33))
+                   (application-writer (traffic-state #x44))
+                   (writer (if connected-p application-writer handshake-writer))
+                   (writes nil) (closed 0) (reads 0)
+                   (driver
+                     (cl-tls-kit::%make-tls13-client-driver
+                      :provider provider :state state
+                      :private-key #(1) :early-secret #(2)
+                      :handshake-secret #(3) :master-secret #(4)
+                      :handshake-traffic-secret #(5)
+                      :client-finished-key #(6) :server-finished-key #(7)
+                      :handshake-read-state handshake-reader
+                      :handshake-write-state handshake-writer
+                      :application-read-state application-reader
+                      :application-write-state application-writer
+                      :transport-read (lambda (driver)
+                                        (declare (ignore driver))
+                                        (incf reads) wire)
+                      :transport-write (lambda (driver bytes)
+                                         (check (not (tls13-client-driver-closed-p driver))
+                                                "close response precedes release")
+                                         (push bytes writes))
+                      :transport-close (lambda (driver)
+                                         (declare (ignore driver))
+                                         (incf closed)))))
+              (check (= (aref wire 0) 23) "peer close uses TLSCiphertext")
+              (check (tls-close-notify-p
+                      (cl-tls-kit::decrypt-tls13-traffic-record
+                       wire (traffic-state read-secret)))
+                     "independent receiver validates encrypted input fixture")
+              (check (null (tls13-client-driver-read-record driver))
+                     "encrypted peer closure has no application data")
+              (check (tls13-client-driver-close-notify-received-p driver)
+                     "encrypted peer closure is recorded")
+              (check (tls13-client-driver-closed-p driver)
+                     "encrypted peer closure marks driver closed")
+              (check (= (length writes) 1)
+                     (format nil "~A encrypted peer closure gets one response" state))
+              (check (= (aref (first writes) 0) 23)
+                     "close response uses TLSCiphertext")
+              (let ((response (cl-tls-kit::decrypt-tls13-traffic-record
+                               (first writes) response-reader)))
+                (check (= (tls-plaintext-content-type response) 21)
+                       "decrypted close response is an alert")
+                (check (equalp (tls-plaintext-fragment response) #(1 0))
+                       "decrypted close response has description zero"))
+              (check (= (cl-tls-kit::tls13-traffic-state-sequence-number writer) 1)
+                     "close response uses current write traffic state once")
+              (check (every (lambda (accessor) (null (funcall accessor driver)))
+                            (list #'cl-tls-kit::tls13-client-driver-private-key
+                                  #'cl-tls-kit::tls13-client-driver-early-secret
+                                  #'cl-tls-kit::tls13-client-driver-handshake-secret
+                                  #'cl-tls-kit::tls13-client-driver-master-secret
+                                  #'cl-tls-kit::tls13-client-driver-handshake-traffic-secret
+                                  #'cl-tls-kit::tls13-client-driver-client-finished-key
+                                  #'cl-tls-kit::tls13-client-driver-server-finished-key
+                                  #'cl-tls-kit::tls13-client-driver-handshake-read-state
+                                  #'cl-tls-kit::tls13-client-driver-handshake-write-state
+                                  #'cl-tls-kit::tls13-client-driver-application-read-state
+                                  #'cl-tls-kit::tls13-client-driver-application-write-state))
+                     "peer closure releases all key and traffic state references")
+              (tls13-client-driver-close driver)
+              (tls13-client-driver-close driver)
+              (check (= (length writes) 1) "repeated close sends no extra response")
+              (check (= closed 1) "encrypted peer closure closes transport once")
+              (check (null (tls13-client-driver-read-record driver))
+                     "read after encrypted closure returns no data")
+              (check (= reads 1) "encrypted closure prevents subsequent transport reads"))))
+        (let* ((writes nil) (closed 0)
+               (driver (cl-tls-kit::%make-tls13-client-driver
+                        :state :awaiting-finished
+                        :handshake-write-state (traffic-state #x22)
+                        :transport-write (lambda (driver wire)
+                                           (declare (ignore driver)) (push wire writes))
+                        :transport-close (lambda (driver)
+                                           (declare (ignore driver)) (incf closed)))))
+          (tls13-client-driver-close driver)
+          (tls13-client-driver-close driver)
+          (check (null writes) "local handshake cancellation still sends no close alert")
+          (check (= closed 1) "local handshake cancellation closes transport once")
+          (check (null (cl-tls-kit::tls13-client-driver-handshake-write-state driver))
+                 "local handshake cancellation releases traffic state")))))
+  t)
+
+(defun run-client-driver-decode-cleanup-tests ()
+  (dolist (wire '(#(22 3 3 0 2 1) #() #(22) #(22 3 3 64 1) #(21 3 3 0 1 1)))
+    (let* ((closed 0) (writes nil)
+           (driver (cl-tls-kit::%make-tls13-client-driver
+                    :transport-read (lambda (driver) (declare (ignore driver)) wire)
+                    :transport-write (lambda (driver bytes)
+                                       (declare (ignore driver)) (push bytes writes))
+                    :transport-close (lambda (driver)
+                                       (declare (ignore driver)) (incf closed)))))
+      (setf (cl-tls-kit::tls13-client-driver-state driver) :connected
+            (cl-tls-kit::tls13-client-driver-handshake-secret driver) #(1 2)
+            (cl-tls-kit::tls13-client-driver-private-key driver) #(3 4))
+      (check (handler-case (progn (tls13-client-driver-read-record driver) nil)
+               (tls-record-error () t)) "malformed records signal a record condition")
+      (check (tls13-client-driver-closed-p driver) "decode failure is terminal")
+      (check (= closed 1) "decode failure releases transport")
+      (check (null (cl-tls-kit::tls13-client-driver-handshake-secret driver))
+             "decode failure forgets handshake secret")
+      (check (null (cl-tls-kit::tls13-client-driver-private-key driver))
+             "decode failure forgets private key")
+      (check (= (length writes) 1) "decode failure sends one fatal alert")
+      (check (= (aref (tls-plaintext-fragment (decode-tls-plaintext (first writes))) 1)
+                (if (equalp wire #(22 3 3 64 1)) 22 50))
+             "fatal alert describes overflow or decode error")
+      (check (null (tls13-client-driver-read-record driver)) "failed driver cannot read again")))
+  (let* ((failure (make-condition 'tls-invalid-record :reason "original decode error"))
+         (closed 0)
+         (driver (cl-tls-kit::%make-tls13-client-driver
+                  :transport-read (lambda (driver) (declare (ignore driver)) (error failure))
+                  :transport-write (lambda (driver bytes)
+                                     (declare (ignore driver bytes)) (error "alert write failure"))
+                  :transport-close (lambda (driver)
+                                     (declare (ignore driver)) (incf closed)
+                                     (error "cleanup failure")))))
+    (setf (cl-tls-kit::tls13-client-driver-state driver) :connected)
+    (check (handler-case (progn (tls13-client-driver-read-record driver) nil)
+             (error (condition) (eq condition failure))) "original failure is preserved")
+    (check (tls13-client-driver-closed-p driver) "secondary failures cannot prevent termination")
+    (check (= closed 1) "cleanup attempted once despite alert write failure"))
+  t)
+
+(defun run-client-driver-alert-tests ()
+  (dolist (level '(0 1 2 255))
+    (dolist (description '(40 50 255))
+      (let* ((closed 0) (writes 0)
+             (driver (cl-tls-kit::%make-tls13-client-driver
+                      :transport-read (lambda (driver)
+                                        (declare (ignore driver))
+                                        (encode-tls-plaintext
+                                         (make-tls-plaintext 21 (vector level description))))
+                      :transport-write (lambda (driver bytes)
+                                         (declare (ignore driver bytes)) (incf writes))
+                      :transport-close (lambda (driver)
+                                         (declare (ignore driver)) (incf closed)))))
+        (setf (cl-tls-kit::tls13-client-driver-state driver) :connected)
+        (check (handler-case (progn (tls13-client-driver-read-record driver) nil)
+                 (tls13-client-driver-error (condition)
+                   (equal (tls13-client-driver-error-reason condition)
+                          (list :peer-alert level description))))
+               "error and unknown alerts are fatal regardless of level")
+        (check (tls13-client-driver-closed-p driver) "peer error alert is terminal")
+        (check (= closed 1) "peer error alert releases transport")
+        (check (zerop writes) "peer error alert is not answered with another error alert")))
+    (let ((driver (cl-tls-kit::%make-tls13-client-driver
+                   :transport-read (lambda (driver)
+                                     (declare (ignore driver))
+                                     (encode-tls-plaintext
+                                      (make-tls-plaintext 21 (vector level 90)))))))
+      (setf (cl-tls-kit::tls13-client-driver-state driver) :connected)
+      (check (null (tls13-client-driver-read-record driver)) "user_canceled is consumed")
+      (check (not (tls13-client-driver-closed-p driver)) "user_canceled alone is not fatal")))
   t)
 
 (defun run-client-driver-lifecycle-tests ()

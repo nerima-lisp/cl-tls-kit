@@ -427,6 +427,8 @@ The KEY-SHARE value is supplied by the crypto/provider integration."
         while (< position (length buffer))
         for count = (read-sequence buffer stream :start position)
         do (when (= count position)
+             (unless (zerop position)
+               (%record-fail 'tls-invalid-record "Truncated record"))
              (return-from %tls-client-read-exact nil))
            (setf position count)
         finally (return buffer)))
@@ -435,11 +437,16 @@ The KEY-SHARE value is supplied by the crypto/provider integration."
   (let ((header (make-array 5 :element-type '(unsigned-byte 8))))
     (unless (%tls-client-read-exact stream header)
       (return-from %tls-client-stream-record-reader nil))
-    (let* ((length (+ (ash (aref header 3) 8) (aref header 4)))
-           (body (make-array length :element-type '(unsigned-byte 8))))
-      (unless (%tls-client-read-exact stream body)
-        (error 'tls-client-error :client nil :reason :truncated-record))
-      (concatenate '(vector (unsigned-byte 8)) header body))))
+    (let ((length (+ (ash (aref header 3) 8) (aref header 4)))
+          (limit (if (= (aref header 0) +tls-content-type-application-data+)
+                     +tls-ciphertext-limit+
+                     +tls-plaintext-limit+)))
+      (when (> length limit)
+        (%record-fail 'tls-record-overflow "Record exceeds the wire length limit"))
+      (let ((body (make-array length :element-type '(unsigned-byte 8))))
+        (unless (%tls-client-read-exact stream body)
+          (%record-fail 'tls-invalid-record "Truncated record body"))
+        (concatenate '(vector (unsigned-byte 8)) header body)))))
 
 (defun %make-tls-client-tcp-transport (host port)
   (unless (find-package '#:sb-bsd-sockets)
@@ -467,35 +474,54 @@ must provide TRANSPORT callbacks directly to MAKE-TLS-CLIENT."
   (apply #'make-tls-client :transport (%make-tls-client-tcp-transport host port)
          args))
 
+(defun %tls-client-release (client)
+  (unless (eq (tls-client-state client) :closed)
+    (setf (tls-client-state client) :closed
+          (tls-client-provider client) nil
+          (tls-client-record-protect client) nil
+          (tls-client-record-unprotect client) nil
+          (tls-client-key-schedule client) nil)
+    (when (tls-client-transport-close client)
+      (funcall (tls-client-transport-close client) client))))
+
 (defun tls-client-read (client)
   (unless (eq (tls-client-state client) :connected)
     (%client-fail client :read :not-connected))
   (unless (tls-client-transport-read client)
     (%client-fail client :read :missing-transport))
-  (let ((record (funcall (tls-client-transport-read client) client)))
-    (when record
-      (let ((plaintext (if (tls-client-record-unprotect client)
-                           (funcall (tls-client-record-unprotect client) client record)
-                           record)))
-        (when (typep plaintext 'tls-plaintext)
-          (cond
-            ((tls-close-notify-p plaintext)
-             (setf (tls-client-close-notify-received client) t
-                   (tls-client-state client) :closed))
-            ((and (= (tls-plaintext-content-type plaintext) +tls-content-type-alert+)
-                  (= (length (tls-plaintext-fragment plaintext)) 2))
-             (error 'tls-client-alert-error
-                    :client client :reason :peer-alert
-                    :level (aref (tls-plaintext-fragment plaintext) 0)
-                    :description (aref (tls-plaintext-fragment plaintext) 1)))
-            ((tls-key-update-p plaintext)
-             (let ((callback (%provider-callback client :key-update)))
-               (unless callback
-                 (%client-fail client :read :missing-key-update-callback))
-               (%apply-provider-result
-                client (funcall callback client
-                                (aref (tls-plaintext-fragment plaintext) 4)))))))
-        plaintext))))
+  (handler-case
+      (let ((record (funcall (tls-client-transport-read client) client)))
+        (when record
+          (let ((plaintext (if (tls-client-record-unprotect client)
+                               (funcall (tls-client-record-unprotect client) client record)
+                               record)))
+            (when (typep plaintext 'tls-plaintext)
+              (cond
+                ((tls-close-notify-p plaintext)
+                 (setf (tls-client-close-notify-received client) t)
+                 (tls-client-close client))
+                ((= (tls-plaintext-content-type plaintext) +tls-content-type-alert+)
+                 (let ((fragment (tls-plaintext-fragment plaintext)))
+                   (unless (= (length fragment) 2)
+                     (%record-fail 'tls-invalid-record "Invalid alert length"))
+                   (unless (= (aref fragment 1) 90)
+                     (error 'tls-client-alert-error
+                            :client client :reason :peer-alert
+                            :level (aref fragment 0)
+                            :description (aref fragment 1)))))
+                ((tls-key-update-p plaintext)
+                 (let ((callback (%provider-callback client :key-update)))
+                   (unless callback
+                     (%client-fail client :read :missing-key-update-callback))
+                   (%apply-provider-result
+                    client (funcall callback client
+                                    (aref (tls-plaintext-fragment plaintext) 4)))))))
+            plaintext)))
+    (error (condition)
+      ;; Retain the read failure if releasing the transport also fails.
+      (handler-case (%tls-client-release client)
+        (error () nil))
+      (error condition))))
 
 (defun tls-client-write (client plaintext)
   (unless (eq (tls-client-state client) :connected)
@@ -519,18 +545,22 @@ must provide TRANSPORT callbacks directly to MAKE-TLS-CLIENT."
 
 (defun tls-client-close (client)
   (unless (eq (tls-client-state client) :closed)
-    (let* ((provider (tls-client-provider client))
-           (callback (and (listp provider)
-                          (getf provider :close-notify))))
-      (when callback
-        (unless (tls-client-transport-write client)
-          (%client-fail client :close :missing-transport))
-        (let ((record (funcall callback client)))
-          (when record
-            (funcall (tls-client-transport-write client) client record)))))
-    (setf (tls-client-state client) :closed)
-    (when (tls-client-transport-close client)
-      (funcall (tls-client-transport-close client) client)))
+    (let ((write-completed-p nil))
+      (unwind-protect
+           (progn
+             (let* ((provider (tls-client-provider client))
+                    (callback (and (listp provider) (getf provider :close-notify))))
+               (when callback
+                 (unless (tls-client-transport-write client)
+                   (%client-fail client :close :missing-transport))
+                 (let ((record (funcall callback client)))
+                   (when record
+                     (funcall (tls-client-transport-write client) client record)))))
+             (setf write-completed-p t))
+        (if write-completed-p
+            (%tls-client-release client)
+            (handler-case (%tls-client-release client)
+              (error () nil))))))
   client)
 
 (defun tls-client-key-update (client &optional (request 0))
