@@ -42,45 +42,82 @@
     (values output exit-code)))
 
 (defun %openssl-e2e-certificate (openssl path key-name common-name days
-                                  &key ca (key-type :rsa))
-  (multiple-value-bind (output exit-code)
-      (%openssl-e2e-run
-       openssl
-       (append (list "req" "-x509")
-               (if (eq key-type :ecdsa)
-                   (list "-newkey" "ec" "-pkeyopt" "ec_paramgen_curve:P-256")
-                   (list "-newkey" "rsa:2048"))
-               (list "-nodes"
-             "-days" (princ-to-string days) "-subj"
-             (format nil "/CN=~A" common-name)
-             "-addext" (format nil "subjectAltName=DNS:~A" common-name)
-             "-addext" (if ca
-                            "basicConstraints=critical,CA:TRUE"
-                            "basicConstraints=critical,CA:FALSE")
-             "-addext" (if ca
-                            "keyUsage=critical,keyCertSign,digitalSignature"
-                            "keyUsage=critical,digitalSignature")
-             "-addext" "extendedKeyUsage=serverAuth"
-             "-keyout" key-name "-out" path)))
-    (declare (ignore output))
-    (unless (zerop exit-code)
-      (error "OpenSSL certificate generation failed"))))
+                                         &key ca (key-type :rsa)
+                                         signer-certificate signer-key)
+  (let* ((request (concatenate 'string path ".csr"))
+         (serial (and signer-certificate
+                      (concatenate 'string signer-certificate ".srl")))
+         (key-options
+           (if (eq key-type :ecdsa)
+               (list "-newkey" "ec" "-pkeyopt" "ec_paramgen_curve:P-256")
+               (list "-newkey" "rsa:2048")))
+         (extensions
+           (list "-addext"
+                 (format nil "subjectAltName=DNS:~A" common-name)
+                 "-addext"
+                 (if ca
+                     "basicConstraints=critical,CA:TRUE"
+                     "basicConstraints=critical,CA:FALSE")
+                 "-addext"
+                 (if ca
+                     "keyUsage=critical,keyCertSign,digitalSignature"
+                     "keyUsage=critical,digitalSignature")
+                 "-addext" "extendedKeyUsage=serverAuth")))
+    (multiple-value-bind (output exit-code)
+        (%openssl-e2e-run
+         openssl
+         (append (list "req" (if signer-certificate "-new" "-x509"))
+                 key-options
+                 (list "-nodes")
+                 (unless signer-certificate
+                   (list "-days" (princ-to-string days)))
+                 (list "-subj" (format nil "/CN=~A" common-name))
+                 extensions
+                 (list "-keyout" key-name
+                       "-out" (if signer-certificate request path))))
+      (declare (ignore output))
+      (unless (zerop exit-code)
+        (error "OpenSSL certificate request failed")))
+    (when signer-certificate
+      (multiple-value-bind (output exit-code)
+          (%openssl-e2e-run
+           openssl
+           (list "x509" "-req" "-in" request
+                 "-CA" signer-certificate "-CAkey" signer-key
+                 "-CAcreateserial" "-copy_extensions" "copy"
+                 "-days" (princ-to-string days) "-out" path))
+        (declare (ignore output))
+        (unless (zerop exit-code)
+          (error "OpenSSL certificate signing failed")))
+      (delete-file request)
+      (when (probe-file serial)
+        (delete-file serial)))))
 
-(defun %openssl-e2e-start (openssl port certificate key suite groups)
-  (uiop:launch-program
-   (list openssl "s_server" "-accept" (princ-to-string port)
-         "-cert" certificate "-key" key "-tls1_3"
-         "-ciphersuites" suite "-groups" groups "-alpn" "http/1.1"
-         "-no_ticket" "-www" "-quiet")
-   :output *standard-output* :error-output *error-output*
-   :wait nil))
+(defun %openssl-e2e-start
+    (openssl port certificate key suite groups
+             &key certificate-chain stateless reverse)
+  (let ((arguments
+         (append
+          (list openssl "s_server" "-accept" (princ-to-string port)
+                "-cert" certificate "-key" key "-tls1_3")
+          (when certificate-chain
+            (list "-cert_chain" certificate-chain))
+          (list "-ciphersuites" suite "-groups" groups "-alpn" "http/1.1")
+          (when stateless (list "-stateless"))
+          (list "-no_ticket")
+          (if reverse (list "-rev") (list "-www"))
+          (list "-quiet"))))
+    (uiop:launch-program arguments
+                         :output *standard-output* :error-output *error-output*
+                         :wait nil)))
 
 (defun %openssl-e2e-pem-certificate (path)
   (cl-tls-kit.x509:parse-certificate-der
    (cl-tls-kit:pem-block-der
     (first (cl-tls-kit:pem-decode (uiop:read-file-string path))))))
 
-(defun %openssl-e2e-driver (host port provider suite groups &key trust-anchors now)
+(defun %openssl-e2e-driver
+    (host port provider suite groups &key trust-anchors now)
   (cl-tls-kit:make-tls13-client-driver-over-tcp
    host port
    :provider provider
@@ -99,19 +136,38 @@
                #\Return #\Linefeed #\Return #\Linefeed
                #\Return #\Linefeed #\Return #\Linefeed)))
 
-(defun %openssl-e2e-read-application (driver)
-  (loop repeat 16
-        for plaintext = (cl-tls-kit:tls13-client-driver-read-record driver)
-        when plaintext return (cl-tls-kit:tls-plaintext-fragment plaintext)
-        finally (error "OpenSSL did not return application data")))
+(defun %openssl-e2e-read-application (driver &optional expected-length)
+  (if expected-length
+      (loop with fragments = nil
+            with total = 0
+            repeat 128
+            for plaintext = (cl-tls-kit:tls13-client-driver-read-record driver)
+            do (when plaintext
+                 (let ((fragment (cl-tls-kit:tls-plaintext-fragment plaintext)))
+                   (push fragment fragments)
+                   (incf total (length fragment))
+                   (when (>= total expected-length)
+                     (return
+                      (apply #'concatenate
+                             '(vector (unsigned-byte 8))
+                             (nreverse fragments))))))
+            finally (error "OpenSSL returned too little application data"))
+      (loop repeat 16
+            for plaintext = (cl-tls-kit:tls13-client-driver-read-record driver)
+            when plaintext return (cl-tls-kit:tls-plaintext-fragment plaintext)
+            finally (error "OpenSSL did not return application data"))))
 
 (defun %openssl-e2e-with-server
-    (openssl suite groups certificate key function)
+    (openssl suite groups certificate key function
+             &key certificate-chain stateless reverse)
   (let* ((port (prog1 *openssl-e2e-port* (incf *openssl-e2e-port*)))
          (server nil))
     (unwind-protect
          (progn
-           (setf server (%openssl-e2e-start openssl port certificate key suite groups))
+           (setf server
+                 (%openssl-e2e-start openssl port certificate key suite groups
+                                     :certificate-chain certificate-chain
+                                     :stateless stateless :reverse reverse))
            (sleep 1)
            (funcall function port))
       (when server
@@ -155,7 +211,22 @@
          (ecdsa-key (namestring (merge-pathnames "ecdsa.key" directory)))
          (provider (cl-tls-kit:make-cl-crypto-kit-provider))
          (selected 0)
-         (assertions 0))
+         (assertions 0)
+         (chain-material
+          (list :first-certificate
+                (namestring (merge-pathnames "intermediate-one.crt" directory))
+                :first-key
+                (namestring (merge-pathnames "intermediate-one.key" directory))
+                :second-certificate
+                (namestring (merge-pathnames "intermediate-two.crt" directory))
+                :second-key
+                (namestring (merge-pathnames "intermediate-two.key" directory))
+                :leaf-certificate
+                (namestring (merge-pathnames "chain-leaf.crt" directory))
+                :leaf-key
+                (namestring (merge-pathnames "chain-leaf.key" directory))
+                :chain
+                (namestring (merge-pathnames "chain.pem" directory)))))
     (ensure-directories-exist directory)
     (unwind-protect
          (progn
@@ -198,52 +269,90 @@
            (%openssl-e2e-with-server
             openssl "TLS_AES_128_GCM_SHA256" "P-256" certificate key
             (lambda (port)
-              (let ((driver (%openssl-e2e-driver "127.0.0.1" port provider #x1301
-                                                 '(#x001d #x0017) :trust-anchors
-                                                 (list (%openssl-e2e-pem-certificate certificate)))))
+              (let ((driver (%openssl-e2e-driver
+                             "127.0.0.1" port provider #x1301 '(#x001d #x0017)
+                             :trust-anchors
+                             (list (%openssl-e2e-pem-certificate certificate)))))
                 (unwind-protect
                      (progn
                        (cl-tls-kit:tls13-client-driver-connect driver)
                        (incf assertions)
-                       (check (eq (cl-tls-kit::tls13-client-driver-state driver)
-                                  :connected)
-                              "cl-tls-kit completes an OpenSSL HelloRetryRequest"))
+                       (check
+                        (and
+                         (eq (cl-tls-kit::tls13-client-driver-state driver)
+                             :connected)
+                         (cl-tls-kit::tls13-client-driver-hello-retry-request-received
+                          driver))
+                        "OpenSSL stateless HRR accepts the echoed cookie")
                        (incf assertions)
-                       (check (string= (cl-tls-kit:tls13-client-driver-negotiated-alpn driver)
+                       (check (string= (cl-tls-kit:tls13-client-driver-negotiated-alpn
+                                        driver)
                                        "http/1.1")
                               "OpenSSL negotiates ALPN after HelloRetryRequest")
-                       (cl-tls-kit:tls13-client-driver-write
-                        driver (%openssl-e2e-http-request))
+                       (let ((payload
+                               (make-array 32768 :element-type '(unsigned-byte 8)
+                                                 :initial-element 65)))
+                         (loop for position from 511 below 32768 by 512
+                               do (setf (aref payload position) 10))
+                         (cl-tls-kit:tls13-client-driver-write driver payload))
                        (incf assertions)
-                       (check (search "HTTP/1.0"
-                                      (map 'string #'code-char
-                                           (%openssl-e2e-read-application driver)))
-                              "OpenSSL accepts application data after HelloRetryRequest")
-                  (cl-tls-kit:tls13-client-driver-close driver)
-                  (incf assertions)
-                  (check (eq (cl-tls-kit::tls13-client-driver-state driver) :closed)
-                         "cl-tls-kit sends close_notify")))))
+                       (check (= (length (%openssl-e2e-read-application driver 32768))
+                                 32768)
+                              "OpenSSL receives an application write split above 16 KiB")
+                       (cl-tls-kit:tls13-client-driver-close driver)
+                       (incf assertions)
+                       (check (eq (cl-tls-kit::tls13-client-driver-state driver) :closed)
+                              "cl-tls-kit sends close_notify"))
+                  (cl-tls-kit:tls13-client-driver-close driver))))
+            :stateless t
+            :reverse t)
            (%openssl-e2e-certificate openssl wrong-certificate wrong-key "wrong.local" 1)
            (%openssl-e2e-certificate openssl other-certificate other-key "other.local" 1)
            (%openssl-e2e-certificate openssl anchor-certificate anchor-key "localhost" 1 :ca t)
+           (%openssl-e2e-certificate
+            openssl (getf chain-material :first-certificate)
+            (getf chain-material :first-key) "intermediate-one" 1
+            :ca t :signer-certificate anchor-certificate :signer-key anchor-key)
+           (%openssl-e2e-certificate
+            openssl (getf chain-material :second-certificate)
+            (getf chain-material :second-key) "intermediate-two" 1
+            :ca t :signer-certificate (getf chain-material :first-certificate)
+            :signer-key (getf chain-material :first-key))
+           (%openssl-e2e-certificate
+            openssl (getf chain-material :leaf-certificate)
+            (getf chain-material :leaf-key) "localhost" 1
+            :signer-certificate (getf chain-material :second-certificate)
+            :signer-key (getf chain-material :second-key))
+           (with-open-file (stream (getf chain-material :chain)
+                                   :direction :output :if-exists :supersede)
+             (write-string (uiop:read-file-string
+                            (getf chain-material :first-certificate))
+                           stream)
+             (write-string (uiop:read-file-string
+                            (getf chain-material :second-certificate))
+                           stream))
            (%openssl-e2e-certificate openssl ecdsa-certificate ecdsa-key "localhost" 1
                                      :key-type :ecdsa)
            (incf selected)
            (%openssl-e2e-with-server
-            openssl "TLS_AES_128_GCM_SHA256" "X25519" anchor-certificate anchor-key
+            openssl "TLS_AES_128_GCM_SHA256" "X25519"
+            (getf chain-material :leaf-certificate)
+            (getf chain-material :leaf-key)
             (lambda (port)
               (let ((driver (%openssl-e2e-driver
                              "127.0.0.1" port provider #x1301 '(#x001d)
                              :trust-anchors
-                             (list (%openssl-e2e-pem-certificate anchor-certificate)))))
+                             (list (%openssl-e2e-pem-certificate
+                                    anchor-certificate)))))
                 (unwind-protect
                      (progn
                        (cl-tls-kit:tls13-client-driver-connect driver)
                        (incf assertions)
                        (check (eq (cl-tls-kit::tls13-client-driver-state driver)
                                   :connected)
-                              "TLS 1.3 accepts a self-signed CA trust anchor with localhost SAN"))
-                  (cl-tls-kit:tls13-client-driver-close driver)))))
+                              "TLS 1.3 builds an unordered intermediate chain without the root certificate"))
+                  (cl-tls-kit:tls13-client-driver-close driver))))
+            :certificate-chain (getf chain-material :chain))
            (incf selected)
            (%openssl-e2e-with-server
             openssl "TLS_AES_128_GCM_SHA256" "X25519" ecdsa-certificate ecdsa-key
@@ -299,4 +408,8 @@
       (ignore-errors (delete-file anchor-certificate))
       (ignore-errors (delete-file anchor-key))
       (ignore-errors (delete-file ecdsa-certificate))
-      (ignore-errors (delete-file ecdsa-key)))))
+      (ignore-errors (delete-file ecdsa-key))
+      (dolist (key '(:first-certificate :first-key
+                     :second-certificate :second-key
+                     :leaf-certificate :leaf-key :chain))
+        (ignore-errors (delete-file (getf chain-material key)))))))
