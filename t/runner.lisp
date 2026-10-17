@@ -7,6 +7,8 @@
         (error "cl-tls-kit key schedule tests did not pass."))
       (incf passed))
     (dolist (test '(run-basic-tests
+                    run-path-building-tests
+                    run-trust-store-tests
                     run-record-tests
                     run-handshake-tests
                     run-client-tests

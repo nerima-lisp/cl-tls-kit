@@ -25,6 +25,14 @@
 (defparameter +max-certificate-chain-length+ 16)
 (defparameter +max-certificate-chain-bytes+ (* 4 1024 1024))
 
+(defun %bounded-proper-list-count (items limit)
+  (loop with count = 0
+        for tail = items then (cdr tail)
+        do (cond ((null tail) (return count))
+                 ((not (consp tail)) (return nil))
+                 ((>= count limit) (return nil))
+                 (t (incf count)))))
+
 (defun %field (object key &optional default)
   (cond ((hash-table-p object) (gethash key object default))
         ((and (listp object) (or (null object) (keywordp (first object))))
@@ -77,7 +85,7 @@
          (symbol (and package (find-symbol "VERIFY-SIGNATURE" package))))
     (and symbol (fboundp symbol) symbol)))
 
-(defun %signature-scheme (certificate issuer)
+(defun %signature-scheme (certificate)
   (let ((algorithm (%field certificate :signature-algorithm)))
     (if (keywordp algorithm)
         algorithm
@@ -135,7 +143,7 @@
       (error 'certificate-signature-provider-unavailable :certificate certificate))
     (handler-case
         (unless (funcall function
-                         (%signature-scheme certificate issuer)
+                         (%signature-scheme certificate)
                          (%crypto-public-key (%field issuer :public-key))
                          (%field certificate :tbs-certificate)
                          (%field certificate :signature))
@@ -194,9 +202,11 @@
       (dolist (kind '(:dns :ip))
         (let ((rules (remove-if-not (lambda (entry) (eq (first entry) kind)) permitted))
               (values (remove-if-not (lambda (san) (eq (first san) kind)) names)))
-          (when (and rules (not (some (lambda (san)
-                                        (some (lambda (entry) (%constraint-match-p entry san)) rules))
-                                      values)))
+          (when (and rules values
+                     (not (every (lambda (san)
+                                   (some (lambda (entry) (%constraint-match-p entry san))
+                                         rules))
+                                 values)))
             (error 'invalid-certificate-chain :certificate certificate)))))))
 
 (defun %check-chain-name-constraints (chain index certificate)
@@ -205,13 +215,15 @@
     (when (%field issuer :name-constraints nil)
       (%check-name-constraints certificate issuer))))
 
-(defun %check-certificate (certificate issuer ca-depth now verify-signature)
+(defun %check-certificate (certificate issuer ca-depth now verify-signature
+                           &optional (check-name-constraints-p t))
   (unless (%time-ok-p certificate now)
     (error 'certificate-expired :certificate certificate))
   (when issuer
     (unless (%same-name-p (%field certificate :issuer nil) (%field issuer :subject nil))
       (error 'invalid-certificate-chain :certificate certificate))
-    (%check-name-constraints certificate issuer)
+    (when check-name-constraints-p
+      (%check-name-constraints certificate issuer))
     (%verify-signature certificate issuer verify-signature)
     (unless (eq t (%basic-constraint issuer :ca nil))
       (error 'not-a-ca :certificate issuer))
@@ -227,13 +239,29 @@
   (count-if (lambda (item) (eq t (%basic-constraint item :ca nil)))
             (subseq chain 1 (min issuer-index (length chain)))))
 
-(defun verify-certificate-chain (chain &key hostname trust-anchors
+(defparameter +max-certificate-path-candidates+ 64)
+(defparameter +max-certificate-anchor-candidates+ 512)
+(defparameter +max-certificate-path-expansions+ 256)
+
+(defun %certificate-identical-p (left right)
+  (or (eq left right)
+      (let ((left-tbs (%field left :tbs-certificate))
+            (right-tbs (%field right :tbs-certificate))
+            (left-signature (%field left :signature))
+            (right-signature (%field right :signature)))
+        (and left-tbs right-tbs left-signature right-signature
+             (equalp left-tbs right-tbs)
+             (equalp left-signature right-signature)))
+      (equalp left right)))
+
+(defun %verify-ordered-certificate-chain (chain &key hostname trust-anchors
                                            (now (get-universal-time)) verify-signature)
   "Verify a leaf-first CHAIN using crypto-kit's common VERIFY-SIGNATURE API.
 VERIFY-SIGNATURE, when supplied, has the same four-argument contract."
   (unless chain (error 'untrusted-root :certificate nil))
-  (when (> (length chain) +max-certificate-chain-length+)
-    (error 'invalid-certificate-chain :certificate (first chain)))
+  (unless (%bounded-proper-list-count chain +max-certificate-chain-length+)
+    (error 'invalid-certificate-chain
+           :certificate (and (consp chain) (car chain))))
   (let ((bytes 0))
     (dolist (certificate chain)
       (incf bytes (length (or (%field certificate :tbs-certificate) #())))
@@ -243,10 +271,16 @@ VERIFY-SIGNATURE, when supplied, has the same four-argument contract."
   (loop for certificate in chain
         for issuer in (append (rest chain) '(nil))
         for index from 0
-        do (%check-chain-name-constraints chain index certificate)
+        for check-name-constraints-p =
+          (not (and (plusp index)
+                    (let ((subject (%field certificate :subject nil))
+                          (issuer-name (%field certificate :issuer nil)))
+                      (and subject issuer-name (%same-name-p subject issuer-name)))))
+        do (when check-name-constraints-p
+             (%check-chain-name-constraints chain index certificate))
            (%check-certificate certificate issuer
                                (%subordinate-ca-depth chain (1+ index))
-                               now verify-signature))
+                               now verify-signature check-name-constraints-p))
   (let* ((leaf (first chain)) (root (car (last chain))))
     (unless (and trust-anchors (member root trust-anchors :test #'equalp))
       (if (%field root :self-signed nil)
@@ -263,6 +297,98 @@ VERIFY-SIGNATURE, when supplied, has the same four-argument contract."
       (unless (hostname-match-p hostname (%field leaf :subject-alternative-names nil))
         (error 'certificate-hostname-mismatch :certificate leaf)))
     t))
+
+(defun %verify-certificate-candidate-paths (peer-certificates trust-anchors
+                                                              &key hostname
+                                                              (now (get-universal-time))
+                                                              verify-signature)
+  (let* ((peer-count
+          (%bounded-proper-list-count
+           peer-certificates +max-certificate-path-candidates+))
+         (anchor-count
+          (%bounded-proper-list-count
+           trust-anchors +max-certificate-anchor-candidates+))
+         (leaf (and (consp peer-certificates) (car peer-certificates))))
+    (unless (and peer-count
+                 (plusp peer-count)
+                 anchor-count
+                 (plusp anchor-count))
+      (error 'invalid-certificate-chain :certificate leaf))
+    (let ((bytes 0))
+      (dolist (certificate peer-certificates)
+        (incf bytes (length (or (%field certificate :tbs-certificate) #())))
+        (incf bytes (length (or (%field certificate :signature) #())))
+        (when (> bytes +max-certificate-chain-bytes+)
+          (error 'invalid-certificate-chain :certificate certificate))))
+    (let ((candidates (append (rest peer-certificates) trust-anchors))
+          (expansions 0)
+          (last-failure nil)
+          (unresolved-certificate leaf)
+          (depth-certificate nil)
+          (depth-exceeded-p nil)
+          (verified-tag (gensym "VERIFIED-")))
+      (catch verified-tag
+        (labels ((issuer-candidate-p (certificate candidate)
+                                     (let ((issuer (%field certificate :issuer nil))
+                                           (subject (%field candidate :subject nil)))
+                                       (and issuer subject (%same-name-p issuer subject))))
+                 (verify-path (reversed-path)
+                              (handler-case
+                                  (%verify-ordered-certificate-chain
+                                   (reverse reversed-path)
+                                   :hostname hostname
+                                   :trust-anchors trust-anchors
+                                   :now now
+                                   :verify-signature verify-signature)
+                                (certificate-signature-provider-unavailable (condition)
+                                                                            (error condition))
+                                (certificate-verification-error (condition)
+                                                                (setf last-failure condition)
+                                                                nil)))
+                 (walk (reversed-path)
+                       (let ((current (car reversed-path))
+                             (matched-issuer-p nil))
+                         (when (member current trust-anchors
+                                       :test #'%certificate-identical-p)
+                           (when (verify-path reversed-path)
+                             (throw verified-tag t)))
+                         (dolist (candidate candidates)
+                           (when (issuer-candidate-p current candidate)
+                             (setf matched-issuer-p t)
+                             (unless (member candidate reversed-path
+                                             :test #'%certificate-identical-p)
+                               (if (>= (length reversed-path)
+                                       +max-certificate-chain-length+)
+                                   (setf depth-exceeded-p t
+                                         depth-certificate current)
+                                 (progn
+                                   (when (>= expansions
+                                             +max-certificate-path-expansions+)
+                                     (error 'invalid-certificate-chain
+                                            :certificate current))
+                                   (incf expansions)
+                                   (walk (cons candidate reversed-path)))))))
+                         (unless matched-issuer-p
+                           (setf unresolved-certificate current)))))
+          (walk (list leaf))
+
+          (cond (last-failure (error last-failure))
+                (depth-exceeded-p
+                 (error 'invalid-certificate-chain
+                        :certificate (or depth-certificate leaf)))
+                (t (error 'untrusted-root
+                          :certificate unresolved-certificate))))))))
+
+(defun verify-certificate-chain (chain &key hostname trust-anchors
+                                           (now (get-universal-time)) verify-signature)
+  "Build a bounded leaf-first path from peer certificates, then verify it."
+  (if (or (null chain) (null trust-anchors))
+      (%verify-ordered-certificate-chain
+       chain :hostname hostname :trust-anchors trust-anchors
+       :now now :verify-signature verify-signature)
+      (%verify-certificate-candidate-paths
+       chain trust-anchors :hostname hostname :now now
+       :verify-signature verify-signature)))
 
 (defun verify-certificate (chain &rest keys)
   (apply #'verify-certificate-chain chain keys))
