@@ -25,6 +25,7 @@
   :pathname "t"
   :serial t
   :components ((:file "package") (:file "tests")
+               (:file "path-building-tests") (:file "trust-store-tests")
                (:file "key-schedule-tests") (:file "record-tests")
                (:file "handshake-tests") (:file "client-tests")
                (:file "client-driver-tests")
