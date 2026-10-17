@@ -1238,4 +1238,46 @@
                             cl-tls-kit::+tls-content-type-alert+)
                          (equalp (tls-plaintext-fragment alert) #(2 80)))))
              "missing shared-secret callback sends plaintext internal_error and closes"))
-    t))
+    (progn
+      (let* ((key-exchange (cl-tls-kit::%driver-default-key-exchange))
+             (generate (getf key-exchange :generate))
+             (shared-secret (getf key-exchange :shared-secret))
+             (private (make-array 32 :element-type '(unsigned-byte 8)
+                                  :initial-element 1))
+             (short-x25519-share
+               (make-array 31 :element-type '(unsigned-byte 8)
+                              :initial-element 1))
+             (off-curve-p256-share
+               (make-array 65 :element-type '(unsigned-byte 8)
+                              :initial-element 0)))
+        (setf (aref off-curve-p256-share 0) #x04)
+        (check
+         (handler-case
+             (progn
+               (funcall shared-secret #x001d private short-x25519-share)
+               nil)
+           (tls13-client-driver-error (condition)
+             (eq (tls13-client-driver-error-reason condition)
+                 :invalid-key-share)))
+         "default X25519 exchange normalizes a wrong-length peer share")
+        (multiple-value-bind (p256-private p256-public)
+            (funcall generate #x0017)
+          (check
+           (handler-case
+               (progn
+                 (funcall shared-secret #x0017 p256-private off-curve-p256-share)
+                 nil)
+             (tls13-client-driver-error (condition)
+               (eq (tls13-client-driver-error-reason condition)
+                   :invalid-key-share)))
+           "default P-256 exchange normalizes an off-curve peer share")
+          (check
+           (handler-case
+               (progn
+                 (funcall shared-secret #x0017 #() p256-public)
+                 nil)
+             (crypto-kit:crypto-error (condition)
+               (string= (crypto-kit:crypto-error-message condition)
+                        "Invalid P-256 private key length")))
+           "default P-256 exchange preserves local key errors")))
+      t)))

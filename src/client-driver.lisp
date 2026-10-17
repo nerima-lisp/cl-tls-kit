@@ -98,8 +98,8 @@
                ((:unexpected-hrr :unexpected-message :unexpected-record) 10)
                (:missing-server-key-share 109)
                ((:unrequested-key-share-group :hrr-unsupported-group
-                                              :hrr-repeated-group :unoffered-cipher-suite
-                                              :downgrade-sentinel) 47)
+                 :hrr-repeated-group :unoffered-cipher-suite
+                 :downgrade-sentinel :invalid-key-share) 47)
                (:unexpected-alpn 120)
                ((:invalid-server-certificate :missing-server-certificate
                                              :certificate-verification-failed) 42)
@@ -186,6 +186,67 @@
       (setf (tls13-client-driver-private-key driver) private
             (tls13-client-driver-selected-group driver) group)
       (cons group public))))
+(defun %driver-default-key-exchange ()
+  (labels ((operation (name)
+             (let ((package (find-package (quote #:crypto-kit))))
+               (unless package
+                 (%driver-fail :missing-key-exchange-function))
+               (let ((symbol (find-symbol name package)))
+                 (unless (and symbol (fboundp symbol))
+                   (%driver-fail :missing-key-exchange-function))
+                 (symbol-function symbol))))
+           (crypto-error-p (condition)
+             (let* ((package (find-package (quote #:crypto-kit)))
+                    (symbol (and package (find-symbol "CRYPTO-ERROR" package))))
+               (and symbol (typep condition symbol))))
+           (crypto-error-message (condition)
+             (let* ((package (find-package (quote #:crypto-kit)))
+                    (symbol (and package
+                                 (find-symbol "CRYPTO-ERROR-MESSAGE" package))))
+               (when (and symbol (fboundp symbol))
+                 (funcall (symbol-function symbol) condition))))
+           (p256-peer-point-error-p (condition)
+             (and (crypto-error-p condition)
+                  (member (crypto-error-message condition)
+                          '("Invalid uncompressed EC point encoding"
+                            "EC point is not on curve")
+                          :test #'string=)))
+           (p256-shared-secret (private public)
+             (let ((ecdh (operation "P256-ECDH")))
+               (handler-case
+                   (funcall ecdh private public)
+                 (error (condition)
+                   (if (p256-peer-point-error-p condition)
+                       (%driver-fail :invalid-key-share)
+                       (error condition)))))))
+    (list
+     :generate
+     (lambda (group)
+       (case group
+         (#x001d
+          (let* ((private (funcall (operation "RANDOM-OCTETS") 32))
+                 (public (funcall (operation "X25519-BASE") private)))
+            (values private public)))
+         (#x0017
+          (funcall (operation "P256-GENERATE-KEYPAIR")))
+         (otherwise
+          (%driver-fail :missing-key-exchange-generator))))
+     :shared-secret
+     (lambda (group private public)
+       (case group
+         (#x001d
+          (unless (= (length public) 32)
+            (%driver-fail :invalid-key-share))
+          (multiple-value-bind (secret all-zero)
+              (funcall (operation "X25519") private public)
+            (when all-zero (%driver-fail :invalid-key-share))
+            secret))
+         (#x0017
+          (unless (and (= (length public) 65) (= (aref public 0) 4))
+            (%driver-fail :invalid-key-share))
+          (p256-shared-secret private public))
+         (otherwise
+          (%driver-fail :missing-key-exchange-function)))))))
 
 (defun make-tls13-client-driver
     (&key provider key-exchange on-send verify-certificate-verify
@@ -197,8 +258,37 @@
   "Create a TLS 1.3 client handshake driver.
 
 The driver owns handshake message sequencing and transcript/key-schedule
-progression. KEY-EXCHANGE supplies :GENERATE and :SHARED-SECRET functions;
-the crypto provider supplies hash, HKDF, HMAC, and AEAD primitives."
+progression. PROVIDER remains required, including when KEY-EXCHANGE is
+omitted, and supplies hash, HKDF, HMAC, and AEAD primitives. By default,
+CL-CRYPTO-KIT handles the X25519 (#x001d) or P-256 (#x0017) key share selected
+during the handshake.
+
+A supplied KEY-EXCHANGE plist replaces the built-in key-share functions. It
+must contain callable function designators for :GENERATE and :SHARED-SECRET.
+:GENERATE is called as (GROUP), where GROUP is a 16-bit TLS named-group ID, and
+returns PRIVATE-KEY and PUBLIC-SHARE as multiple values. PRIVATE-KEY is opaque
+to the driver; the value returned for a GROUP is passed unchanged to the
+:SHARED-SECRET call for that GROUP. PUBLIC-SHARE is a vector of octets in the
+TLS encoding for GROUP. The built-in handlers support X25519 (#x001d), with its
+32-octet RFC 7748 encoding, and P-256 (#x0017), with a 65-octet SEC1 uncompressed
+point beginning with #x04. Custom callbacks may implement other groups in
+SUPPORTED-GROUPS. Because the custom plist replaces both built-in functions,
+callbacks must handle every listed group. The driver does not validate group
+coverage at construction, so list only groups the callbacks support.
+
+:SHARED-SECRET is called as (GROUP PRIVATE-KEY PEER-PUBLIC-SHARE); the peer
+share is a vector of octets in the TLS encoding for that GROUP. It returns the
+raw shared-secret bytes for GROUP as an octet vector for the TLS 1.3 key
+schedule. Custom callbacks must validate peer shares. The built-in handlers
+reject all-zero X25519 secrets and malformed P-256 points. Errors signaled by
+custom callbacks propagate; the driver does not reclassify arbitrary callback
+errors as invalid peer shares.
+
+SUPPORTED-GROUPS controls the offered groups and their preference order. By
+default, X25519 is first and P-256 second; the driver sends an initial share
+for the first group. For a HelloRetryRequest asking for a different offered
+group, :GENERATE is called again for that group. The driver rejects requests
+for unoffered groups, a retry of the initial group, and a second HelloRetryRequest."
   (unless (typep provider 'tls13-crypto-provider) (%driver-fail :provider))
   (let* ((offered-suites (coerce
                           (remove-if-not
@@ -210,7 +300,7 @@ the crypto provider supplies hash, HKDF, HMAC, and AEAD primitives."
                      (aref offered-suites 0))))
     (unless suite (%driver-fail :unsupported-cipher-suite))
     (let ((driver (%make-tls13-client-driver
-                   :provider provider :key-exchange key-exchange :on-send on-send
+                   :provider provider :key-exchange (or key-exchange (%driver-default-key-exchange)) :on-send on-send
                    :transport-read (or transport-read (getf transport :read))
                    :transport-write (or transport-write (getf transport :write))
                    :transport-close (or transport-close (getf transport :close))
