@@ -2,37 +2,6 @@
 
 (defparameter *openssl-e2e-port* 45100)
 
-(defun %openssl-e2e-call (name)
-  (let* ((package (find-package "CRYPTO-KIT"))
-         (symbol (and package (find-symbol name package))))
-    (unless (and symbol (fboundp symbol))
-      (error "CL-CRYPTO-KIT:~A is unavailable" name))
-    (symbol-function symbol)))
-
-(defun %openssl-e2e-key-exchange ()
-  (let ((random (%openssl-e2e-call "RANDOM-OCTETS"))
-        (x25519 (%openssl-e2e-call "X25519"))
-        (p256-generate (%openssl-e2e-call "P256-GENERATE-KEYPAIR"))
-        (p256-ecdh (%openssl-e2e-call "P256-ECDH")))
-    (list :random random
-          :generate
-          (lambda (group)
-            (if (= group #x001d)
-                (let ((private (funcall random 32)))
-                  (let ((base (make-array 32 :element-type '(unsigned-byte 8)
-                                           :initial-element 0)))
-                    (setf (aref base 0) 9)
-                    (values private (nth-value 0 (funcall x25519 private base)))))
-                (funcall p256-generate)))
-          :shared-secret
-          (lambda (group private public)
-            (if (= group #x001d)
-                (multiple-value-bind (secret all-zero)
-                    (funcall x25519 private public)
-                  (when all-zero (error "X25519 produced an all-zero secret"))
-                  secret)
-                (funcall p256-ecdh private public))))))
-
 (defun %openssl-e2e-run (program arguments)
   (multiple-value-bind (output error-output exit-code)
       (uiop:run-program (cons program arguments)
@@ -121,7 +90,6 @@
   (cl-tls-kit:make-tls13-client-driver-over-tcp
    host port
    :provider provider
-   :key-exchange (%openssl-e2e-key-exchange)
    :on-send nil
    :alpn '("http/1.1")
    :cipher-suites (vector suite)
@@ -162,17 +130,48 @@
              &key certificate-chain stateless reverse)
   (let* ((port (prog1 *openssl-e2e-port* (incf *openssl-e2e-port*)))
          (server nil))
-    (unwind-protect
-         (progn
-           (setf server
-                 (%openssl-e2e-start openssl port certificate key suite groups
-                                     :certificate-chain certificate-chain
-                                     :stateless stateless :reverse reverse))
-           (sleep 1)
-           (funcall function port))
-      (when server
-        (ignore-errors (uiop:terminate-process server))
-        (ignore-errors (uiop:wait-process server))))))
+    (labels ((wait-for-server ()
+               (let* ((package (or (find-package '#:sb-bsd-sockets)
+                                   (progn
+                                     (require :sb-bsd-sockets)
+                                     (find-package '#:sb-bsd-sockets))))
+                      (make-socket (find-symbol "MAKE-INET-SOCKET" package))
+                      (connect (find-symbol "SOCKET-CONNECT" package))
+                      (close-socket (find-symbol "SOCKET-CLOSE" package))
+                      (refused-type
+                        (find-symbol "CONNECTION-REFUSED-ERROR" package)))
+                 (loop repeat 50
+                       for ready =
+                         (let ((socket (funcall make-socket :stream :tcp)))
+                           (unwind-protect
+                                (handler-case
+                                    (progn
+                                      (funcall connect socket #(127 0 0 1) port)
+                                      t)
+                                  (error (condition)
+                                    (if (and refused-type
+                                             (typep condition refused-type))
+                                        nil
+                                        (error condition))))
+                             (funcall close-socket socket)))
+                       when ready return t
+                       do (unless (uiop:process-alive-p server)
+                            (error "OpenSSL server exited before listening"))
+                          (sleep 0.1)
+                       finally
+                         (error "OpenSSL server did not listen on port ~D"
+                                port)))))
+      (unwind-protect
+           (progn
+             (setf server
+                   (%openssl-e2e-start openssl port certificate key suite groups
+                                       :certificate-chain certificate-chain
+                                       :stateless stateless :reverse reverse))
+             (wait-for-server)
+             (funcall function port))
+        (when server
+          (ignore-errors (uiop:terminate-process server))
+          (ignore-errors (uiop:wait-process server)))))))
 
 (defun %openssl-e2e-expect-verification
     (openssl provider certificate key trust-anchor now expected)
