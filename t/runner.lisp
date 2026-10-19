@@ -13,6 +13,8 @@
                     run-handshake-tests
                     run-client-tests
                     run-client-driver-tests
+                    run-client-resumption-tests
+                    run-client-resumption-security-tests
                     run-verification-tests
                     run-quic-boundary-tests
                     run-openssl-e2e-tests))

@@ -32,7 +32,7 @@
 
 (defun %require-octets (value name)
   (unless (%octets-p value)
-    (%tls13-error "~A must be a vector of octets, got ~S" name value))
+    (%tls13-error "~A must be a vector of octets" name))
   value)
 
 (defun %concat-octets (&rest vectors)
@@ -245,6 +245,21 @@ dependency and does not refer to an uninterned package at read time."
 
 (defun tls13-resumption-secret (provider hash master-secret transcript-hash)
   (tls13-derive-secret provider hash master-secret "res master" transcript-hash))
+(progn
+  (defun tls13-resumption-psk (provider hash resumption-master-secret ticket-nonce)
+    (%require-octets ticket-nonce "TICKET-NONCE")
+    (tls13-hkdf-expand-label
+     provider hash resumption-master-secret "resumption" ticket-nonce
+     (%tls13-hash-length provider hash)))
+  (defun tls13-psk-binder (provider hash psk truncated-client-hello-hash)
+    (%require-octets truncated-client-hello-hash "TRUNCATED-CLIENT-HELLO-HASH")
+    (let* ((early-secret (tls13-early-secret provider hash psk))
+           (binder-key (tls13-derive-secret
+                        provider hash early-secret "res binder"
+                        (tls13-empty-hash provider hash)))
+           (finished-key (tls13-finished-key provider hash binder-key)))
+      (tls13-compute-finished-verify-data
+       provider hash finished-key truncated-client-hello-hash))))
 
 (defun tls13-traffic-secret (provider hash base-secret direction transcript-hash
                              &key (phase :handshake))
