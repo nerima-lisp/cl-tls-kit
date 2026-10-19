@@ -613,7 +613,9 @@
                      (list (make-tls-extension 43 #(#x03 #x04))
                            (make-tls-extension 51
                                                (cl-tls-kit::%hs-u16 #x0017)))))))
-          (tls13-client-driver-step driver hrr-wire)
+          (progn
+            (setf now 601001)
+            (tls13-client-driver-step driver hrr-wire))
           (let* ((client-hello-2 (first (car sent)))
                  (hello-2 (decode-handshake client-hello-2))
                  (extensions (tls13-client-hello-extensions hello-2))
@@ -635,7 +637,9 @@
             (multiple-value-setq (identity-2 binder-2)
               (multiple-value-bind (identity age binder)
                   (%client-resumption-psk-fields (tls-extension-data psk-extension))
-                (declare (ignore age))
+                (%client-resumption-check
+                 (= age 600001)
+                 "HelloRetryRequest recomputes obfuscated age after ticket expiry")
                 (values identity binder)))
             (let* ((binder-length (length binder-2))
                    (truncated
