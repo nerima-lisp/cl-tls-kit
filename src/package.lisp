@@ -154,7 +154,13 @@
    #:quic-tls-boundary-send-key-update #:quic-tls-boundary-close-notify-p
    #:quic-tls-boundary-alert-p #:quic-tls-boundary-key-update-p
    #:make-tls13-ticket-store #:tls13-ticket-store #:tls13-ticket-store-p
-   #:tls13-client-driver-resumed-p))
+   #:tls13-client-driver-resumed-p
+   #:tls13-server-driver #:tls13-server-driver-p
+   #:make-tls13-server-driver #:tls13-server-driver-step
+   #:tls13-server-driver-error #:tls13-server-driver-error-reason
+   #:tls13-server-ticket-key-store #:tls13-server-ticket-key-store-p
+   #:make-tls13-server-ticket-key-store
+   #:rotate-tls13-server-ticket-key-store))
 
 (defpackage #:cl-tls-kit.x509
   (:use #:cl #:cl-tls-kit)

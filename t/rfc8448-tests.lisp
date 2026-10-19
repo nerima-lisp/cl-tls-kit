@@ -7,11 +7,15 @@
 ;;;; file must not grow a second HKDF, digest, or HMAC implementation.
 
 (defun rfc8448-%hex (string)
-  (let ((result (make-array (/ (length string) 2)
-                            :element-type '(unsigned-byte 8))))
+  (let* ((digits
+           (remove-if (lambda (character)
+                        (find character '(#\Space #\Tab #\Newline #\Return)))
+                      string))
+         (result (make-array (/ (length digits) 2)
+                             :element-type '(unsigned-byte 8))))
     (dotimes (i (length result) result)
       (setf (aref result i)
-            (parse-integer string :start (* i 2) :end (+ (* i 2) 2)
+            (parse-integer digits :start (* i 2) :end (+ (* i 2) 2)
                            :radix 16)))))
 
 (defparameter *rfc8448-simple-1rtt-client-fixture*
@@ -59,8 +63,7 @@
 
 (defun rfc8448-%check (actual expected name)
   (unless (equalp actual expected)
-    (error "RFC 8448 test failed for ~A: got ~S, expected ~S"
-           name actual expected)))
+    (error "RFC 8448 test failed for ~A" name)))
 
 (defun run-rfc8448-tests (&optional provider)
   "Run the RFC 8448 client key-schedule checks, or report a real skip.

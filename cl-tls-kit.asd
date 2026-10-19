@@ -16,7 +16,7 @@
                (:file "verify") (:file "key-schedule") (:file "record")
                (:file "handshake") (:file "verification")
                (:file "quic-boundary") (:file "rfc8448") (:file "client")
-               (:file "client-driver"))
+               (:file "client-driver") (:file "server-driver"))
   :in-order-to ((test-op (test-op "cl-tls-kit/test"))))
 
 (asdf:defsystem "cl-tls-kit/test"
@@ -29,8 +29,10 @@
                (:file "key-schedule-tests") (:file "record-tests")
                (:file "handshake-tests") (:file "client-tests")
                (:file "client-driver-tests") (:file "client-resumption-tests")
+               (:file "server-driver-tests")
                (:file "verification-tests") (:file "quic-boundary-tests")
-               (:file "rfc8448-tests") (:file "openssl-e2e")
+               (:file "rfc8448-tests") (:file "rfc8448-server-tests")
+               (:file "openssl-e2e") (:file "server-openssl-e2e")
                (:file "runner"))
   :perform (asdf:test-op (op c)
              (declare (ignore op c))

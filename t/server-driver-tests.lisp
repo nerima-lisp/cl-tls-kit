@@ -1,0 +1,901 @@
+(in-package #:cl-tls-kit/test)
+
+(defun %server-driver-test-event (events type)
+  (find type events :key (lambda (event) (getf event :type))))
+
+(defun %server-driver-test-events (events type)
+  (remove-if-not (lambda (event) (eq (getf event :type) type)) events))
+
+(defun %server-driver-test-random ()
+  (let ((counter 0))
+    (lambda (length)
+      (let ((bytes (make-array length :element-type '(unsigned-byte 8))))
+        (dotimes (index length bytes)
+          (setf (aref bytes index) (mod (incf counter) 256)))))))
+
+(defun %server-driver-test-client (provider &key (alpn '("h2" "http/1.1"))
+                                             (groups '(#x001d #x0017))
+                                             (schemes #( #x0804 #x0403 #x0807))
+                                             (cipher-suites #( #x1301 #x1302 #x1303 #x1304))
+                                             trust-anchors (now (get-universal-time))
+                                             on-certificate-verify)
+  (let ((outgoing (list nil)))
+    (let ((driver
+            (make-tls13-client-driver
+             :provider provider :hostname "server.test" :alpn alpn
+             :supported-groups groups :signature-algorithms schemes
+             :cipher-suites cipher-suites
+             :trust-anchors trust-anchors :now now
+             :verify-certificate-verify on-certificate-verify
+             :on-send (lambda (ignored wire)
+                        (declare (ignore ignored))
+                        (push wire (car outgoing))))))
+      (values driver outgoing))))
+
+(defun %server-driver-test-client-hello (driver outgoing)
+  (tls13-client-driver-start driver)
+  (let ((wire (pop (car outgoing))))
+    (unless wire (error "Client driver did not send a ClientHello"))
+    (values wire (decode-handshake wire))))
+
+(defun %server-driver-test-rewrite-client-hello (hello extension-type data)
+  (make-tls13-client-hello
+   (tls13-client-hello-legacy-version hello)
+   (tls13-client-hello-random hello)
+   (tls13-client-hello-session-id hello)
+   (tls13-client-hello-cipher-suites hello)
+   (append
+    (remove extension-type (tls13-client-hello-extensions hello)
+            :key #'tls-extension-type)
+    (unless (eq data :remove)
+      (list (make-tls-extension extension-type data))))))
+
+(defun %server-driver-test-duplicate-extension-wire (wire extension-type)
+  (let* ((body (subseq wire 4))
+         (session-id-result
+           (multiple-value-list
+            (cl-tls-kit::%read-vector body 34 1 :maximum 32)))
+         (cipher-suites-result
+           (multiple-value-list
+            (cl-tls-kit::%read-vector body (second session-id-result) 2 :minimum 2)))
+         (compression-result
+           (multiple-value-list
+            (cl-tls-kit::%read-vector body (second cipher-suites-result) 1)))
+         (extensions-length-position (second compression-result)))
+    (multiple-value-bind (extensions-length extensions-start)
+        (cl-tls-kit::%read-integer body extensions-length-position 2)
+      (let ((cursor extensions-start)
+            (end (+ extensions-start extensions-length))
+            (duplicate nil))
+        (loop while (< cursor end) do
+          (multiple-value-bind (type next)
+              (cl-tls-kit::%read-integer body cursor 2)
+            (multiple-value-bind (length data-start)
+                (cl-tls-kit::%read-integer body next 2)
+              (let ((next-extension (+ data-start length)))
+                (when (= type extension-type)
+                  (setf duplicate (subseq body cursor next-extension)))
+                (setf cursor next-extension)))))
+        (unless duplicate
+          (error "ClientHello has no extension ~D to duplicate" extension-type))
+        (let* ((extensions
+                 (cl-tls-kit::%tls13-server-cat
+                  (subseq body extensions-start end) duplicate))
+               (new-body
+                 (cl-tls-kit::%tls13-server-cat
+                  (subseq body 0 extensions-length-position)
+                  (cl-tls-kit::%tls13-server-u16 (length extensions))
+                  extensions)))
+          (cl-tls-kit::%tls13-server-cat
+           #(1) (cl-tls-kit::%tls13-server-u24 (length new-body)) new-body))))))
+
+(defun %server-driver-test-u16-list (values)
+  (cl-tls-kit::%encode-vector
+   (apply #'cl-tls-kit::%cat (mapcar #'cl-tls-kit::%hs-u16 values)) 2))
+
+(defun %server-driver-test-u32 (value)
+  (vector (ldb (byte 8 24) value) (ldb (byte 8 16) value)
+          (ldb (byte 8 8) value) (ldb (byte 8 0) value)))
+
+(defun %server-driver-test-server
+    (provider chain key ticket-key-store clock &key (groups '(#x001d #x0017))
+                                                (alpn '("http/1.1" "h2"))
+                                                (cipher-suites #( #x1301 #x1302 #x1303 #x1304)))
+  (make-tls13-server-driver
+   :provider provider :certificate-chain chain :private-key key
+   :alpn-protocols alpn :ticket-key-store ticket-key-store
+   :supported-groups groups :cipher-suites cipher-suites
+   :clock clock :random (%server-driver-test-random)))
+
+(defun %server-driver-test-state-snapshot (driver)
+  (list (cl-tls-kit::tls13-server-driver-state driver)
+        (cl-tls-kit::tls13-server-driver-selected-alpn driver)
+        (cl-tls-kit::tls13-server-driver-selected-suite driver)
+        (cl-tls-kit::tls13-server-driver-sni-hostname driver)
+        (cl-tls-kit::tls13-server-driver-hash driver)
+        (cl-tls-kit::tls13-server-driver-selected-group driver)
+        (cl-tls-kit::tls13-server-driver-hrr-seen-p driver)
+        (cl-tls-kit::tls13-server-driver-resumed-p driver)
+        (copy-seq (cl-tls-kit::tls13-server-driver-transcript driver))))
+
+(defun %server-driver-test-alert-p (events description)
+  (let ((alert (%server-driver-test-event events :alert))
+        (send (find-if (lambda (event)
+                         (and (eq (getf event :type) :send)
+                              (eq (getf event :content-type) :alert)))
+                       events)))
+    (and alert send
+         (= (getf alert :description) description)
+         (equalp (getf send :wire) (vector 2 description)))))
+
+(defun %server-driver-test-assert-client-hello-rejected
+    (name driver wire expected-alert check-case)
+  (let ((before (%server-driver-test-state-snapshot driver)))
+    (multiple-value-bind (returned events)
+        (tls13-server-driver-step driver wire :level :initial)
+      (funcall check-case (eq returned driver)
+               (format nil "~A returns the same server driver" name))
+      (funcall check-case (%server-driver-test-alert-p events expected-alert)
+               (format nil "~A emits fatal alert ~D (got ~S)" name expected-alert
+                       (getf (%server-driver-test-event events :alert) :description)))
+      (funcall check-case (equalp before (%server-driver-test-state-snapshot driver))
+               (format nil "~A leaves server handshake state unchanged" name))
+      events)))
+
+(defun %server-driver-test-memory-handshake
+    (provider chain key anchor ticket-key-store now &key (groups '(#x001d #x0017))
+                                                   (alpn '("h2" "http/1.1")))
+  (let ((client-outgoing (list nil))
+        (client-certificate-verify-count 0)
+        (server-alpn nil)
+        (ticket-event nil)
+        (hrr-count 0)
+        (events-seen nil)
+        (client nil)
+        (server nil))
+    (setf client
+          (make-tls13-client-driver
+           :provider provider :hostname "server.test" :alpn alpn
+           :trust-anchors (list anchor) :now now
+           :verify-certificate-verify
+           (lambda (message)
+             (declare (ignore message))
+             (incf client-certificate-verify-count))
+           :on-send (lambda (ignored wire)
+                      (declare (ignore ignored))
+                      (push wire (car client-outgoing))))
+          server (%server-driver-test-server provider chain key ticket-key-store
+                                             (lambda () now) :groups groups))
+    (tls13-client-driver-start client)
+    (loop repeat 8
+          for client-wire = (pop (car client-outgoing))
+          while client-wire
+          do (multiple-value-bind (returned events)
+                 (tls13-server-driver-step
+                  server client-wire
+                  :level (if (= (aref client-wire 0) 20) :handshake :initial))
+               (setf server returned
+                     events-seen (append events-seen events))
+               (dolist (event events)
+                 (case (getf event :type)
+                   (:send
+                    (when (eq (getf event :content-type) :alert)
+                      (error "Memory handshake server emitted alert ~S"
+                             (getf (%server-driver-test-event events :alert)
+                                   :description)))
+                    (let ((message (decode-handshake (getf event :wire))))
+                      (when (typep message 'tls13-hello-retry-request)
+                        (incf hrr-count))
+                      (tls13-client-driver-step client (getf event :wire))))
+                   (:alpn (setf server-alpn (getf event :protocol)))
+                   (:ticket-issued (setf ticket-event event))))))
+    (values server client server-alpn ticket-event hrr-count
+            client-certificate-verify-count events-seen (car client-outgoing))))
+(defun %server-driver-test-client-server-resumption-roundtrip
+    (provider chain key anchor ticket-key-store now check-case &key (suite #x1301)
+                                                        hello-retry-p client-cipher-suites)
+  (let ((ticket-store (make-tls13-ticket-store :clock (lambda () 0))))
+    (labels
+        ((queue-server-record (endpoint wire)
+           (setf (gethash :server-records endpoint)
+                 (nconc (gethash :server-records endpoint) (list wire))))
+         (process-server-events (endpoint events)
+           (dolist (event events)
+             (case (getf event :type)
+               (:secret
+                (let* ((direction (getf event :direction))
+                       (level (getf event :level))
+                       (states (gethash (if (eq direction :read)
+                                            :read-states :write-states)
+                                        endpoint)))
+                  (setf (gethash (list direction level) states)
+                        (cl-tls-kit::make-tls13-traffic-state
+                         provider
+                         (cl-tls-kit::tls13-cipher-suite-hash suite)
+                         (if (= suite #x1302) :aes-256-gcm :aes-128-gcm)
+                         (getf event :secret)
+                         (if (= suite #x1302) 32 16)
+                         12))))
+               (:send
+                (let* ((level (getf event :level))
+                       (content-type
+                         (case (getf event :content-type)
+                           ((:alert 21) 21)
+                           ((:application-data 23) 23)
+                           (otherwise 22)))
+                       (plaintext
+                         (cl-tls-kit:make-tls-plaintext content-type (getf event :wire)))
+                       (state (unless (eq level :initial)
+                                (or (gethash (list :write level)
+                                             (gethash :write-states endpoint))
+                                    (error "Server traffic secret was not installed")))))
+                  (queue-server-record
+                   endpoint
+                   (if state
+                       (cl-tls-kit:encrypt-tls13-traffic-record plaintext state)
+                       (cl-tls-kit::encode-tls-plaintext plaintext)))))
+               (:ticket-issued (setf (gethash :ticket-issued endpoint) t))
+               (:handshake-complete
+                (setf (gethash :handshake-complete endpoint) t
+                      (gethash :resumed endpoint) (getf event :resumed-p)))
+               ((:cipher-suite :alpn) nil)
+               (:alert (error "Server driver emitted fatal alert ~D"
+                              (getf event :description)))
+               (otherwise (error "Unknown server driver event ~S"
+                                 (getf event :type))))))
+         (dispatch-handshake (endpoint wire level)
+           (multiple-value-bind (driver events)
+               (tls13-server-driver-step (gethash :server endpoint) wire :level level)
+             (setf (gethash :server endpoint) driver)
+             (process-server-events endpoint events)))
+         (process-client-record (endpoint wire)
+           (case (aref wire 0)
+             (20 nil)
+             (22
+              (let ((plaintext (cl-tls-kit::decode-tls-plaintext wire)))
+                (dispatch-handshake endpoint
+                                    (cl-tls-kit:tls-plaintext-fragment plaintext)
+                                    :initial)))
+             (23
+              (let* ((level (if (gethash :handshake-complete endpoint)
+                                :application :handshake))
+                     (state (or (gethash (list :read level)
+                                         (gethash :read-states endpoint))
+                                (error "Client traffic secret was not installed")))
+                     (plaintext (cl-tls-kit:decrypt-tls13-traffic-record wire state))
+                     (content-type (cl-tls-kit:tls-plaintext-content-type plaintext))
+                     (fragment (cl-tls-kit:tls-plaintext-fragment plaintext)))
+                (case content-type
+                  (22 (dispatch-handshake endpoint fragment level))
+                  (23
+                   (setf (gethash :application-data endpoint)
+                         (append (gethash :application-data endpoint)
+                                 (list (copy-seq fragment))))
+                   (queue-server-record
+                    endpoint
+                    (cl-tls-kit:encrypt-tls13-traffic-record
+                     (cl-tls-kit:make-tls-plaintext 23 fragment)
+                     (or (gethash (list :write :application)
+                                  (gethash :write-states endpoint))
+                         (error "Server application traffic secret is unavailable")))))
+                  (otherwise (error "Unexpected client TLS content type ~D"
+                                    content-type)))))
+             (otherwise (error "Unexpected client TLS record type ~D"
+                               (aref wire 0)))))
+         (make-endpoint ()
+           (let* ((endpoint (make-hash-table :test (function eq)))
+                  (server (%server-driver-test-server
+                           provider chain key ticket-key-store (lambda () now)
+                           :groups (if hello-retry-p '(#x0017) '(#x001d))
+                           :alpn '("http/1.1")
+                           :cipher-suites (vector suite))))
+             (setf (gethash :server endpoint) server
+                   (gethash :client-records endpoint) nil
+                   (gethash :server-records endpoint) nil
+                   (gethash :read-states endpoint)
+                   (make-hash-table :test (function equal))
+                   (gethash :write-states endpoint)
+                   (make-hash-table :test (function equal))
+                   (gethash :application-data endpoint) nil
+                   (gethash :certificate-verify-count endpoint) 0
+                   (gethash :client endpoint)
+                   (make-tls13-client-driver
+                    :provider provider :hostname "server.test"
+                    :alpn '("http/1.1")
+                    :cipher-suites (or client-cipher-suites (vector suite))
+                    :supported-groups (if hello-retry-p
+                                          '(#x001d #x0017)
+                                          '(#x001d))
+                    :trust-anchors (list anchor) :now now :ticket-store ticket-store
+                    :verify-certificate-verify
+                    (lambda (message)
+                      (declare (ignore message))
+                      (incf (gethash :certificate-verify-count endpoint)))
+                    :transport-write
+                    (lambda (driver wire)
+                      (declare (ignore driver))
+                      (setf (gethash :client-records endpoint)
+                            (nconc (gethash :client-records endpoint)
+                                   (list (copy-seq wire)))))
+                    :transport-read
+                    (lambda (driver)
+                      (declare (ignore driver))
+                      (unless (gethash :server-records endpoint)
+                        (loop while (gethash :client-records endpoint)
+                              for wire = (pop (gethash :client-records endpoint))
+                              do (process-client-record endpoint wire)))
+                      (pop (gethash :server-records endpoint)))))
+             endpoint)))
+      (let* ((full (make-endpoint))
+             (client (gethash :client full)))
+        (tls13-client-driver-connect client)
+        (funcall check-case
+                 (eq (cl-tls-kit::tls13-client-driver-state client) :connected)
+                 "memory client completes a full TLS handshake over TLS records")
+        (funcall check-case
+                 (and (eql (not (null hello-retry-p))
+                           (cl-tls-kit::tls13-client-driver-hello-retry-request-received
+                            client))
+                      (or (not hello-retry-p)
+                          (and (= (cl-tls-kit::tls13-client-driver-suite client) suite)
+                               (eq (cl-tls-kit::tls13-client-driver-hash client)
+                                   :sha384))))
+                 "full handshake uses the expected HelloRetryRequest suite hash")
+        (tls13-client-driver-read-record client)
+        (funcall check-case
+                 (and (gethash :ticket-issued full)
+                      (gethash :handshake-complete full)
+                      (not (gethash :resumed full)))
+                 "full handshake delivers NewSessionTicket after client Finished")
+        (funcall check-case
+                 (= (cl-tls-kit::%tls13-ticket-store-count ticket-store) 1)
+                 "client driver stores the received session ticket")
+        (funcall check-case
+                 (= (gethash :certificate-verify-count full) 1)
+                 "client driver verifies CertificateVerify on the full handshake")
+        (let* ((resumed (make-endpoint))
+               (resumed-client (gethash :client resumed)))
+          (tls13-client-driver-connect resumed-client)
+          (let* ((hello (cl-tls-kit::tls13-client-driver-client-hello resumed-client))
+                 (psk (find 41 (tls13-client-hello-extensions hello)
+                            :key (function tls-extension-type))))
+            (funcall check-case psk
+                     "second ClientHello offers the stored ticket as a PSK"))
+          (tls13-client-driver-read-record resumed-client)
+          (funcall check-case
+                   (and (tls13-client-driver-resumed-p resumed-client)
+                        (gethash :handshake-complete resumed)
+                        (gethash :resumed resumed))
+                   "server and client complete the second handshake with PSK resumption")
+          (funcall check-case
+                   (and (eql (not (null hello-retry-p))
+                             (cl-tls-kit::tls13-client-driver-hello-retry-request-received
+                              resumed-client))
+                        (or (not hello-retry-p)
+                            (and (= (cl-tls-kit::tls13-client-driver-suite resumed-client)
+                                    suite)
+                                 (eq (cl-tls-kit::tls13-client-driver-hash resumed-client)
+                                     :sha384))))
+                   "resumed handshake uses the expected HelloRetryRequest suite hash")
+          (funcall check-case
+                   (zerop (gethash :certificate-verify-count resumed))
+                   "resumed handshake omits CertificateVerify")
+          (let* ((payload #(99 108 105 101 110 116 45 100 97 116 97))
+                 (reply nil))
+            (tls13-client-driver-write resumed-client payload)
+            (setf reply (tls13-client-driver-read-record resumed-client))
+            (funcall check-case
+                     (equalp (first (gethash :application-data resumed)) payload)
+                     "server receives encrypted client application data")
+            (funcall check-case
+                     (and reply
+                          (= (tls-plaintext-content-type reply) 23)
+                          (equalp (tls-plaintext-fragment reply) payload))
+                     "client receives the encrypted application-data response"))))
+      t)))
+
+(defun %server-driver-test-psk-client-hello
+    (provider ticket identity age now &key corrupt-binder-p remove-psk-modes-p
+                                      (cipher-suites #( #x1301 #x1302 #x1303 #x1304)))
+  (multiple-value-bind (client outgoing)
+      (%server-driver-test-client provider :alpn '("http/1.1")
+                                  :cipher-suites cipher-suites :trust-anchors nil
+                                  :now now)
+    (multiple-value-bind (ignored hello)
+        (%server-driver-test-client-hello client outgoing)
+      (declare (ignore ignored))
+      (let* ((hash (cl-tls-kit::tls13-cipher-suite-hash (getf ticket :suite)))
+             (hash-length (length (cl-tls-kit::tls13-empty-hash provider hash)))
+             (zero-binder (make-array hash-length :element-type '(unsigned-byte 8)
+                                      :initial-element 0))
+             (identity-entry
+               (cl-tls-kit::%cat
+                (cl-tls-kit::%encode-vector identity 2 :minimum 1)
+                (%server-driver-test-u32 age)))
+             (identities (cl-tls-kit::%encode-vector identity-entry 2 :minimum 7))
+             (binder-entry
+               (cl-tls-kit::%cat (vector hash-length) zero-binder))
+             (binders (cl-tls-kit::%encode-vector binder-entry 2 :minimum 33))
+             (psk-data (cl-tls-kit::%cat identities binders))
+             (extensions
+               (append
+                (remove-if
+                 (lambda (extension)
+                   (member (tls-extension-type extension) '(41 45)))
+                 (tls13-client-hello-extensions hello))
+                (unless remove-psk-modes-p
+                  (list (make-tls-extension 45 #(1 1))))
+                (list (make-tls-extension 41 psk-data))))
+             (psk-hello
+               (make-tls13-client-hello
+                (tls13-client-hello-legacy-version hello)
+                (tls13-client-hello-random hello)
+                (tls13-client-hello-session-id hello)
+                cipher-suites
+                extensions))
+             (wire (encode-handshake 1 psk-hello))
+             (decoded (decode-handshake wire))
+             (psk-extension
+               (find 41 (tls13-client-hello-extensions decoded)
+                     :key #'tls-extension-type))
+             (prefix-length
+               (progn
+                 (unless psk-extension
+                   (error "Test ClientHello has no pre_shared_key extension"))
+                 (cl-tls-kit::%tls13-server-psk-prefix-length wire)))
+             (early-secret (cl-tls-kit:tls13-early-secret
+                            provider hash (getf ticket :psk)))
+             (binder-key
+               (cl-tls-kit:tls13-derive-secret
+                provider hash early-secret "res binder"
+                (cl-tls-kit::tls13-empty-hash provider hash)))
+             (finished-key (cl-tls-kit:tls13-finished-key
+                            provider hash binder-key))
+             (binder
+               (cl-tls-kit:tls13-compute-finished-verify-data
+                provider hash finished-key
+                (funcall (cl-tls-kit::tls13-crypto-provider-digest provider)
+                         hash (subseq wire 0 prefix-length)))))
+        (unless (= (length binder) hash-length)
+          (error "Test binder has an unexpected hash length"))
+        (replace wire binder :start1 (- (length wire) hash-length))
+        (when corrupt-binder-p
+          (setf (aref wire (1- (length wire)))
+                (logxor (aref wire (1- (length wire))) 1)))
+        (values client wire)))))
+
+(defun %server-driver-test-complete-resumed-handshake
+    (provider server client client-hello-wire ticket-fields server-events check-case)
+  (let* ((send-events (%server-driver-test-events server-events :send))
+         (server-hello-wire
+           (getf (find-if (lambda (event) (= (aref (getf event :wire) 0) 2))
+                          send-events)
+                 :wire))
+         (encrypted-extensions-wire
+           (getf (find-if (lambda (event) (= (aref (getf event :wire) 0) 8))
+                          send-events)
+                 :wire))
+         (server-finished-wire
+           (getf (find-if (lambda (event) (= (aref (getf event :wire) 0) 20))
+                          send-events)
+                 :wire))
+         (server-hello (decode-handshake server-hello-wire))
+         (share (decode-key-share-server-extension
+                 (tls-extension-data
+                  (find 51 (tls13-server-hello-extensions server-hello)
+                        :key #'tls-extension-type))))
+         (group (car share))
+         (private (cl-tls-kit::tls13-client-driver-private-key client))
+         (shared-secret
+           (funcall (getf (cl-tls-kit::tls13-client-driver-key-exchange client)
+                          :shared-secret)
+                    group private (cdr share)))
+         (suite (tls13-server-hello-cipher-suite server-hello))
+         (hash (cl-tls-kit::tls13-cipher-suite-hash suite))
+         (server-hello-transcript
+           (cl-tls-kit::%cat client-hello-wire server-hello-wire))
+         (server-hello-hash
+           (funcall (cl-tls-kit::tls13-crypto-provider-digest provider)
+                    hash server-hello-transcript))
+         (early-secret
+           (cl-tls-kit:tls13-early-secret provider hash (getf ticket-fields :psk)))
+         (handshake-secret
+           (cl-tls-kit:tls13-handshake-secret provider hash early-secret shared-secret))
+         (client-secret
+           (cl-tls-kit:tls13-traffic-secret provider hash handshake-secret
+                                            :client server-hello-hash))
+         (server-secret
+           (cl-tls-kit:tls13-traffic-secret provider hash handshake-secret
+                                            :server server-hello-hash))
+         (server-finished-key
+           (cl-tls-kit:tls13-finished-key provider hash server-secret))
+         (client-finished-key
+           (cl-tls-kit:tls13-finished-key provider hash client-secret))
+         (transcript-before-server-finished
+           (cl-tls-kit::%cat client-hello-wire server-hello-wire
+                             encrypted-extensions-wire))
+         (server-finished-hash
+           (funcall (cl-tls-kit::tls13-crypto-provider-digest provider)
+                    hash transcript-before-server-finished))
+         (server-finished (decode-handshake server-finished-wire)))
+    (funcall check-case
+             (equalp (tls13-finished-verify-data server-finished)
+                     (cl-tls-kit:tls13-compute-finished-verify-data
+                      provider hash server-finished-key server-finished-hash))
+             "resumed client verifies the server Finished")
+    (funcall check-case
+             (and (notany (lambda (event)
+                            (member (aref (getf event :wire) 0) '(11 15)))
+                          send-events)
+                  (find :secret server-events :key (lambda (event) (getf event :type))))
+             "resumed server flight omits Certificate and CertificateVerify")
+    (let* ((transcript-through-server-finished
+             (cl-tls-kit::%cat transcript-before-server-finished
+                               server-finished-wire))
+           (client-finished-hash
+             (funcall (cl-tls-kit::tls13-crypto-provider-digest provider)
+                      hash transcript-through-server-finished))
+           (client-finished-wire
+             (encode-handshake
+              20 (make-tls13-finished
+                  (cl-tls-kit:tls13-compute-finished-verify-data
+                   provider hash client-finished-key client-finished-hash)))))
+      (multiple-value-bind (returned events)
+          (tls13-server-driver-step server client-finished-wire :level :handshake)
+        (setf server returned)
+        (funcall check-case
+                 (and (%server-driver-test-event events :handshake-complete)
+                      (getf (%server-driver-test-event events :handshake-complete)
+                            :resumed-p))
+                 "valid PSK handshake completes as resumed")))))
+
+(defun %server-driver-test-with-signature-counter (function)
+  (let* ((package (or (find-package "CRYPTO-KIT")
+                      (find-package "CL-CRYPTO-KIT")))
+         (symbol (and package (find-symbol "SIGN-MESSAGE" package)))
+         (original (and symbol (fboundp symbol) (symbol-function symbol)))
+         (calls 0))
+    (unless original
+      (error "cl-crypto-kit does not provide SIGN-MESSAGE"))
+    (unwind-protect
+         (progn
+           (setf (symbol-function symbol)
+                 (lambda (&rest arguments)
+                   (incf calls)
+                   (apply original arguments)))
+           (funcall function (lambda () calls)))
+      (setf (symbol-function symbol) original))))
+
+(defun run-server-driver-tests ()
+  (unless (find-package "CRYPTO-KIT")
+    (format t "TLS 1.3 server driver: SKIPPED (cl-crypto-kit unavailable)~%")
+    (return-from run-server-driver-tests :skipped))
+  (let* ((openssl (or (uiop:getenv "OPENSSL") "openssl"))
+         (directory
+           (merge-pathnames
+            (format nil "cl-tls-kit-server-driver-~D-~D/"
+                    (get-universal-time) (random 1000000000))
+            (uiop:temporary-directory)))
+         (certificate (namestring (merge-pathnames "server.crt" directory)))
+         (key-path (namestring (merge-pathnames "server.key" directory)))
+         (provider (make-cl-crypto-kit-provider))
+         (now (+ (get-universal-time) 60))
+         (ticket-key-store (make-tls13-server-ticket-key-store))
+         (selected 0)
+         (assertions 0)
+         (chain nil)
+         (private-key nil)
+         (anchor nil))
+    (ensure-directories-exist directory)
+    (unwind-protect
+         (progn
+           (funcall (symbol-function (find-symbol "%OPENSSL-E2E-CERTIFICATE"
+                                                 :cl-tls-kit/test))
+                    openssl certificate key-path "server.test" 1 :key-type :ecdsa)
+           (setf chain
+                 (list (cl-tls-kit:pem-block-der
+                        (first (cl-tls-kit:pem-decode
+                                (uiop:read-file-string certificate)))))
+                 private-key
+                 (funcall (symbol-function
+                           (find-symbol "%OPENSSL-E2E-ECDSA-PRIVATE-KEY"
+                                        :cl-tls-kit/test))
+                          openssl key-path)
+                 anchor (cl-tls-kit.x509:parse-certificate-der (first chain)))
+           (%server-driver-test-with-signature-counter
+            (lambda (signature-calls)
+              (labels ((check-case (condition message)
+                         (incf assertions)
+                         (check condition message))
+                       (new-server (&key (groups '(#x001d #x0017))
+                             (cipher-suites #( #x1301 #x1302 #x1303 #x1304)))
+                         (%server-driver-test-server
+                          provider chain private-key ticket-key-store
+                          (lambda () now) :groups groups
+                          :cipher-suites cipher-suites)))
+                (let ((client-hello nil)
+                      (client-wire nil))
+                  (multiple-value-bind (client outgoing)
+                      (%server-driver-test-client provider :trust-anchors (list anchor)
+                                                  :now now)
+                    (multiple-value-bind (wire hello)
+                        (%server-driver-test-client-hello client outgoing)
+                      (setf client-hello hello
+                            client-wire wire)))
+                  (let* ((duplicate-hello
+                           (%server-driver-test-duplicate-extension-wire
+                            client-wire 13))
+                         (no-group-hello
+                           (%server-driver-test-rewrite-client-hello
+                            client-hello 10 (%server-driver-test-u16-list '(#x0019))))
+                         (no-group-wire (encode-handshake 1 no-group-hello))
+                         (no-signature-hello
+                           (%server-driver-test-rewrite-client-hello
+                            client-hello 13 (%server-driver-test-u16-list '(#x0804)))))
+                    (let* ((decoded (decode-handshake no-group-wire))
+                           (versions
+                             (find 43 (tls13-client-hello-extensions decoded)
+                                   :key #'tls-extension-type))
+                           (groups
+                             (find 10 (tls13-client-hello-extensions decoded)
+                                   :key #'tls-extension-type)))
+                      (check-case
+                       (= (tls13-client-hello-legacy-version decoded) #x0303)
+                       "unsupported-group fixture retains TLS 1.3 legacy_version")
+                      (check-case (equalp (tls-extension-data versions) #(2 3 4))
+                                  "unsupported-group fixture retains TLS 1.3 supported_versions")
+                      (check-case
+                       (equalp (tls-extension-data groups)
+                               (%server-driver-test-u16-list '(#x0019)))
+                       "unsupported-group fixture contains only group 0x0019"))
+                    (let ((probe (new-server)))
+                      (handler-case
+                          (let* ((hello
+                                   (cl-tls-kit::%tls13-server-parse-client-hello
+                                    no-group-wire))
+                                 (fields
+                                   (cl-tls-kit::%tls13-server-clienthello-fields
+                                    hello)))
+                            (cl-tls-kit::%tls13-server-select-group
+                             probe (getf fields :groups))
+                            (check-case nil
+                                        "unsupported-group selection should fail"))
+                        (cl-tls-kit:tls13-server-driver-error (condition)
+                          (check-case
+                           (and (eq
+                                 (cl-tls-kit:tls13-server-driver-error-reason condition)
+                                 :no-common-supported-group)
+                                (= (cl-tls-kit::%tls13-server-driver-error-alert
+                                    condition)
+                                   40))
+                           (format nil "unsupported-group selection has reason ~S and alert ~D"
+                                   (cl-tls-kit:tls13-server-driver-error-reason condition)
+                                   (cl-tls-kit::%tls13-server-driver-error-alert
+                                    condition))))))
+                    (incf selected)
+                    (%server-driver-test-assert-client-hello-rejected
+                     "duplicate extension" (new-server) duplicate-hello 47 #'check-case)
+                    (incf selected)
+                    (%server-driver-test-assert-client-hello-rejected
+                     "unsupported group" (new-server)
+                     no-group-wire 40 #'check-case)
+                    (incf selected)
+                    (%server-driver-test-assert-client-hello-rejected
+                     "unsupported signature scheme" (new-server)
+                     (encode-handshake 1 no-signature-hello) 40 #'check-case)
+                    (progn
+                     (incf selected)
+                     (%server-driver-test-assert-client-hello-rejected
+                      "malformed supported_groups" (new-server)
+                      (encode-handshake
+                       1 (%server-driver-test-rewrite-client-hello
+                          client-hello 10 #(0 3 #x00 #x1d #x00)))
+                      50 #'check-case)
+                     (incf selected)
+                     (%server-driver-test-assert-client-hello-rejected
+                      "missing key_share" (new-server)
+                      (encode-handshake 1
+                                        (%server-driver-test-rewrite-client-hello client-hello 51 :remove))
+                      109 #'check-case)
+                     (incf selected)
+                     (%server-driver-test-assert-client-hello-rejected
+                      "missing signature_algorithms" (new-server)
+                      (encode-handshake 1
+                                        (%server-driver-test-rewrite-client-hello client-hello 13 :remove))
+                      109 #'check-case)
+                     (check-case (zerop (funcall signature-calls))
+                                 "doomed ClientHellos invoke no signing operation"))))
+                (let ((values (make-array 32767)))
+                  (dotimes (index (1- (length values)))
+                    (setf (aref values index) index))
+                  (setf (aref values (1- (length values)))
+                        (aref values (- (length values) 2)))
+                  (incf selected)
+                  (check-case
+                   (not (cl-tls-kit::%tls13-server-unique-p (coerce values 'list)))
+                   "long negotiation vector ending in a duplicate is rejected"))
+                (multiple-value-bind (server client alpn ticket hrr-count
+                                      client-cv-count events outgoing)
+                    (%server-driver-test-memory-handshake
+                     provider chain private-key anchor ticket-key-store now)
+                  (declare (ignore events outgoing))
+                  (check-case (eq (cl-tls-kit::tls13-client-driver-state client) :connected)
+                              "memory client completes a full TLS 1.3 handshake")
+                  (check-case (eq (cl-tls-kit::tls13-server-driver-state server) :complete)
+                              "memory server completes the client Finished")
+                  (check-case (equal alpn "http/1.1")
+                              "server selects its preferred offered ALPN")
+                  (check-case (equal (cl-tls-kit:tls13-client-driver-negotiated-alpn client)
+                                     "http/1.1")
+                              "client validates the EncryptedExtensions ALPN")
+                  (check-case (= client-cv-count 1)
+                              "cl-tls-kit client processes CertificateVerify")
+                  (check-case (and ticket (getf ticket :identity)
+                                   (plusp (length (getf ticket :identity))))
+                              "server issues a resumable NewSessionTicket")
+                  (check-case (zerop hrr-count)
+                              "matching initial key share avoids HelloRetryRequest")
+                  (check-case (= (funcall signature-calls) 1)
+                              "a valid full handshake signs CertificateVerify once")
+                  (let* ((ticket-fields
+                           (cl-tls-kit::%tls13-server-open-ticket
+                            server (getf ticket :identity)))
+                         (resumption-client nil)
+                         (resumption-wire nil)
+                         (resume-server (new-server)))
+                    (multiple-value-setq (resumption-client resumption-wire)
+                      (%server-driver-test-psk-client-hello
+                       provider ticket-fields (getf ticket :identity)
+                       (getf ticket-fields :age-add) now))
+                    (incf selected)
+                    (let ((before (%server-driver-test-state-snapshot resume-server)))
+                      (multiple-value-bind (returned events)
+                          (tls13-server-driver-step
+                           resume-server resumption-wire :level :initial)
+                        (setf resume-server returned)
+                        (%server-driver-test-complete-resumed-handshake
+                         provider resume-server resumption-client resumption-wire
+                         ticket-fields events #'check-case)
+                        (progn
+                          (check-case (= (funcall signature-calls) 1)
+                                      "PSK resumption skips CertificateVerify signing")
+                          (let ((missing-modes-server (new-server)))
+                            (multiple-value-bind (ignored missing-modes-wire)
+                                (%server-driver-test-psk-client-hello
+                                 provider ticket-fields (getf ticket :identity)
+                                 (getf ticket-fields :age-add) now
+                                 :remove-psk-modes-p t)
+                              (declare (ignore ignored))
+                              (incf selected)
+                              (%server-driver-test-assert-client-hello-rejected
+                               "PSK missing psk_key_exchange_modes"
+                               missing-modes-server missing-modes-wire 109 #'check-case)
+                              (check-case (= (funcall signature-calls) 1)
+                                          "PSK ClientHello without modes is rejected before signing"))))
+                        (check-case (not (equalp before
+                                                 (%server-driver-test-state-snapshot
+                                                  resume-server)))
+                                    "valid PSK ClientHello advances server state")))
+                    (progn
+                      (let ((hash-mismatch-server
+                              (new-server :cipher-suites #( #x1302))))
+                        (multiple-value-bind (ignored hash-mismatch-wire)
+                            (%server-driver-test-psk-client-hello
+                             provider ticket-fields (getf ticket :identity)
+                             (getf ticket-fields :age-add) now
+                             :cipher-suites #( #x1302))
+                          (declare (ignore ignored))
+                          (incf selected)
+                          (%server-driver-test-assert-client-hello-rejected
+                           "PSK hash mismatch" hash-mismatch-server hash-mismatch-wire
+                           47 #'check-case)
+                          (check-case (= (funcall signature-calls) 1)
+                                      "PSK with a different suite hash is rejected before signing")))
+                      (let ((bad-binder-server (new-server)))
+                        (multiple-value-bind (ignored bad-binder-wire)
+                            (%server-driver-test-psk-client-hello
+                             provider ticket-fields (getf ticket :identity)
+                             (getf ticket-fields :age-add) now :corrupt-binder-p t)
+                          (declare (ignore ignored))
+                          (incf selected)
+                          (%server-driver-test-assert-client-hello-rejected
+                           "bad PSK binder" bad-binder-server bad-binder-wire 51 #'check-case)
+                          (check-case (= (funcall signature-calls) 1)
+                                      "invalid PSK binder is rejected before signing"))))
+                    (let* ((expired-now (+ now (getf ticket-fields :lifetime) 1))
+                           (expired-server
+                             (%server-driver-test-server
+                              provider chain private-key ticket-key-store
+                              (lambda () expired-now)))
+                           (expired-age
+                             (+ (getf ticket-fields :age-add)
+                                (* 1000 (- expired-now
+                                           (getf ticket-fields :issued))))))
+                      (multiple-value-bind (ignored expired-wire)
+                          (%server-driver-test-psk-client-hello
+                           provider ticket-fields (getf ticket :identity)
+                           expired-age expired-now)
+                        (declare (ignore ignored))
+                        (incf selected)
+                        (%server-driver-test-assert-client-hello-rejected
+                         "expired PSK ticket" expired-server expired-wire 47 #'check-case)
+                        (check-case (= (funcall signature-calls) 1)
+                                    "expired ticket is rejected before signing")))
+                    (let* ((unknown-identity (copy-seq (getf ticket :identity)))
+                           (unknown-server (new-server)))
+                      (setf (aref unknown-identity 0)
+                            (logxor (aref unknown-identity 0) 1))
+                      (multiple-value-bind (ignored unknown-wire)
+                          (%server-driver-test-psk-client-hello
+                           provider ticket-fields unknown-identity
+                           (getf ticket-fields :age-add) now)
+                        (declare (ignore ignored))
+                        (incf selected)
+                        (multiple-value-bind (returned events)
+                            (tls13-server-driver-step
+                             unknown-server unknown-wire :level :initial)
+                          (setf unknown-server returned)
+                          (let ((sent-types
+                                  (mapcar (lambda (event)
+                                            (aref (getf event :wire) 0))
+                                          (%server-driver-test-events events :send))))
+                            (check-case (and (null (%server-driver-test-event events :alert))
+                                             (member 11 sent-types)
+                                             (member 15 sent-types))
+                                        "unknown PSK identity falls back to certificate authentication"))
+                          (check-case
+                           (and (eq (cl-tls-kit::tls13-server-driver-state unknown-server)
+                                    :awaiting-client-finished)
+                                (not (cl-tls-kit::tls13-server-driver-resumed-p
+                                      unknown-server)))
+                           "unknown PSK identity begins a full handshake")
+                          (check-case (= (funcall signature-calls) 2)
+                                      "unknown PSK fallback signs CertificateVerify once"))))))
+                (incf selected)
+                (multiple-value-bind (server client alpn ticket hrr-count
+                                      client-cv-count events outgoing)
+                    (%server-driver-test-memory-handshake
+                     provider chain private-key anchor ticket-key-store now
+                     :groups '(#x0017))
+                  (declare (ignore server alpn ticket events outgoing))
+                  (check-case (= hrr-count 1)
+                              "server requests the mutually supported P-256 share")
+                  (check-case (eq (cl-tls-kit::tls13-client-driver-state client) :connected)
+                              "memory client completes a HelloRetryRequest handshake")
+                  (check-case (= client-cv-count 1)
+                              "client verifies CertificateVerify after HelloRetryRequest")
+                  (check-case (= (funcall signature-calls) 3)
+                              "HelloRetryRequest full handshake signs once"))
+                (progn
+                  (incf selected)
+                  (%server-driver-test-client-server-resumption-roundtrip
+                   provider chain private-key anchor ticket-key-store now (function check-case))
+                  (check-case (= (funcall signature-calls) 4)
+                              "client and server drivers resume without another signature")
+                  (incf selected)
+                  (%server-driver-test-client-server-resumption-roundtrip
+                   provider chain private-key anchor ticket-key-store now (function check-case)
+                   :suite #x1302)
+                  (check-case (= (funcall signature-calls) 5)
+                              "SHA-384 client and server drivers resume without another signature")
+                  (incf selected)
+                  (%server-driver-test-client-server-resumption-roundtrip
+                   provider chain private-key anchor ticket-key-store now (function check-case)
+                   :suite #x1302 :hello-retry-p t
+                   :client-cipher-suites #( #x1301 #x1302))
+                  (check-case (= (funcall signature-calls) 6)
+                              "SHA-384 HelloRetryRequest resumption signs only the full handshake")
+                  (check-case (plusp selected)
+                              "server driver selected nonzero test cases"))
+                (check-case (plusp assertions)
+                            "server driver executed nonzero assertions")
+                (format t "TLS 1.3 server driver: selected test count: ~D; assertions: ~D~%"
+                        selected assertions)
+                t))))
+      (when (probe-file certificate) (ignore-errors (delete-file certificate)))
+      (when (probe-file key-path) (ignore-errors (delete-file key-path)))
+      (when (probe-file directory)
+        (ignore-errors (uiop:delete-directory-tree directory :validate t))))
+    (check (not (probe-file directory))
+           "server driver certificate directory is removed after tests")
+    t))

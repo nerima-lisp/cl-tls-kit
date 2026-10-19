@@ -520,3 +520,43 @@
                      :second-certificate :second-key
                      :leaf-certificate :leaf-key :chain))
         (ignore-errors (delete-file (getf chain-material key)))))))
+
+(defun %openssl-e2e-ecdsa-private-key (openssl path)
+  (let ((der-path (concatenate 'string path ".der")))
+    (unwind-protect
+         (progn
+           (multiple-value-bind (output exit-code)
+               (%openssl-e2e-run
+                openssl
+                (list "ec" "-in" path "-outform" "DER" "-out" der-path))
+             (declare (ignore output))
+             (unless (zerop exit-code)
+               (error "OpenSSL could not export the ECDSA test key")))
+           (let* ((der
+                    (with-open-file
+                        (stream der-path :direction :input
+                                :element-type '(unsigned-byte 8))
+                      (let ((bytes (make-array (file-length stream)
+                                               :element-type '(unsigned-byte 8))))
+                        (unless (= (read-sequence bytes stream) (length bytes))
+                          (error "OpenSSL returned a truncated ECDSA test key"))
+                        bytes)))
+                  (node (cl-tls-kit:der-decode der))
+                  (children (cl-tls-kit:der-node-children node))
+                  (scalar-node (second children))
+                  (scalar (and scalar-node
+                               (= (cl-tls-kit:der-node-tag scalar-node) 4)
+                               (cl-tls-kit:der-node-value scalar-node)))
+                  (crypto-package (find-package "CRYPTO-KIT"))
+                  (constructor (and crypto-package
+                                    (find-symbol "MAKE-EC-PRIVATE-KEY"
+                                                 crypto-package))))
+             (unless (and (= (cl-tls-kit:der-node-tag node) 16)
+                          scalar
+                          (= (length scalar) 32)
+                          constructor
+                          (fboundp constructor))
+               (error "OpenSSL returned an invalid P-256 test key"))
+             (funcall constructor :p256 scalar)))
+      (when (probe-file der-path)
+        (delete-file der-path)))))
