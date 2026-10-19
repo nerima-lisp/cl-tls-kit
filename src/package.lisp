@@ -152,7 +152,9 @@
    #:quic-tls-boundary-emit-cipher-suite #:quic-tls-boundary-emit-alpn
    #:quic-tls-boundary-send-alert #:quic-tls-boundary-send-close-notify
    #:quic-tls-boundary-send-key-update #:quic-tls-boundary-close-notify-p
-   #:quic-tls-boundary-alert-p #:quic-tls-boundary-key-update-p))
+   #:quic-tls-boundary-alert-p #:quic-tls-boundary-key-update-p
+   #:make-tls13-ticket-store #:tls13-ticket-store #:tls13-ticket-store-p
+   #:tls13-client-driver-resumed-p))
 
 (defpackage #:cl-tls-kit.x509
   (:use #:cl #:cl-tls-kit)

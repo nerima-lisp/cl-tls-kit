@@ -52,8 +52,16 @@
           default = pkgs.mkShell {
             packages = [
               pkgs.sbcl
+              pkgs.sbclPackages.alexandria
+              pkgs.sbclPackages.bordeaux-threads
+              pkgs.sbclPackages.global-vars
+              pkgs.sbclPackages.trivial-features
+              pkgs.sbclPackages.trivial-garbage
               cl-weave.packages.${system}.default
             ];
+            shellHook = ''
+              export CL_SOURCE_REGISTRY="$PWD//:${cl-crypto-kit.outPath}/:${pkgs.sbclPackages.alexandria}/:${pkgs.sbclPackages.global-vars}/:${pkgs.sbclPackages.trivial-features}/:${pkgs.sbclPackages.trivial-garbage}/:${pkgs.sbclPackages.bordeaux-threads}/"
+            '';
           };
         }
       );
@@ -63,7 +71,15 @@
             pname = "cl-tls-kit-tests";
             version = "0.1.0";
             src = self;
-            nativeBuildInputs = [ pkgs.sbcl pkgs.openssl ];
+            nativeBuildInputs = [
+              pkgs.sbcl
+              pkgs.openssl
+              pkgs.sbclPackages.alexandria
+              pkgs.sbclPackages.bordeaux-threads
+              pkgs.sbclPackages.global-vars
+              pkgs.sbclPackages.trivial-features
+              pkgs.sbclPackages.trivial-garbage
+            ];
             dontConfigure = true;
             dontBuild = true;
             doCheck = true;
@@ -73,7 +89,7 @@
               export XDG_CACHE_HOME="$TMPDIR/cache"
               mkdir -p "$HOME" "$XDG_CACHE_HOME"
               export OPENSSL="${pkgs.openssl}/bin/openssl"
-              export CL_SOURCE_REGISTRY="$PWD//:${cl-crypto-kit.outPath}/"
+              export CL_SOURCE_REGISTRY="$PWD//:${cl-crypto-kit.outPath}/:${pkgs.sbclPackages.alexandria}/:${pkgs.sbclPackages.global-vars}/:${pkgs.sbclPackages.trivial-features}/:${pkgs.sbclPackages.trivial-garbage}/:${pkgs.sbclPackages.bordeaux-threads}/"
               ${pkgs.sbcl}/bin/sbcl --noinform --non-interactive \
                 --load t/crypto-provider-check.lisp
               ${pkgs.sbcl}/bin/sbcl --noinform --non-interactive \
@@ -93,10 +109,18 @@
         let
           test = pkgs.writeShellApplication {
             name = "cl-tls-kit-test";
-            runtimeInputs = [ pkgs.sbcl pkgs.openssl ];
+            runtimeInputs = [
+              pkgs.sbcl
+              pkgs.openssl
+              pkgs.sbclPackages.alexandria
+              pkgs.sbclPackages.bordeaux-threads
+              pkgs.sbclPackages.global-vars
+              pkgs.sbclPackages.trivial-features
+              pkgs.sbclPackages.trivial-garbage
+            ];
             text = ''
               export OPENSSL="${pkgs.openssl}/bin/openssl"
-              export CL_SOURCE_REGISTRY="$PWD//:${cl-crypto-kit.outPath}/"
+              export CL_SOURCE_REGISTRY="$PWD//:${cl-crypto-kit.outPath}/:${pkgs.sbclPackages.alexandria}/:${pkgs.sbclPackages.global-vars}/:${pkgs.sbclPackages.trivial-features}/:${pkgs.sbclPackages.trivial-garbage}/:${pkgs.sbclPackages.bordeaux-threads}/"
               sbcl --noinform --non-interactive --eval '(require :asdf)' --eval '(asdf:test-system "cl-tls-kit")'
             '';
           };

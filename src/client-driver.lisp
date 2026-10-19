@@ -10,6 +10,7 @@
   provider key-exchange on-send verify-certificate-verify
   transport-read transport-write transport-close
   hostname alpn negotiated-alpn cipher-suites supported-groups signature-algorithms
+  ticket-store offered-ticket resumed-p resumption-master-secret
   client-hello private-key selected-group last-sent-key-share-group
   hello-retry-request-received hash suite state
   certificate-chain peer-certificate trust-anchors now verify-signature
@@ -25,20 +26,183 @@
 ;; Certificate chains and their per-certificate extensions fit within this
 ;; policy limit while fragmented input cannot consume the uint24 wire maximum.
 (defconstant +tls13-max-handshake-body-length+ (* 1024 1024))
+(progn
+  (progn
+  (defconstant +tls13-ticket-max-lifetime+ 604800)
+  (defconstant +tls13-ticket-max-per-key+ 4)
+  (defconstant +tls13-ticket-max-total+ 64))
+  (defstruct (%tls13-session-ticket
+              (:constructor %make-tls13-session-ticket
+                  (hostname alpn identity psk hash lifetime age-add created-at order)))
+    hostname alpn identity psk hash lifetime age-add created-at order)
+  (defmethod print-object ((ticket %tls13-session-ticket) stream)
+    (print-unreadable-object (ticket stream :type t)))
+  (defstruct (tls13-ticket-store
+              (:constructor %make-tls13-ticket-store (clock mutex)))
+    (clock nil :read-only t)
+    (mutex nil :read-only t)
+    (entries (make-hash-table :test (function equal)))
+    (next-order 0))
+  (defmethod print-object ((store tls13-ticket-store) stream)
+    (print-unreadable-object (store stream :type t)))
+  (defmethod print-object ((driver tls13-client-driver) stream)
+    (print-unreadable-object (driver stream :type t)))
+  (defun %tls13-ticket-now-ms ()
+    (floor (* 1000 (get-internal-real-time)) internal-time-units-per-second))
+  (defun make-tls13-ticket-store (&key (clock (function %tls13-ticket-now-ms)))
+    "Create a thread-safe in-memory ticket store.
+
+CLOCK returns monotonic milliseconds. Tickets expire after their advertised
+lifetime, measured from when they are stored. The client does not store tickets
+whose advertised lifetimes exceed seven days, the TLS 1.3 maximum. Expiry is
+checked when a ticket is selected for ClientHello1. If the server requests a
+HelloRetryRequest, the driver retains that ticket for ClientHello2 even if it
+expires in between.
+
+The store matches tickets by normalized hostname (or no hostname) and the
+negotiated ALPN protocol (or no ALPN). It keeps at most four tickets per match
+and 64 total. When a limit is reached, it evicts the oldest ticket.
+
+Pass the same store as :TICKET-STORE to each client driver. Drivers store
+NewSessionTicket messages automatically. When a driver starts a connection, it
+removes one matching ticket from the store and does not put it back."
+    (unless (functionp clock)
+      (error "Ticket-store clock must be callable"))
+    (%make-tls13-ticket-store clock
+                              (bordeaux-threads:make-lock "TLS 1.3 ticket store")))
+  (defun %tls13-ticket-key (hostname alpn)
+    (list (and hostname (normalize-hostname hostname))
+          (and alpn (copy-seq alpn))))
+  (defun %tls13-ticket-expired-p (ticket now)
+    (>= (- now (%tls13-session-ticket-created-at ticket))
+        (* 1000 (%tls13-session-ticket-lifetime ticket))))
+  (defun %tls13-ticket-store-call (store function)
+    (bordeaux-threads:with-lock-held ((tls13-ticket-store-mutex store))
+      (funcall function)))
+  (progn
+  (defun %tls13-ticket-clear-secret (ticket)
+    (fill (%tls13-session-ticket-psk ticket) 0)
+    ticket)
+  (defun %tls13-ticket-store-count (store)
+    (loop for tickets being the hash-values of (tls13-ticket-store-entries store)
+          sum (length tickets)))
+  (defun %tls13-ticket-store-trim-key (store key)
+    (let* ((entries (tls13-ticket-store-entries store))
+           (tickets (gethash key entries))
+           (excess (- (length tickets) +tls13-ticket-max-per-key+)))
+      (when (plusp excess)
+        (dolist (ticket (subseq tickets 0 excess))
+          (%tls13-ticket-clear-secret ticket))
+        (setf (gethash key entries) (nthcdr excess tickets)))))
+  (defun %tls13-ticket-store-oldest (store)
+    (let ((oldest-key nil)
+          (oldest-ticket nil))
+      (maphash
+       (lambda (key tickets)
+         (dolist (ticket tickets)
+           (when (or (null oldest-ticket)
+                     (< (%tls13-session-ticket-order ticket)
+                        (%tls13-session-ticket-order oldest-ticket)))
+             (setf oldest-key key
+                   oldest-ticket ticket))))
+       (tls13-ticket-store-entries store))
+      (values oldest-key oldest-ticket)))
+  (defun %tls13-ticket-store-trim-total (store)
+    (let ((entries (tls13-ticket-store-entries store)))
+      (loop while (> (%tls13-ticket-store-count store) +tls13-ticket-max-total+)
+            do (multiple-value-bind (key oldest)
+                   (%tls13-ticket-store-oldest store)
+                 (let ((remaining (remove oldest (gethash key entries) :count 1)))
+                   (%tls13-ticket-clear-secret oldest)
+                   (if remaining
+                       (setf (gethash key entries) remaining)
+                       (remhash key entries)))))))
+  (defun %tls13-ticket-store-prune (store now)
+    (let ((entries (tls13-ticket-store-entries store)))
+      (dolist (key (loop for key being the hash-keys of entries collect key))
+        (let ((live (remove-if (lambda (ticket)
+                                 (let ((expired (%tls13-ticket-expired-p ticket now)))
+                                   (when expired (%tls13-ticket-clear-secret ticket))
+                                   expired))
+                               (gethash key entries))))
+          (if live
+              (setf (gethash key entries) live)
+              (remhash key entries)))))))
+  (defun %tls13-ticket-store-put
+    (store hostname alpn identity psk hash lifetime age-add &optional stored-at)
+  (unless (and (tls13-ticket-store-p store)
+               (%octets-p identity) (<= 1 (length identity) #xffff)
+               (%octets-p psk) (member hash (list :sha256 :sha384))
+               (= (length psk) (if (eq hash :sha384) 48 32))
+               (integerp lifetime) (<= 1 lifetime +tls13-ticket-max-lifetime+)
+               (typep age-add (list (quote integer) 0 #xffffffff)))
+    (error "Invalid TLS 1.3 ticket"))
+  (let* ((key (%tls13-ticket-key hostname alpn))
+         (ticket nil))
+    (%tls13-ticket-store-call
+     store
+     (lambda ()
+       (let* ((now (or stored-at (funcall (tls13-ticket-store-clock store))))
+              (order (incf (tls13-ticket-store-next-order store))))
+         (%tls13-ticket-store-prune store now)
+         (setf ticket
+               (%make-tls13-session-ticket
+                (first key) (second key) (copy-seq identity) (copy-seq psk)
+                hash lifetime age-add now order))
+         (setf (gethash key (tls13-ticket-store-entries store))
+               (append (gethash key (tls13-ticket-store-entries store))
+                       (list ticket)))
+         (%tls13-ticket-store-trim-key store key)
+         (%tls13-ticket-store-trim-total store))))
+    ticket))
+  (defun %tls13-ticket-store-take (store hostname alpn hashes)
+    (when store
+      (let ((key (%tls13-ticket-key hostname alpn)))
+        (%tls13-ticket-store-call
+         store
+         (lambda ()
+           (let* ((now (funcall (tls13-ticket-store-clock store)))
+                  (entries (tls13-ticket-store-entries store)))
+             (%tls13-ticket-store-prune store now)
+             (let* ((tickets (gethash key entries))
+                    (ticket (find-if
+                             (lambda (candidate)
+                               (member (%tls13-session-ticket-hash candidate) hashes))
+                             tickets)))
+               (when ticket
+                 (let ((remaining (remove ticket tickets :count 1)))
+                   (if remaining
+                       (setf (gethash key entries) remaining)
+                       (remhash key entries)))
+                 ticket)))))))))
 
 (progn
   (defvar *driver-transport-failure* nil)
   (defun %driver-fail (reason)
     (error 'tls13-client-driver-error :reason reason))
-  (defun %driver-close-transport (driver)
-    (unless (eq (tls13-client-driver-state driver) :closed)
-      (setf (tls13-client-driver-state driver) :closed)
-      (when (tls13-client-driver-transport-close driver)
-        (handler-case
-            (progn
-              (funcall (tls13-client-driver-transport-close driver) driver)
-              nil)
-          (error (condition) condition))))))
+  (defun %driver-close-transport (driver &optional sensitive-error-p)
+    (let ((ticket (tls13-client-driver-offered-ticket driver))
+          (state (tls13-client-driver-state driver)))
+      (when (or (not sensitive-error-p)
+                (and ticket
+                     (some #'plusp (%tls13-session-ticket-psk ticket)))
+                (member state '(:awaiting-server-hello
+                                :awaiting-encrypted-extensions
+                                :awaiting-certificate
+                                :awaiting-certificate-verify
+                                :awaiting-finished)))
+        (%driver-clear-offered-ticket-secret driver)
+        (unless (eq state :closed)
+          (setf (tls13-client-driver-state driver) :closed)
+          (when (tls13-client-driver-resumption-master-secret driver)
+            (fill (tls13-client-driver-resumption-master-secret driver) 0)
+            (setf (tls13-client-driver-resumption-master-secret driver) nil))
+          (when (tls13-client-driver-transport-close driver)
+            (handler-case
+                (progn
+                  (funcall (tls13-client-driver-transport-close driver) driver)
+                  nil)
+              (error (condition) condition))))))))
 
 (defun %driver-add-transcript (driver wire)
   (setf (tls13-client-driver-transcript driver)
@@ -98,8 +262,9 @@
                ((:unexpected-hrr :unexpected-message :unexpected-record) 10)
                (:missing-server-key-share 109)
                ((:unrequested-key-share-group :hrr-unsupported-group
-                 :hrr-repeated-group :unoffered-cipher-suite
-                 :downgrade-sentinel :invalid-key-share) 47)
+  :hrr-repeated-group :unoffered-cipher-suite :downgrade-sentinel
+  :invalid-key-share :unexpected-psk-identity :invalid-psk-identity
+  :psk-hash-mismatch :resumed-alpn-mismatch) 47)
                (:unexpected-alpn 120)
                ((:invalid-server-certificate :missing-server-certificate
                                              :certificate-verification-failed) 42)
@@ -186,6 +351,147 @@
       (setf (tls13-client-driver-private-key driver) private
             (tls13-client-driver-selected-group driver) group)
       (cons group public))))
+(progn
+  (defun %driver-take-session-ticket (driver)
+    (let* ((store (tls13-client-driver-ticket-store driver))
+           (hostname (tls13-client-driver-hostname driver))
+           (protocols (tls13-client-driver-alpn driver))
+           (hashes (remove-duplicates
+                    (map 'list #'tls13-cipher-suite-hash
+                         (tls13-client-driver-cipher-suites driver))))
+           (protocols (if (and (listp protocols) protocols)
+                          protocols
+                        (list nil))))
+      (loop for protocol in protocols
+            for ticket = (%tls13-ticket-store-take
+                          store hostname protocol hashes)
+            when ticket return ticket)))
+  (defun %driver-client-hello-with-psk-binder (driver hello ticket &optional allow-expired-p)
+    (let* ((store (tls13-client-driver-ticket-store driver))
+           (now (funcall (tls13-ticket-store-clock store))))
+      (flet ((without-psk (client-hello)
+                          (make-tls13-client-hello
+                           (tls13-client-hello-legacy-version client-hello)
+                           (tls13-client-hello-random client-hello)
+                           (tls13-client-hello-session-id client-hello)
+                           (tls13-client-hello-cipher-suites client-hello)
+                           (remove-if (lambda (extension)
+                                        (member (tls-extension-type extension) '(41 45)))
+                                      (tls13-client-hello-extensions client-hello)))))
+        (when (and (not allow-expired-p) (%tls13-ticket-expired-p ticket now)) (progn (%tls13-ticket-clear-secret ticket) (return-from %driver-client-hello-with-psk-binder (values (without-psk hello) nil))))
+        (let* ((hash (%tls13-session-ticket-hash ticket))
+               (psk (%tls13-session-ticket-psk ticket))
+               (binder-length (length psk))
+               (age
+ (mod (+ (max 0 (- now (%tls13-session-ticket-created-at ticket)))
+         (%tls13-session-ticket-age-add ticket))
+      (expt 2 32)))
+               (identity-entry
+                (%cat (%encode-vector (%tls13-session-ticket-identity ticket) 2 :minimum 1)
+                      (%u32 age)))
+               (identities (%encode-vector identity-entry 2 :minimum 7))
+               (binder-entry
+                (%cat (%hs-u8 binder-length)
+                      (make-array binder-length
+                                  :element-type '(unsigned-byte 8)
+                                  :initial-element 0)))
+               (binders (%encode-vector binder-entry 2 :minimum (1+ binder-length)))
+               (extension-data (%cat identities binders))
+               (extensions
+                (append (remove-if (lambda (extension)
+                                     (= (tls-extension-type extension) 41))
+                                   (tls13-client-hello-extensions hello))
+                        (list (make-tls-extension 41 extension-data))))
+               (provisional
+                (make-tls13-client-hello
+                 (tls13-client-hello-legacy-version hello)
+                 (tls13-client-hello-random hello)
+                 (tls13-client-hello-session-id hello)
+                 (tls13-client-hello-cipher-suites hello)
+                 extensions))
+               (wire (encode-handshake 1 provisional))
+               (truncated (subseq wire 0 (- (length wire) (+ 3 binder-length))))
+               (transcript
+                (concatenate '(vector (unsigned-byte 8))
+                             (tls13-client-driver-transcript driver) truncated))
+               (digest (funcall (tls13-crypto-provider-digest
+                                 (tls13-client-driver-provider driver))
+                                hash transcript))
+               (binder (tls13-psk-binder
+                        (tls13-client-driver-provider driver) hash psk digest))
+               (complete-data
+                (concatenate '(vector (unsigned-byte 8))
+                             (subseq extension-data 0 (- (length extension-data)
+                                                         binder-length))
+                             binder))
+               (complete
+                (make-tls13-client-hello
+                 (tls13-client-hello-legacy-version hello)
+                 (tls13-client-hello-random hello)
+                 (tls13-client-hello-session-id hello)
+                 (tls13-client-hello-cipher-suites hello)
+                 (append (remove-if (lambda (extension)
+                                      (= (tls-extension-type extension) 41))
+                                    (tls13-client-hello-extensions hello))
+                         (list (make-tls-extension 41 complete-data))))))
+          (if (and (not allow-expired-p)
+                   (%tls13-ticket-expired-p
+                    ticket (funcall (tls13-ticket-store-clock store))))
+              (progn
+  (%tls13-ticket-clear-secret ticket)
+  (values (without-psk hello) nil))
+            (values complete ticket))))))
+  (progn
+  (defun %driver-store-session-ticket (driver message)
+    (let* ((store (tls13-client-driver-ticket-store driver))
+           (master (tls13-client-driver-resumption-master-secret driver))
+           (lifetime (tls13-new-session-ticket-lifetime-age message)))
+      (when (and store master (<= 1 lifetime +tls13-ticket-max-lifetime+))
+        (let ((psk (tls13-resumption-psk
+                    (tls13-client-driver-provider driver)
+                    (tls13-client-driver-hash driver) master
+                    (tls13-new-session-ticket-ticket-nonce message))))
+          (unwind-protect
+              (%tls13-ticket-store-put
+               store (tls13-client-driver-hostname driver)
+               (tls13-client-driver-negotiated-alpn driver)
+               (tls13-new-session-ticket-ticket message)
+               psk
+               (tls13-client-driver-hash driver) lifetime
+               (tls13-new-session-ticket-ticket-age-add message))
+            (fill psk 0))))
+      driver))
+  (defun %driver-server-selected-psk-p (driver hello)
+    (let ((extensions
+           (remove-if-not (lambda (extension)
+                            (= (tls-extension-type extension) 41))
+                          (tls13-server-hello-extensions hello))))
+      (when extensions
+        (unless (= (length extensions) 1)
+          (%driver-fail :invalid-psk-identity))
+        (let ((ticket (tls13-client-driver-offered-ticket driver))
+              (data (tls-extension-data (first extensions))))
+          (unless ticket (%driver-fail :unexpected-psk-identity))
+          (unless (= (length data) 2) (%driver-fail :invalid-psk-identity))
+          (unless (zerop (+ (ash (aref data 0) 8) (aref data 1)))
+            (%driver-fail :unexpected-psk-identity))
+          (unless (eq (tls13-cipher-suite-hash
+                       (tls13-server-hello-cipher-suite hello))
+                      (%tls13-session-ticket-hash ticket))
+            (%driver-fail :psk-hash-mismatch))
+          t))))
+  (defun %driver-clear-offered-ticket-secret (driver)
+    (let ((ticket (tls13-client-driver-offered-ticket driver)))
+      (when ticket
+        (fill (%tls13-session-ticket-psk ticket) 0))))
+  (defun %driver-install-resumption-master-secret (driver)
+  (when (tls13-client-driver-ticket-store driver)
+    (let* ((provider (tls13-client-driver-provider driver))
+           (hash (tls13-client-driver-hash driver)))
+      (setf (tls13-client-driver-resumption-master-secret driver)
+            (tls13-resumption-secret
+             provider hash (tls13-client-driver-master-secret driver)
+             (%driver-digest driver (tls13-client-driver-transcript driver)))))))))
 (defun %driver-default-key-exchange ()
   (labels ((operation (name)
              (let ((package (find-package (quote #:crypto-kit))))
@@ -251,17 +557,19 @@
 (defun make-tls13-client-driver
     (&key provider key-exchange on-send verify-certificate-verify
           transport-read transport-write transport-close transport hostname alpn
-          trust-anchors (now (get-universal-time)) verify-signature
+          ticket-store trust-anchors (now (get-universal-time)) verify-signature
           (cipher-suites #( #x1301 #x1302 #x1303))
           (supported-groups '(#x001d #x0017))
           (signature-algorithms #( #x0804 #x0805 #x0806 #x0403 #x0503)))
-  "Create a TLS 1.3 client handshake driver.
-
-The driver owns handshake message sequencing and transcript/key-schedule
+  "The driver owns handshake message sequencing and transcript/key-schedule
 progression. PROVIDER remains required, including when KEY-EXCHANGE is
 omitted, and supplies hash, HKDF, HMAC, and AEAD primitives. By default,
 CL-CRYPTO-KIT handles the X25519 (#x001d) or P-256 (#x0017) key share selected
-during the handshake.
+during the handshake. ALPN, when supplied, is a non-empty list of protocol
+strings in preference order. Each must encode to 1 to 255 ASCII octets. Ticket
+lookup tries the offered protocols in order. Stored tickets use the server-
+selected protocol, or no ALPN when none is selected. A resumed connection must
+select the ALPN value stored with its ticket.
 
 A supplied KEY-EXCHANGE plist replaces the built-in key-share functions. It
 must contain callable function designators for :GENERATE and :SHARED-SECRET.
@@ -272,9 +580,8 @@ to the driver; the value returned for a GROUP is passed unchanged to the
 TLS encoding for GROUP. The built-in handlers support X25519 (#x001d), with its
 32-octet RFC 7748 encoding, and P-256 (#x0017), with a 65-octet SEC1 uncompressed
 point beginning with #x04. Custom callbacks may implement other groups in
-SUPPORTED-GROUPS. Because the custom plist replaces both built-in functions,
-callbacks must handle every listed group. The driver does not validate group
-coverage at construction, so list only groups the callbacks support.
+SUPPORTED-GROUPS. The driver does not validate group coverage at construction,
+so callbacks must handle every listed group.
 
 :SHARED-SECRET is called as (GROUP PRIVATE-KEY PEER-PUBLIC-SHARE); the peer
 share is a vector of octets in the TLS encoding for that GROUP. It returns the
@@ -289,7 +596,10 @@ default, X25519 is first and P-256 second; the driver sends an initial share
 for the first group. For a HelloRetryRequest asking for a different offered
 group, :GENERATE is called again for that group. The driver rejects requests
 for unoffered groups, a retry of the initial group, and a second HelloRetryRequest."
-  (unless (typep provider 'tls13-crypto-provider) (%driver-fail :provider))
+  (progn
+    (unless (typep provider 'tls13-crypto-provider) (%driver-fail :provider))
+    (when (and ticket-store (not (typep ticket-store 'tls13-ticket-store)))
+      (%driver-fail :ticket-store)))
   (let* ((offered-suites (coerce
                           (remove-if-not
                            (lambda (suite)
@@ -300,13 +610,15 @@ for unoffered groups, a retry of the initial group, and a second HelloRetryReque
                      (aref offered-suites 0))))
     (unless suite (%driver-fail :unsupported-cipher-suite))
     (let ((driver (%make-tls13-client-driver
-                   :provider provider :key-exchange (or key-exchange (%driver-default-key-exchange)) :on-send on-send
+                   :provider provider
+                   :key-exchange (or key-exchange (%driver-default-key-exchange))
+                   :on-send on-send
                    :transport-read (or transport-read (getf transport :read))
                    :transport-write (or transport-write (getf transport :write))
                    :transport-close (or transport-close (getf transport :close))
                    :verify-certificate-verify verify-certificate-verify
-                   :hostname hostname :alpn alpn :cipher-suites offered-suites
-                   :supported-groups supported-groups
+                   :hostname hostname :alpn alpn :ticket-store ticket-store
+                   :cipher-suites offered-suites :supported-groups supported-groups
                    :signature-algorithms signature-algorithms
                    :trust-anchors trust-anchors :now now
                    :verify-signature verify-signature :suite suite
@@ -318,46 +630,63 @@ for unoffered groups, a retry of the initial group, and a second HelloRetryReque
 (defun tls13-client-driver-start (driver)
   (unless (eq (tls13-client-driver-state driver) :new)
     (%driver-fail :already-started))
-  (let* ((group (first (tls13-client-driver-supported-groups driver)))
-         (share (%driver-key-share driver group))
-         (random (or (and (listp (tls13-client-driver-key-exchange driver))
-                          (getf (tls13-client-driver-key-exchange driver) :random))
-                     #'%tls-client-csprng-octets))
-         (client (make-tls13-client-hello
-                  #x0303
-                  (funcall random 32)
-                  (funcall random 32)
-                  (tls13-client-driver-cipher-suites driver)
-                  (append
-                   (when (tls13-client-driver-hostname driver)
-                     (list (make-tls-extension 0
-                                               (encode-sni-extension
-                                                (tls13-client-driver-hostname driver)))))
-                   (when (tls13-client-driver-alpn driver)
-                     (list (make-tls-extension 16
-                                               (encode-alpn-extension
-                                                (tls13-client-driver-alpn driver)))))
-                   (list (make-tls-extension 43 #(2 3 4))
-                         (make-tls-extension 10
-                                              (%encode-vector
-                                               (apply #'%cat
-                                                      (mapcar #'%hs-u16
-                                                              (tls13-client-driver-supported-groups driver)))
-                                               2))
-                         (make-tls-extension 13
-                                              (%encode-vector
-                                               (apply #'%cat
-                                                      (map 'list #'%hs-u16
-                                                           (tls13-client-driver-signature-algorithms driver)))
-                                               2))
-                         (make-tls-extension 45 #(1 1))
-                         (make-tls-extension 51
-                                             (encode-key-share-extension (list share))))))))
-    (setf (tls13-client-driver-client-hello driver) client
-          (tls13-client-driver-state driver) :awaiting-server-hello)
-    (%driver-send driver 1 client)
-    (setf (tls13-client-driver-last-sent-key-share-group driver) group)
-    driver))
+  (handler-case
+      (let ((ticket nil)
+            (ticket-transferred nil))
+        (unwind-protect
+             (let* ((group (first (tls13-client-driver-supported-groups driver)))
+                    (share (%driver-key-share driver group))
+                    (random (or (and (listp (tls13-client-driver-key-exchange driver))
+                                     (getf (tls13-client-driver-key-exchange driver) :random))
+                                #'%tls-client-csprng-octets)))
+               (setf ticket (%driver-take-session-ticket driver))
+               (let* ((extensions
+                        (append
+                         (when (tls13-client-driver-hostname driver)
+                           (list (make-tls-extension
+                                  0 (encode-sni-extension
+                                     (tls13-client-driver-hostname driver)))))
+                         (when (tls13-client-driver-alpn driver)
+                           (list (make-tls-extension
+                                  16 (encode-alpn-extension
+                                      (tls13-client-driver-alpn driver)))))
+                         (list (make-tls-extension 43 #(2 3 4))
+                               (make-tls-extension
+                                10 (%encode-vector
+                                    (apply #'%cat
+                                           (mapcar #'%hs-u16
+                                                   (tls13-client-driver-supported-groups driver)))
+                                    2))
+                               (make-tls-extension
+                                13 (%encode-vector
+                                    (apply #'%cat
+                                           (map 'list #'%hs-u16
+                                                (tls13-client-driver-signature-algorithms driver)))
+                                    2))
+                               (when ticket (make-tls-extension 45 #(1 1)))
+                               (make-tls-extension
+                                51 (encode-key-share-extension (list share))))))
+                      (client (make-tls13-client-hello
+                               #x0303
+                               (funcall random 32)
+                               (funcall random 32)
+                               (tls13-client-driver-cipher-suites driver)
+                               (remove nil extensions))))
+                 (when ticket
+                   (multiple-value-setq (client ticket)
+                     (%driver-client-hello-with-psk-binder driver client ticket)))
+                 (setf (tls13-client-driver-client-hello driver) client
+                       (tls13-client-driver-offered-ticket driver) ticket
+                       (tls13-client-driver-state driver) :awaiting-server-hello
+                       ticket-transferred t)
+                 (%driver-send driver 1 client)
+                 (setf (tls13-client-driver-last-sent-key-share-group driver) group)
+                 driver))
+          (unless ticket-transferred
+            (when ticket (%tls13-ticket-clear-secret ticket)))))
+    (error (condition)
+      (%driver-close-transport driver)
+      (error condition))))
 
 (defun %driver-server-key-share (hello)
   (let ((extension (find 51 (tls13-server-hello-extensions hello)
@@ -437,6 +766,7 @@ Returns DRIVER; outgoing messages are delivered to ON-SEND."
       (return-from %driver-client-step driver))
     (when (and (eq (tls13-client-driver-state driver) :connected)
                (typep message 'tls13-new-session-ticket))
+      (%driver-store-session-ticket driver message)
       (return-from %driver-client-step driver))
     (when (and (= type 2) (typep message 'tls13-hello-retry-request))
       (unless (eq (tls13-client-driver-state driver) :awaiting-server-hello)
@@ -455,22 +785,29 @@ Returns DRIVER; outgoing messages are delivered to ON-SEND."
           (%driver-fail :hrr-repeated-group))
         (let ((share (%driver-key-share driver group))
               (hello (tls13-client-driver-client-hello driver)))
-          (setf (tls13-client-driver-client-hello driver)
-                (let ((cookie (find 44 (tls13-hello-retry-request-extensions message)
-                                    :key #'tls-extension-type)))
-                  (make-tls13-client-hello
-                   (tls13-client-hello-legacy-version hello)
-                   (tls13-client-hello-random hello)
-                   (tls13-client-hello-session-id hello)
-                   (tls13-client-hello-cipher-suites hello)
-                   (append
-                    (list (make-tls-extension 51
-                                              (encode-key-share-extension (list share))))
-                    (when cookie
-                      (list (make-tls-extension 44 (tls-extension-data cookie))))
-                    (remove-if (lambda (extension)
-                                 (member (tls-extension-type extension) '(44 51)))
-                               (tls13-client-hello-extensions hello)))))))
+          (progn
+            (setf (tls13-client-driver-client-hello driver)
+                  (let ((cookie (find 44 (tls13-hello-retry-request-extensions message)
+                                      :key (function tls-extension-type))))
+                    (make-tls13-client-hello
+                     (tls13-client-hello-legacy-version hello)
+                     (tls13-client-hello-random hello)
+                     (tls13-client-hello-session-id hello)
+                     (tls13-client-hello-cipher-suites hello)
+                     (append
+                      (list (make-tls-extension 51
+                                                (encode-key-share-extension (list share))))
+                      (when cookie
+                        (list (make-tls-extension 44 (tls-extension-data cookie))))
+                      (remove-if (lambda (extension)
+                                   (member (tls-extension-type extension) (list 44 51)))
+                                 (tls13-client-hello-extensions hello))))))
+            (when (tls13-client-driver-offered-ticket driver)
+              ;; ClientHello1 already offered this ticket; recompute its binder for the retry.
+              (setf (tls13-client-driver-client-hello driver)
+                    (%driver-client-hello-with-psk-binder
+                     driver (tls13-client-driver-client-hello driver)
+                     (tls13-client-driver-offered-ticket driver) t)))))
         (setf (tls13-client-driver-compatibility-ccs-flight driver) :hello-retry-request
               (tls13-client-driver-compatibility-ccs-count driver) 0)
         (%driver-send driver 1 (tls13-client-driver-client-hello driver))
@@ -506,10 +843,15 @@ Returns DRIVER; outgoing messages are delivered to ON-SEND."
              (tls13-server-hello-cipher-suite message)
              (tls13-client-driver-hash driver)
              (tls13-cipher-suite-hash (tls13-server-hello-cipher-suite message)))
-       (setf (tls13-client-driver-early-secret driver)
-             (tls13-early-secret
-              (tls13-client-driver-provider driver)
-              (tls13-client-driver-hash driver)))
+       (let ((ticket (tls13-client-driver-offered-ticket driver))
+             (selected (%driver-server-selected-psk-p driver message)))
+         (setf (tls13-client-driver-resumed-p driver) (not (null selected))
+               (tls13-client-driver-early-secret driver)
+               (tls13-early-secret
+                (tls13-client-driver-provider driver)
+                (tls13-client-driver-hash driver)
+                (and selected ticket (%tls13-session-ticket-psk ticket))))
+         (%driver-clear-offered-ticket-secret driver))
        (%driver-install-handshake-secret driver (%driver-server-key-share message))
        (let* ((provider (tls13-client-driver-provider driver))
               (hash (tls13-client-driver-hash driver))
@@ -540,19 +882,33 @@ Returns DRIVER; outgoing messages are delivered to ON-SEND."
                               :key #'tls-extension-type)))
          (when extension
            (let ((protocols (decode-alpn-extension (tls-extension-data extension))))
+             (unless (= (length protocols) 1)
+               (%driver-fail :unexpected-alpn))
              (unless (member (first protocols) (tls13-client-driver-alpn driver)
                              :test #'string=)
                (%driver-fail :unexpected-alpn))
              (setf (tls13-client-driver-negotiated-alpn driver)
                    (first protocols)))))
-       (setf (tls13-client-driver-state driver) :awaiting-certificate))
+       (when (and (tls13-client-driver-resumed-p driver)
+                  (not (equal (tls13-client-driver-negotiated-alpn driver)
+                              (%tls13-session-ticket-alpn
+                               (tls13-client-driver-offered-ticket driver)))))
+         (%driver-fail :resumed-alpn-mismatch))
+       (setf (tls13-client-driver-state driver)
+             (if (tls13-client-driver-resumed-p driver)
+                 :awaiting-finished
+               :awaiting-certificate)))
       (tls13-certificate
+       (when (tls13-client-driver-resumed-p driver)
+         (%driver-fail :unexpected-message))
        (let ((chain (%driver-certificate-chain message)))
          (setf (tls13-client-driver-certificate-chain driver) chain
                (tls13-client-driver-peer-certificate driver) (first chain))
          (%driver-verify-certificate-chain driver chain))
        (setf (tls13-client-driver-state driver) :awaiting-certificate-verify))
       (tls13-certificate-verify
+       (when (tls13-client-driver-resumed-p driver)
+         (%driver-fail :unexpected-message))
        (let ((certificate (tls13-client-driver-peer-certificate driver)))
          (unless certificate (%driver-fail :missing-server-certificate))
          (when (tls13-client-driver-verify-certificate-verify driver)
@@ -570,6 +926,8 @@ Returns DRIVER; outgoing messages are delivered to ON-SEND."
                                                          (tls13-verification-error-reason condition))))))
        (setf (tls13-client-driver-state driver) :awaiting-finished))
       (tls13-finished
+       (unless (eq (tls13-client-driver-state driver) :awaiting-finished)
+         (%driver-fail :unexpected-message))
        (unless (tls13-verify-finished
                 (tls13-compute-finished-verify-data
                  (tls13-client-driver-provider driver)
@@ -579,18 +937,16 @@ Returns DRIVER; outgoing messages are delivered to ON-SEND."
                 (tls13-finished-verify-data message))
          (%driver-fail :finished-mismatch))
        (let* ((provider (tls13-client-driver-provider driver))
+              (hash (tls13-client-driver-hash driver))
               (master (tls13-master-secret
-                       provider (tls13-client-driver-hash driver)
-                       (tls13-client-driver-handshake-secret driver)))
+                       provider hash (tls13-client-driver-handshake-secret driver)))
               (transcript-hash (%driver-digest driver
                                                (tls13-client-driver-transcript driver)))
               (server-secret
-               (tls13-traffic-secret provider (tls13-client-driver-hash driver)
-                                     master :server transcript-hash
+               (tls13-traffic-secret provider hash master :server transcript-hash
                                      :phase :application))
               (client-secret
-               (tls13-traffic-secret provider (tls13-client-driver-hash driver)
-                                     master :client transcript-hash
+               (tls13-traffic-secret provider hash master :client transcript-hash
                                      :phase :application)))
          (setf (tls13-client-driver-master-secret driver) master
                (tls13-client-driver-application-read-state driver)
@@ -604,6 +960,7 @@ Returns DRIVER; outgoing messages are delivered to ON-SEND."
                (tls13-client-driver-client-finished-key driver)
                (%driver-digest driver (tls13-client-driver-transcript driver)))))
          (%driver-send driver 20 (make-tls13-finished verify-data)))
+       (%driver-install-resumption-master-secret driver)
        (setf (tls13-client-driver-state driver) :connected))
       (otherwise (%driver-fail :unexpected-message)))
     driver))
@@ -780,6 +1137,9 @@ Returns DRIVER; outgoing messages are delivered to ON-SEND."
         (error condition))
       (tls13-decode-error (condition)
         (%driver-handle-fatal-condition driver condition)
+        (error condition))
+      (error (condition)
+        (%driver-close-transport driver t)
         (error condition)))))
 (defun tls13-client-driver-read-record (driver)
   (let ((*driver-transport-failure* nil))
@@ -796,12 +1156,16 @@ Returns DRIVER; outgoing messages are delivered to ON-SEND."
         (error condition))
       (tls-record-error (condition)
         (%driver-handle-fatal-condition driver condition)
+        (error condition))
+      (error (condition)
+        (%driver-close-transport driver t)
         (error condition)))))
 
-(export '(tls13-client-driver tls13-client-driver-p make-tls13-client-driver
-          tls13-client-driver-start tls13-client-driver-step
-          tls13-client-driver-connect tls13-client-driver-read-record
-          tls13-client-driver-write tls13-client-driver-close
-          tls13-client-driver-key-update make-tls13-client-driver-over-tcp
-          tls13-client-driver-negotiated-alpn
-          tls13-client-driver-error tls13-client-driver-error-reason))
+(export '(tls13-client-driver tls13-client-driver-p
+  make-tls13-client-driver tls13-client-driver-start tls13-client-driver-step
+  tls13-client-driver-connect tls13-client-driver-read-record
+  tls13-client-driver-write tls13-client-driver-close
+  tls13-client-driver-key-update make-tls13-client-driver-over-tcp
+  tls13-client-driver-negotiated-alpn tls13-client-driver-error
+  tls13-client-driver-error-reason make-tls13-ticket-store
+  tls13-ticket-store tls13-ticket-store-p tls13-client-driver-resumed-p))

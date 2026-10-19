@@ -64,7 +64,7 @@
 
 (defun %openssl-e2e-start
     (openssl port certificate key suite groups
-             &key certificate-chain stateless reverse)
+     &key certificate-chain stateless reverse tickets)
   (let ((arguments
          (append
           (list openssl "s_server" "-accept" (princ-to-string port)
@@ -73,7 +73,7 @@
             (list "-cert_chain" certificate-chain))
           (list "-ciphersuites" suite "-groups" groups "-alpn" "http/1.1")
           (when stateless (list "-stateless"))
-          (list "-no_ticket")
+          (unless tickets (list "-no_ticket"))
           (if reverse (list "-rev") (list "-www"))
           (list "-quiet"))))
     (uiop:launch-program arguments
@@ -86,7 +86,7 @@
     (first (cl-tls-kit:pem-decode (uiop:read-file-string path))))))
 
 (defun %openssl-e2e-driver
-    (host port provider suite groups &key trust-anchors now)
+    (host port provider suite groups &key trust-anchors now ticket-store)
   (cl-tls-kit:make-tls13-client-driver-over-tcp
    host port
    :provider provider
@@ -96,6 +96,7 @@
    :supported-groups groups
    :hostname "localhost"
    :trust-anchors trust-anchors
+   :ticket-store ticket-store
    :now (or now (get-universal-time))))
 
 (defun %openssl-e2e-http-request ()
@@ -127,7 +128,7 @@
 
 (defun %openssl-e2e-with-server
     (openssl suite groups certificate key function
-             &key certificate-chain stateless reverse)
+     &key certificate-chain stateless reverse tickets)
   (let* ((port (prog1 *openssl-e2e-port* (incf *openssl-e2e-port*)))
          (server nil))
     (labels ((wait-for-server ()
@@ -166,7 +167,8 @@
              (setf server
                    (%openssl-e2e-start openssl port certificate key suite groups
                                        :certificate-chain certificate-chain
-                                       :stateless stateless :reverse reverse))
+                                       :stateless stateless :reverse reverse
+                                       :tickets tickets))
              (wait-for-server)
              (funcall function port))
         (when server
@@ -264,6 +266,51 @@
                              (check (search "HTTP/1.0" (map 'string #'code-char response))
                                     "OpenSSL accepts application data after KeyUpdate")))
                       (cl-tls-kit:tls13-client-driver-close driver)))))))
+           (progn
+  (incf selected)
+  (%openssl-e2e-with-server
+   openssl "TLS_AES_128_GCM_SHA256" "X25519" certificate key
+   (lambda (port)
+     (let* ((store (cl-tls-kit:make-tls13-ticket-store))
+            (trust-anchor (%openssl-e2e-pem-certificate certificate)))
+       (let ((first-driver
+               (%openssl-e2e-driver
+                "127.0.0.1" port provider #x1301 (list #x001d)
+                :trust-anchors (list trust-anchor) :ticket-store store)))
+         (unwind-protect
+              (progn
+                (cl-tls-kit:tls13-client-driver-connect first-driver)
+                (incf assertions)
+                (check (not (cl-tls-kit:tls13-client-driver-resumed-p first-driver))
+                       "first OpenSSL connection completes a full handshake")
+                (cl-tls-kit:tls13-client-driver-write
+                 first-driver (%openssl-e2e-http-request))
+                (incf assertions)
+                (check (search "HTTP/1.0"
+                               (map 'string (function code-char)
+                                    (%openssl-e2e-read-application first-driver)))
+                       "first OpenSSL connection processes a ticket and application data"))
+           (cl-tls-kit:tls13-client-driver-close first-driver)))
+       (let ((second-driver
+               (%openssl-e2e-driver
+                "127.0.0.1" port provider #x1301 (list #x001d)
+                :trust-anchors (list trust-anchor) :ticket-store store)))
+         (unwind-protect
+              (progn
+                (cl-tls-kit:tls13-client-driver-connect second-driver)
+                (incf assertions)
+                (check (cl-tls-kit:tls13-client-driver-resumed-p second-driver)
+                       "second OpenSSL connection resumes with the stored PSK")
+                (cl-tls-kit:tls13-client-driver-write
+                 second-driver (%openssl-e2e-http-request))
+                (incf assertions)
+                (check (search "HTTP/1.0"
+                               (map 'string (function code-char)
+                                    (%openssl-e2e-read-application second-driver)))
+                       "resumed OpenSSL connection carries application data"))
+           (cl-tls-kit:tls13-client-driver-close second-driver)))))
+   :tickets t)
+  (incf selected))
            (incf selected)
            (%openssl-e2e-with-server
             openssl "TLS_AES_128_GCM_SHA256" "P-256" certificate key
