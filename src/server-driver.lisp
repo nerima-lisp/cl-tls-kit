@@ -27,6 +27,8 @@
   provider certificate-chain private-key alpn-protocols sni-callback
   ticket-key-store supported-groups cipher-suites clock random key-exchange
   (state :awaiting-client-hello)
+  (max-consecutive-key-updates 32)
+  (consecutive-key-updates 0)
   selected-alpn selected-suite sni-hostname hash selected-group private-key-share
   initial-client-hello cookie hrr-seen-p resumed-p
   (transcript (make-array 0 :element-type (quote (unsigned-byte 8))))
@@ -407,9 +409,12 @@ random octets. TICKET-LIFETIME is the maximum ticket lifetime in seconds."
           ticket-key-store (supported-groups (%tls13-server-default-groups))
           (cipher-suites (%tls13-server-default-suites))
           (clock (function get-universal-time))
-          (random (function %tls13-server-default-random)))
+          (random (function %tls13-server-default-random))
+          (max-consecutive-key-updates 32))
   "Create a socket-independent TLS 1.3 server handshake driver."
-  (unless (and (functionp clock) (functionp random)
+  (unless (and (integerp max-consecutive-key-updates)
+               (not (minusp max-consecutive-key-updates))
+               (functionp clock) (functionp random)
                (or (null sni-callback) (functionp sni-callback)))
     (%tls13-server-fail :invalid-server-driver-configuration 80))
   (%tls13-server-validate-options provider supported-groups cipher-suites)
@@ -425,6 +430,7 @@ random octets. TICKET-LIFETIME is the maximum ticket lifetime in seconds."
      :sni-callback sni-callback :ticket-key-store store
      :supported-groups (copy-list supported-groups)
      :cipher-suites (copy-seq cipher-suites) :clock clock :random random
+     :max-consecutive-key-updates max-consecutive-key-updates
      :key-exchange exchange)))
 
 (defun %tls13-server-validate-credential (chain private-key)
@@ -900,9 +906,10 @@ random octets. TICKET-LIFETIME is the maximum ticket lifetime in seconds."
   (list :type :secret :direction direction :level level :secret (copy-seq secret)))
 
 (defun %tls13-server-alert-level (driver)
-  (if (eq (tls13-server-driver-state driver) :awaiting-client-finished)
-      :handshake
-      :initial))
+  (case (tls13-server-driver-state driver)
+    (:awaiting-client-finished :handshake)
+    (:complete :application)
+    (otherwise :initial)))
 
 (defun %tls13-server-handshake-transcript (prefix &rest messages)
   (apply #'%tls13-server-cat prefix messages))
@@ -1221,29 +1228,39 @@ random octets. TICKET-LIFETIME is the maximum ticket lifetime in seconds."
                (= (aref wire 0) 24)
                (= (%tls13-server-read-u24 wire 1) (- (length wire) 4)))
     (%tls13-server-fail :malformed-key-update 50))
-  (let* ((message (handler-case (decode-handshake wire)
-                    (error () (%tls13-server-fail :malformed-key-update 50))))
-         (read-secret (tls13-server-driver-client-application-secret driver))
-         (next-read-secret (%tls13-server-update-traffic-secret driver read-secret))
-         (reply-p (= (tls13-key-update-request message) 1))
-         (write-secret (and reply-p
-                            (tls13-server-driver-server-application-secret driver)))
-         (next-write-secret (and reply-p
-                                 (%tls13-server-update-traffic-secret driver write-secret)))
-         (events
-           (append
-            (list (%tls13-server-secret-event :read :application next-read-secret))
-            (when reply-p
-              (list (%tls13-server-send-event
-                     :application (encode-handshake 24 (make-tls13-key-update 0)))
-                    (%tls13-server-secret-event :write :application next-write-secret))))))
-    (%tls13-server-zero-octets read-secret)
-    (setf (tls13-server-driver-client-application-secret driver) next-read-secret)
-    (when reply-p
-      (%tls13-server-zero-octets write-secret)
-      (setf (tls13-server-driver-server-application-secret driver)
-            next-write-secret))
-    events))
+  (let ((message (handler-case (decode-handshake wire)
+                   (error () (%tls13-server-fail :malformed-key-update 50)))))
+    (incf (tls13-server-driver-consecutive-key-updates driver))
+    (when (> (tls13-server-driver-consecutive-key-updates driver)
+             (tls13-server-driver-max-consecutive-key-updates driver))
+      (%tls13-server-fail :too-many-consecutive-key-updates 10))
+    (let* ((read-secret (tls13-server-driver-client-application-secret driver))
+           (next-read-secret (%tls13-server-update-traffic-secret driver read-secret))
+           (reply-p (= (tls13-key-update-request message) 1))
+           (write-secret (and reply-p
+                              (tls13-server-driver-server-application-secret driver)))
+           (next-write-secret (and reply-p
+                                   (%tls13-server-update-traffic-secret driver write-secret)))
+           (events
+             (append
+              (list (%tls13-server-secret-event :read :application next-read-secret))
+              (when reply-p
+                (list (%tls13-server-send-event
+                       :application (encode-handshake 24 (make-tls13-key-update 0)))
+                      (%tls13-server-secret-event :write :application next-write-secret))))))
+      (%tls13-server-zero-octets read-secret)
+      (setf (tls13-server-driver-client-application-secret driver) next-read-secret)
+      (when reply-p
+        (%tls13-server-zero-octets write-secret)
+        (setf (tls13-server-driver-server-application-secret driver)
+              next-write-secret))
+      events)))
+
+(defun tls13-server-driver-note-application-data-received (driver)
+  (unless (typep driver 'tls13-server-driver)
+    (%tls13-server-fail :invalid-server-driver 80))
+  (setf (tls13-server-driver-consecutive-key-updates driver) 0)
+  driver)
 
 (defun tls13-server-driver-step (driver wire &key level)
   "Consume one complete handshake message and return DRIVER and output events.
