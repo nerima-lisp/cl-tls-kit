@@ -385,15 +385,21 @@ parameters value; this function only wraps it in the TLS extension."
          boundary level 1 wire (quic-tls-boundary-transport-parameters boundary))
         (quic-tls-boundary-send boundary level 1 wire))))
 
-(defun quic-tls-boundary-send-hrr (boundary selected-group &optional cookie)
+(defun quic-tls-boundary-send-hrr
+    (boundary selected-group &optional cookie
+     (cipher-suite (or (quic-tls-boundary-cipher-suite boundary) #x1301)))
   "Send HRR, replacing CH1 in the transcript with message_hash(CH1)."
   (%quic-replace-transcript-for-hrr boundary)
   (setf (quic-tls-boundary-selected-group boundary) selected-group
         (quic-tls-boundary-cookie boundary) cookie)
-  (let ((extensions (if cookie (list (make-tls-extension 44 (%quic-octets cookie))) nil)))
+  (let ((extensions
+          (if cookie
+              (list (make-tls-extension 44 (%quic-octets cookie)))
+            nil)))
     (quic-tls-boundary-send-message
      boundary :initial 2
-     (make-tls13-hello-retry-request #x0303 selected-group extensions))))
+     (make-tls13-hello-retry-request
+      #x0303 selected-group extensions cipher-suite))))
 
 (defun quic-tls-boundary-send-alert (boundary level description &key (fatal-p nil))
   "Emit a TLS alert as raw CRYPTO data; alerts are not TLS records in QUIC."

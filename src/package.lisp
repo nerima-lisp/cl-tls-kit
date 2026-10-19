@@ -89,7 +89,7 @@
    #:tls13-server-hello-legacy-version #:tls13-server-hello-random
    #:tls13-server-hello-session-id #:tls13-server-hello-cipher-suite
    #:tls13-server-hello-extensions #:encode-server-hello #:decode-server-hello
-   #:tls13-hello-retry-request #:make-tls13-hello-retry-request
+   #:tls13-hello-retry-request #:make-tls13-hello-retry-request #:tls13-hello-retry-request-cipher-suite
    #:tls13-hello-retry-request-selected-group #:encode-hello-retry-request
    #:tls13-encrypted-extensions #:make-tls13-encrypted-extensions
    #:tls13-certificate-entry #:make-tls13-certificate-entry
