@@ -1,6 +1,7 @@
 (in-package #:cl-tls-kit/test)
 
 (defvar *client-resumption-assertions* 0)
+(declaim (ftype (function (t) t) run-client-resumption-regression-tests))
 
 (defun %client-resumption-check (condition message)
   (incf *client-resumption-assertions*)
@@ -50,7 +51,10 @@
           (declare (ignore group private peer))
           (make-array 32 :element-type '(unsigned-byte 8) :initial-element 5))))
 
-(defun %client-resumption-driver (provider store hostname alpn)
+(defun %client-resumption-driver
+    (provider store hostname alpn
+     &optional (cipher-suites #(#x1301))
+       (supported-groups '(#x001d)))
   (let ((sent (list nil)))
     (values
      (apply #'make-tls13-client-driver
@@ -59,8 +63,8 @@
                     (when store (list :ticket-store store))
                     (list :hostname hostname
                           :alpn alpn
-                          :cipher-suites #(#x1301)
-                          :supported-groups '(#x001d)
+                          :cipher-suites cipher-suites
+                          :supported-groups supported-groups
                           :on-send (lambda (driver wire)
                                      (declare (ignore driver))
                                      (push wire (car sent))))))
@@ -484,8 +488,7 @@
               (cl-tls-kit::tls13-client-driver-offered-ticket client))
              (%client-resumption-hex "4ecd0eb6ec3b4d87f5d6028f922ca4c5851a277fd41311c9e62d2c9492e1c4f3")))
        "valid NewSessionTicket stores the RFC-derived PSK and offers its identity"))))
-        (format t "TLS 1.3 client resumption: selected test count: ~D; assertions: ~D~%"
-                selected *client-resumption-assertions*)
+        (progn (run-client-resumption-regression-tests provider) (format t "TLS 1.3 client resumption: selected test count: ~D; assertions: ~D~%" selected *client-resumption-assertions*))
         t)))
   )
 (defun run-client-resumption-security-tests (&optional provider)
@@ -833,3 +836,254 @@
     (format t "TLS 1.3 client resumption security: selected test count: ~D; assertions: ~D~%"
             selected *client-resumption-assertions*)
     t))
+(defun run-client-resumption-regression-tests (provider)
+  (let ((selected 0))
+    (labels ((hrr-wire (suite)
+               (encode-handshake
+                2 (make-tls13-server-hello
+                   #x0303 cl-tls-kit::*tls13-hrr-random* #() suite
+                   (list (make-tls-extension 43 #(#x03 #x04))
+                         (make-tls-extension 51
+                                             (cl-tls-kit::%hs-u16 #x0017))))))
+             (ticket-psk (length)
+               (make-array length :element-type '(unsigned-byte 8)
+                           :initial-element #x42)))
+      (incf selected)
+      (let* ((store (make-tls13-ticket-store :clock (lambda () 1000)))
+             (stored
+               (cl-tls-kit::%tls13-ticket-store-put
+                store "hrr.example.test" "h2" (%client-resumption-hex "090807")
+                (ticket-psk 48) :sha384 600 7)))
+        (multiple-value-bind (driver sent)
+            (%client-resumption-driver
+             provider store "hrr.example.test" (list "h2")
+             #(#x1301 #x1302) (list #x001d #x0017))
+          (tls13-client-driver-start driver)
+          (let* ((client-hello-1 (first (car sent)))
+                 (hrr (hrr-wire #x1302))
+                 (hrr-message (decode-handshake hrr)))
+            (tls13-client-driver-step driver hrr)
+            (let* ((client-hello-2 (first (car sent)))
+                   (hello-2 (decode-handshake client-hello-2))
+                   (psk (%client-resumption-extension hello-2 41))
+                   (binder (nth-value
+                            2 (%client-resumption-psk-fields
+                               (tls-extension-data psk))))
+                   (binder-length (length binder))
+                   (truncated (subseq client-hello-2 0
+                                      (- (length client-hello-2)
+                                         (+ 3 binder-length))))
+                   (digest (funcall (cl-tls-kit::tls13-crypto-provider-digest provider)
+                                    :sha384 client-hello-1))
+                   (message-hash
+                     (cl-tls-kit::%cat #(254) (cl-tls-kit::%u24 (length digest))
+                                      digest))
+                   (transcript
+                     (concatenate '(vector (unsigned-byte 8)) message-hash hrr))
+                   (binder-hash
+                     (funcall (cl-tls-kit::tls13-crypto-provider-digest provider)
+                              :sha384
+                              (concatenate '(vector (unsigned-byte 8))
+                                           transcript truncated)))
+                   (expected
+                     (cl-tls-kit::tls13-psk-binder
+                      provider :sha384
+                      (cl-tls-kit::%tls13-session-ticket-psk stored)
+                      binder-hash)))
+              (%client-resumption-check
+               (and (typep hrr-message 'tls13-hello-retry-request)
+                    (= (tls13-hello-retry-request-cipher-suite hrr-message) #x1302))
+               "HRR preserves the selected TLS_AES_256_GCM_SHA384 suite")
+              (%client-resumption-check
+               (and (= (cl-tls-kit::tls13-client-driver-suite driver) #x1302)
+                    (eq (cl-tls-kit::tls13-client-driver-hash driver) :sha384)
+                    (equalp (cl-tls-kit::tls13-client-driver-transcript driver)
+        (concatenate '(vector (unsigned-byte 8))
+                     transcript client-hello-2)))
+               "SHA384 HRR rebuilds message_hash and transcript with SHA384")
+              (%client-resumption-check
+               (and (eq stored
+                        (cl-tls-kit::tls13-client-driver-offered-ticket driver))
+                    (= binder-length 48)
+                    (equalp binder expected))
+               "SHA384 HRR recomputes a 48-byte ticket binder over ClientHello2")))))
+      (incf selected)
+      (let* ((store (make-tls13-ticket-store :clock (lambda () 1000)))
+             (stored
+               (cl-tls-kit::%tls13-ticket-store-put
+                store "mismatch.example.test" "h2" (%client-resumption-hex "01")
+                (ticket-psk 32) :sha256 600 0)))
+        (multiple-value-bind (driver sent)
+            (%client-resumption-driver
+             provider store "mismatch.example.test" (list "h2")
+             #(#x1301 #x1302) (list #x001d #x0017))
+          (tls13-client-driver-start driver)
+          (tls13-client-driver-step driver (hrr-wire #x1302))
+          (let* ((hello-2 (decode-handshake (first (car sent))))
+                 (extensions (tls13-client-hello-extensions hello-2)))
+            (%client-resumption-check
+             (and (null (%client-resumption-extension hello-2 41))
+                  (null (%client-resumption-extension hello-2 45))
+                  (null (cl-tls-kit::tls13-client-driver-offered-ticket driver))
+                  (every #'zerop (cl-tls-kit::%tls13-session-ticket-psk stored))
+                  (eq (cl-tls-kit::tls13-client-driver-hash driver) :sha384))
+             "SHA256 ticket is dropped when HRR selects a SHA384 suite")
+            (%client-resumption-check
+             (not (member 41 extensions :key #'tls-extension-type))
+             "hash-mismatched PSK is absent from ClientHello2"))))
+      (incf selected)
+      (let* ((now 1000)
+             (derivation-count 0)
+             (resume-label (map 'vector (function char-code) "tls13 resumption"))
+             (clocked-provider
+               (let* ((copy (cl-tls-kit::copy-tls13-crypto-provider provider))
+                      (expand
+                        (cl-tls-kit::tls13-crypto-provider-hkdf-expand copy)))
+                 (setf (cl-tls-kit::tls13-crypto-provider-hkdf-expand copy)
+                       (lambda (hash secret info length)
+                         (when (and (>= (length info) (+ 3 (length resume-label)))
+                                    (= (aref info 2) (length resume-label))
+                                    (equalp (subseq info 3 (+ 3 (length resume-label)))
+                                            resume-label))
+                           (incf derivation-count)
+                           (setf now 2001))
+                         (funcall expand hash secret info length)))
+                 copy))
+             (store (make-tls13-ticket-store :clock (lambda () now)))
+             (driver
+               (cl-tls-kit::%make-tls13-client-driver
+                :provider clocked-provider :ticket-store store
+                :hostname "receipt.example.test" :hash :sha256 :suite #x1301
+                :state :connected :negotiated-alpn "h2"
+                :resumption-master-secret (ticket-psk 32))))
+        (tls13-client-driver-step
+         driver
+         (encode-handshake
+          4 (make-tls13-new-session-ticket
+             3 (%client-resumption-hex "0000") (%client-resumption-hex "090807")
+             nil 100)))
+        (let* ((key (cl-tls-kit::%tls13-ticket-key "receipt.example.test" "h2"))
+               (ticket (first (gethash key
+                                       (cl-tls-kit::tls13-ticket-store-entries store)))))
+          (%client-resumption-check
+           (and (= derivation-count 1)
+                (= now 2001)
+                ticket
+                (= (cl-tls-kit::%tls13-session-ticket-created-at ticket) 1000))
+           "NewSessionTicket stores its receipt time before PSK derivation")
+          (multiple-value-bind (client sent)
+              (%client-resumption-driver
+               provider store "receipt.example.test" (list "h2"))
+            (tls13-client-driver-start client)
+            (%client-resumption-check
+             (= (nth-value
+                 1 (%client-resumption-psk-fields
+                    (tls-extension-data
+                     (%client-resumption-extension
+                      (decode-handshake (first (car sent))) 41))))
+                1101)
+             "ticket age uses receipt time across delayed registration"))))
+      (incf selected)
+      (let* ((now 1000)
+             (derivation-count 0)
+             (resume-label (map 'vector (function char-code) "tls13 resumption"))
+             (clocked-provider
+               (let* ((copy (cl-tls-kit::copy-tls13-crypto-provider provider))
+                      (expand
+                        (cl-tls-kit::tls13-crypto-provider-hkdf-expand copy)))
+                 (setf (cl-tls-kit::tls13-crypto-provider-hkdf-expand copy)
+                       (lambda (hash secret info length)
+                         (when (and (>= (length info) (+ 3 (length resume-label)))
+                                    (= (aref info 2) (length resume-label))
+                                    (equalp (subseq info 3 (+ 3 (length resume-label)))
+                                            resume-label))
+                           (incf derivation-count)
+                           (setf now 2001))
+                         (funcall expand hash secret info length)))
+                 copy))
+             (store (make-tls13-ticket-store :clock (lambda () now)))
+             (driver
+               (cl-tls-kit::%make-tls13-client-driver
+                :provider clocked-provider :ticket-store store
+                :hostname "expiry.example.test" :hash :sha256 :suite #x1301
+                :state :connected :negotiated-alpn "h2"
+                :resumption-master-secret (ticket-psk 32))))
+        (tls13-client-driver-step
+         driver
+         (encode-handshake
+          4 (make-tls13-new-session-ticket
+             1 (%client-resumption-hex "0000") (%client-resumption-hex "090807")
+             nil 100)))
+        (%client-resumption-check
+         (and (= derivation-count 1)
+              (= now 2001)
+              (zerop (cl-tls-kit::%tls13-ticket-store-count store)))
+         "one-second ticket expires during PSK derivation from receipt time"))
+      (incf selected)
+      (let* ((store (make-tls13-ticket-store :clock (lambda () 1000)))
+             (stored
+               (cl-tls-kit::%tls13-ticket-store-put
+                store "target-a.example.test" "h2" (%client-resumption-hex "01")
+                (ticket-psk 32) :sha256 600 0)))
+        (multiple-value-bind (driver ignored)
+            (%client-resumption-driver provider store nil (list "h2"))
+          (declare (ignore ignored))
+          (tls13-client-driver-start driver)
+          (%client-resumption-check
+           (and (not (%client-resumption-has-psk-p driver))
+                (= (cl-tls-kit::%tls13-ticket-store-count store) 1)
+                (not (every #'zerop
+                            (cl-tls-kit::%tls13-session-ticket-psk stored))))
+           "nil hostname neither offers nor consumes another host ticket"))
+        (let ((producer
+                (cl-tls-kit::%make-tls13-client-driver
+                 :provider provider :ticket-store store :hostname nil
+                 :hash :sha256 :suite #x1301 :state :connected
+                 :negotiated-alpn "h2"
+                 :resumption-master-secret (ticket-psk 32))))
+          (tls13-client-driver-step
+           producer
+           (encode-handshake
+            4 (make-tls13-new-session-ticket
+               600 (%client-resumption-hex "0000")
+               (%client-resumption-hex "090807") nil 3)))
+          (%client-resumption-check
+           (= (cl-tls-kit::%tls13-ticket-store-count store) 1)
+           "NewSessionTicket is not stored when hostname is unknown"))
+        (multiple-value-bind (driver ignored)
+            (%client-resumption-driver
+             provider store "target-a.example.test" (list "h2"))
+          (declare (ignore ignored))
+          (tls13-client-driver-start driver)
+          (%client-resumption-check
+           (%client-resumption-has-psk-p driver)
+           "known hostname can still consume its own scoped ticket")))
+      (incf selected)
+      (let* ((factory-symbol (quote cl-tls-kit::%make-tls-client-tcp-transport))
+             (factory (symbol-function factory-symbol)))
+        (unwind-protect
+             (progn
+               (setf (symbol-function factory-symbol)
+                     (lambda (host port)
+                       (declare (ignore host port))
+                       (list :read nil :write nil :close nil)))
+               (let ((client
+                       (cl-tls-kit:make-tls-client-over-tcp
+                        "facade.example.test" 443)))
+                 (%client-resumption-check
+                  (string= (cl-tls-kit::tls-client-hostname client)
+                           "facade.example.test")
+                  "legacy TCP facade defaults hostname from its destination")
+                 (cl-tls-kit:tls-client-close client))
+               (let ((client
+                       (cl-tls-kit:make-tls-client-over-tcp
+                        "facade.example.test" 443 :hostname "override.example.test")))
+                 (%client-resumption-check
+                  (string= (cl-tls-kit::tls-client-hostname client)
+                           "override.example.test")
+                  "legacy TCP facade preserves an explicit hostname override")
+                 (cl-tls-kit:tls-client-close client)))
+          (setf (symbol-function factory-symbol) factory)))
+      (format t "TLS 1.3 client resumption regressions: selected test count: ~D; assertions: ~D~%"
+              selected *client-resumption-assertions*)
+      t)))

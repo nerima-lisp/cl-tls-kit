@@ -464,8 +464,11 @@ The KEY-SHARE value is supplied by the crypto/provider integration."
   "Open a blocking SBCL TCP stream and return a client using TLS records on it.
 This is the portable entry in this minimal implementation; non-SBCL images
 must provide TRANSPORT callbacks directly to MAKE-TLS-CLIENT."
-  (apply #'make-tls-client :transport (%make-tls-client-tcp-transport host port)
-         args))
+  (apply #'make-tls-client
+         :transport (%make-tls-client-tcp-transport host port)
+         (if (member :hostname args)
+             args
+           (append args (list :hostname host)))))
 
 (defun tls-client-read (client)
   (unless (eq (tls-client-state client) :connected)

@@ -1280,4 +1280,56 @@
                (string= (crypto-kit:crypto-error-message condition)
                         "Invalid P-256 private key length")))
            "default P-256 exchange preserves local key errors")))
-      t)))
+      (progn
+  (let* ((writes '())
+         (early-data-driver
+           (make-tls13-client-driver
+            :provider provider
+            :key-exchange key-exchange
+            :hostname "example.test"
+            :transport-write
+            (lambda (ignored wire)
+              (declare (ignore ignored))
+              (push wire writes)))))
+    (tls13-client-driver-start early-data-driver)
+    (tls13-client-driver-step
+     early-data-driver
+     (encode-handshake
+      2 (make-tls13-server-hello
+         #x0303
+         (make-array 32 :element-type '(unsigned-byte 8) :initial-element 8)
+         #() #x1301
+         (list (make-tls-extension 43 #(3 4))
+               (make-tls-extension
+                51 (encode-key-share-server-extension
+                    #x001d
+                    (make-array 32 :element-type '(unsigned-byte 8)
+                                :initial-element 9)))))))
+    (let* ((write-state
+             (cl-tls-kit::tls13-client-driver-handshake-write-state
+              early-data-driver))
+           (alert-reader
+             (make-tls13-traffic-state
+              provider :sha256 :aes-128-gcm
+              (tls13-traffic-state-secret write-state) 16 12))
+           (failure
+             (handler-case
+                 (progn
+                   (tls13-client-driver-step
+                    early-data-driver
+                    (encode-handshake
+                     8 (make-tls13-encrypted-extensions
+                        (list (make-tls-extension 42 #())))))
+                   nil)
+               (tls13-client-driver-error (condition)
+                 (eq (tls13-client-driver-error-reason condition)
+                     :unsupported-extension)))))
+      (check failure
+             "EncryptedExtensions rejects unoffered early_data")
+      (let ((alert
+              (decrypt-tls13-traffic-record (first writes) alert-reader)))
+        (check (and (= (tls-plaintext-content-type alert)
+                       cl-tls-kit::+tls-content-type-alert+)
+                    (equalp (tls-plaintext-fragment alert) #(2 110)))
+               "unoffered early_data sends encrypted unsupported_extension"))))
+  t))))

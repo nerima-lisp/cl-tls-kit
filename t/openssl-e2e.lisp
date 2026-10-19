@@ -86,18 +86,20 @@
     (first (cl-tls-kit:pem-decode (uiop:read-file-string path))))))
 
 (defun %openssl-e2e-driver
-    (host port provider suite groups &key trust-anchors now ticket-store)
-  (cl-tls-kit:make-tls13-client-driver-over-tcp
-   host port
-   :provider provider
-   :on-send nil
-   :alpn '("http/1.1")
-   :cipher-suites (vector suite)
-   :supported-groups groups
-   :hostname "localhost"
-   :trust-anchors trust-anchors
-   :ticket-store ticket-store
-   :now (or now (get-universal-time))))
+    (host port provider suite groups
+     &key trust-anchors now ticket-store (hostname "localhost"))
+  (apply #'cl-tls-kit:make-tls13-client-driver-over-tcp
+         host port
+         (append
+          (list :provider provider
+                :on-send nil
+                :alpn (list "http/1.1")
+                :cipher-suites (vector suite)
+                :supported-groups groups
+                :trust-anchors trust-anchors
+                :ticket-store ticket-store
+                :now (or now (get-universal-time)))
+          (when hostname (list :hostname hostname)))))
 
 (defun %openssl-e2e-http-request ()
   (map 'vector #'char-code
@@ -275,7 +277,7 @@
             (trust-anchor (%openssl-e2e-pem-certificate certificate)))
        (let ((first-driver
                (%openssl-e2e-driver
-                "127.0.0.1" port provider #x1301 (list #x001d)
+                "localhost" port provider #x1301 (list #x001d)
                 :trust-anchors (list trust-anchor) :ticket-store store)))
          (unwind-protect
               (progn
@@ -293,7 +295,7 @@
            (cl-tls-kit:tls13-client-driver-close first-driver)))
        (let ((second-driver
                (%openssl-e2e-driver
-                "127.0.0.1" port provider #x1301 (list #x001d)
+                "localhost" port provider #x1301 (list #x001d)
                 :trust-anchors (list trust-anchor) :ticket-store store)))
          (unwind-protect
               (progn
@@ -310,6 +312,65 @@
                        "resumed OpenSSL connection carries application data"))
            (cl-tls-kit:tls13-client-driver-close second-driver)))))
    :tickets t)
+  (incf selected)
+  (%openssl-e2e-with-server
+   openssl "TLS_AES_256_GCM_SHA384" "P-256" certificate key
+   (lambda (port)
+     (let* ((store (cl-tls-kit:make-tls13-ticket-store))
+            (trust-anchor (%openssl-e2e-pem-certificate certificate))
+            (groups (list #x001d #x0017)))
+       (let ((first-driver
+               (%openssl-e2e-driver
+                "localhost" port provider #x1302 groups
+                :trust-anchors (list trust-anchor) :ticket-store store
+                :hostname nil)))
+         (unwind-protect
+              (progn
+                (cl-tls-kit:tls13-client-driver-connect first-driver)
+                (incf assertions)
+                (check
+                 (and (not (cl-tls-kit:tls13-client-driver-resumed-p first-driver))
+                      (cl-tls-kit::tls13-client-driver-hello-retry-request-received
+                       first-driver)
+                      (= (cl-tls-kit::tls13-client-driver-suite first-driver) #x1302)
+                      (eq (cl-tls-kit::tls13-client-driver-hash first-driver) :sha384))
+                 "OpenSSL HRR selects SHA384 during a full handshake")
+                (cl-tls-kit:tls13-client-driver-write
+                 first-driver (%openssl-e2e-http-request))
+                (incf assertions)
+                (check (search "HTTP/1.0"
+                               (map 'string (function code-char)
+                                    (%openssl-e2e-read-application first-driver)))
+                       "OpenSSL completes the SHA384 HRR handshake and sends a ticket")
+                (incf assertions)
+                (check (plusp (cl-tls-kit::%tls13-ticket-store-count store))
+                       "SHA384 NewSessionTicket is stored for the next connection"))
+           (cl-tls-kit:tls13-client-driver-close first-driver)))
+       (let ((second-driver
+               (%openssl-e2e-driver
+                "localhost" port provider #x1302 groups
+                :trust-anchors (list trust-anchor) :ticket-store store
+                :hostname nil)))
+         (unwind-protect
+              (progn
+                (cl-tls-kit:tls13-client-driver-connect second-driver)
+                (incf assertions)
+                (check
+                 (and (cl-tls-kit:tls13-client-driver-resumed-p second-driver)
+                      (cl-tls-kit::tls13-client-driver-hello-retry-request-received
+                       second-driver)
+                      (= (cl-tls-kit::tls13-client-driver-suite second-driver) #x1302)
+                      (eq (cl-tls-kit::tls13-client-driver-hash second-driver) :sha384))
+                 "OpenSSL resumes with a SHA384 binder after HRR")
+                (cl-tls-kit:tls13-client-driver-write
+                 second-driver (%openssl-e2e-http-request))
+                (incf assertions)
+                (check (search "HTTP/1.0"
+                               (map 'string (function code-char)
+                                    (%openssl-e2e-read-application second-driver)))
+                       "resumed SHA384 HRR connection carries application data"))
+           (cl-tls-kit:tls13-client-driver-close second-driver)))))
+   :tickets t :stateless t)
   (incf selected))
            (incf selected)
            (%openssl-e2e-with-server

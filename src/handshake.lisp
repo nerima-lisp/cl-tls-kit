@@ -282,9 +282,11 @@
 (defstruct (tls13-server-hello (:constructor make-tls13-server-hello
                                   (legacy-version random session-id cipher-suite extensions)))
   legacy-version random session-id cipher-suite extensions)
-(defstruct (tls13-hello-retry-request (:constructor make-tls13-hello-retry-request
-                                         (legacy-version selected-group extensions)))
-  legacy-version selected-group extensions)
+(defstruct (tls13-hello-retry-request
+             (:constructor make-tls13-hello-retry-request
+                 (legacy-version selected-group extensions
+                  &optional (cipher-suite #x1301))))
+  legacy-version selected-group extensions cipher-suite)
 (defstruct (tls13-encrypted-extensions (:constructor make-tls13-encrypted-extensions (extensions))) extensions)
 (defstruct (tls13-certificate-entry (:constructor make-tls13-certificate-entry (certificate extensions)))
   certificate extensions)
@@ -372,15 +374,21 @@
               (unless (and ks (= (length (tls-extension-data ks)) 2))
                 (%tls13-fail "HRR must contain a key_share extension"))
               (make-tls13-hello-retry-request
-               version (nth-value 0 (%read-integer (tls-extension-data ks) 0 2)) extensions))
+               version
+               (nth-value 0 (%read-integer (tls-extension-data ks) 0 2))
+               extensions
+               suite))
             (make-tls13-server-hello version random sid suite extensions))))))
 (defun encode-hello-retry-request (hrr)
   (encode-server-hello
-   (make-tls13-server-hello (tls13-hello-retry-request-legacy-version hrr)
-                            *tls13-hrr-random* #() 0
-                            (cons (make-tls-extension 51 (%hs-u16 (tls13-hello-retry-request-selected-group hrr)))
-                                  (remove 51 (tls13-hello-retry-request-extensions hrr)
-                                          :key #'tls-extension-type)))))
+   (make-tls13-server-hello
+    (tls13-hello-retry-request-legacy-version hrr)
+    *tls13-hrr-random* #()
+    (tls13-hello-retry-request-cipher-suite hrr)
+    (cons (make-tls-extension
+           51 (%hs-u16 (tls13-hello-retry-request-selected-group hrr)))
+          (remove 51 (tls13-hello-retry-request-extensions hrr)
+                  :key #'tls-extension-type)))))
 
 (defun encode-encrypted-extensions (message) (%encode-extensions (tls13-encrypted-extensions-extensions message)))
 (defun decode-encrypted-extensions (bytes)
@@ -459,7 +467,11 @@
     (11 . encode-certificate) (13 . encode-certificate-request) (15 . encode-certificate-verify)
     (20 . encode-finished) (4 . encode-new-session-ticket) (24 . encode-key-update)))
 (defun encode-handshake (type message)
-  (let ((encoder (cdr (assoc type *tls13-message-codecs*))))
+  (let ((encoder
+          (if (and (eql type 2)
+                   (typep message 'tls13-hello-retry-request))
+              (function encode-hello-retry-request)
+              (cdr (assoc type *tls13-message-codecs*)))))
     (unless encoder (%tls13-fail "unsupported handshake type"))
     (let ((body (funcall encoder message)))
       (%cat (%hs-u8 type) (%u24 (length body)) body))))

@@ -99,15 +99,19 @@
                  (progn (decode-key-update #(2)) nil)
                  (tls13-decode-error () t))
              "invalid KeyUpdate request is rejected"))
-    (let ((state (make-tls13-state
-                  :client :server-hello
-                  (lambda (bytes)
-                    (declare (ignore bytes))
-                    (make-array 48 :element-type '(unsigned-byte 8)))))
-          (hrr (make-tls13-hello-retry-request #x0303 #x0017 nil)))
-      (tls13-state-handle-hello-retry-request state hrr #(1 0 0 0))
-      (check (= (aref (tls13-state-transcript state) 3) 48)
-             "HRR message_hash uses the negotiated digest length"))
+    (let* ((state (make-tls13-state
+               :client :server-hello
+               (lambda (bytes)
+                 (declare (ignore bytes))
+                 (make-array 48 :element-type '(unsigned-byte 8)))))
+       (hrr (make-tls13-hello-retry-request
+             #x0303 #x0017 nil #x1302))
+       (decoded (decode-handshake (encode-handshake 2 hrr))))
+  (check (= (tls13-hello-retry-request-cipher-suite decoded) #x1302)
+         "HRR cipher suite round trips through the wire codec")
+  (tls13-state-handle-hello-retry-request state hrr #(1 0 0 0))
+  (check (= (aref (tls13-state-transcript state) 3) 48)
+         "HRR message_hash uses the negotiated digest length"))
     (let ((state (make-tls13-state :client)))
       (tls13-state-advance state 2)
       (check (eq (tls13-state-phase state) :server-hello)
