@@ -50,6 +50,22 @@
   (defun %tls13-ticket-now-ms ()
     (floor (* 1000 (get-internal-real-time)) internal-time-units-per-second))
   (defun make-tls13-ticket-store (&key (clock (function %tls13-ticket-now-ms)))
+    "Create a thread-safe in-memory ticket store.
+
+CLOCK returns monotonic milliseconds. Tickets expire after their advertised
+lifetime, measured from when they are stored. The client does not store tickets
+whose advertised lifetimes exceed seven days, the TLS 1.3 maximum. Expiry is
+checked when a ticket is selected for ClientHello1. If the server requests a
+HelloRetryRequest, the driver retains that ticket for ClientHello2 even if it
+expires in between.
+
+The store matches tickets by normalized hostname (or no hostname) and the
+negotiated ALPN protocol (or no ALPN). It keeps at most four tickets per match
+and 64 total. When a limit is reached, it evicts the oldest ticket.
+
+Pass the same store as :TICKET-STORE to each client driver. Drivers store
+NewSessionTicket messages automatically. When a driver starts a connection, it
+removes one matching ticket from the store and does not put it back."
     (unless (functionp clock)
       (error "Ticket-store clock must be callable"))
     (%make-tls13-ticket-store clock
@@ -545,13 +561,15 @@
           (cipher-suites #( #x1301 #x1302 #x1303))
           (supported-groups '(#x001d #x0017))
           (signature-algorithms #( #x0804 #x0805 #x0806 #x0403 #x0503)))
-  "Create a TLS 1.3 client handshake driver.
-
-The driver owns handshake message sequencing and transcript/key-schedule
+  "The driver owns handshake message sequencing and transcript/key-schedule
 progression. PROVIDER remains required, including when KEY-EXCHANGE is
 omitted, and supplies hash, HKDF, HMAC, and AEAD primitives. By default,
 CL-CRYPTO-KIT handles the X25519 (#x001d) or P-256 (#x0017) key share selected
-during the handshake.
+during the handshake. ALPN, when supplied, is a non-empty list of protocol
+strings in preference order. Each must encode to 1 to 255 ASCII octets. Ticket
+lookup tries the offered protocols in order. Stored tickets use the server-
+selected protocol, or no ALPN when none is selected. A resumed connection must
+select the ALPN value stored with its ticket.
 
 A supplied KEY-EXCHANGE plist replaces the built-in key-share functions. It
 must contain callable function designators for :GENERATE and :SHARED-SECRET.
@@ -562,9 +580,8 @@ to the driver; the value returned for a GROUP is passed unchanged to the
 TLS encoding for GROUP. The built-in handlers support X25519 (#x001d), with its
 32-octet RFC 7748 encoding, and P-256 (#x0017), with a 65-octet SEC1 uncompressed
 point beginning with #x04. Custom callbacks may implement other groups in
-SUPPORTED-GROUPS. Because the custom plist replaces both built-in functions,
-callbacks must handle every listed group. The driver does not validate group
-coverage at construction, so list only groups the callbacks support.
+SUPPORTED-GROUPS. The driver does not validate group coverage at construction,
+so callbacks must handle every listed group.
 
 :SHARED-SECRET is called as (GROUP PRIVATE-KEY PEER-PUBLIC-SHARE); the peer
 share is a vector of octets in the TLS encoding for that GROUP. It returns the
@@ -786,6 +803,7 @@ Returns DRIVER; outgoing messages are delivered to ON-SEND."
                                    (member (tls-extension-type extension) (list 44 51)))
                                  (tls13-client-hello-extensions hello))))))
             (when (tls13-client-driver-offered-ticket driver)
+              ;; ClientHello1 already offered this ticket; recompute its binder for the retry.
               (setf (tls13-client-driver-client-hello driver)
                     (%driver-client-hello-with-psk-binder
                      driver (tls13-client-driver-client-hello driver)
