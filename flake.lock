@@ -3,15 +3,16 @@
     "cl-crypto-kit": {
       "flake": false,
       "locked": {
-        "lastModified": 1791013020,
-        "narHash": "sha256-uRNIw2fQ8itmBZ0oUCc99b+aK7hPQN0IHOSn0RsabXM=",
+        "lastModified": 1792410368,
+        "narHash": "sha256-NLW0iKNKNELLzW3CndtxWmQxlw3aIdfeskyXT40buEo=",
         "owner": "nerima-lisp",
         "repo": "cl-crypto-kit",
-        "rev": "0adeb48f7d2755a323bfa6906d73f6a78d14d74e",
+        "rev": "41ed7e90f736591aa1961bc6deb0741c73392a60",
         "type": "github"
       },
       "original": {
         "owner": "nerima-lisp",
+        "ref": "v0.2.1",
         "repo": "cl-crypto-kit",
         "type": "github"
       }

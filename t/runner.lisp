@@ -2,7 +2,7 @@
 
 (defun run-tests ()
   (let ((passed 0))
-    (when (find-package '#:crypto-kit)
+    (when (find-package (quote #:crypto-kit))
       (unless (eq (run-key-schedule-tests) t)
         (error "cl-tls-kit key schedule tests did not pass."))
       (incf passed))
@@ -15,19 +15,24 @@
                     run-client-driver-tests
                     run-client-resumption-tests
                     run-client-resumption-security-tests
+                    run-server-driver-tests
                     run-verification-tests
                     run-quic-boundary-tests
-                    run-openssl-e2e-tests))
+                    run-openssl-e2e-tests
+                    run-server-openssl-e2e-tests))
       (let ((result (funcall test)))
-        (unless (member result '(t :skipped))
+        (unless (member result (quote (t :skipped)))
           (error "cl-tls-kit test group failed: ~A" test))
         (when (eq result t)
           (incf passed))))
-    (let ((rfc8448-result (run-rfc8448-tests)))
-      (when (eq rfc8448-result t)
+    (let ((client-result (run-rfc8448-tests)))
+      (when (eq client-result t)
         (incf passed))
-      (format t "cl-tls-kit tests: ~D groups passed; RFC 8448 result: ~A~%"
-              passed rfc8448-result))
+      (let ((server-result (run-rfc8448-server-trace-tests)))
+        (when (eq server-result t)
+          (incf passed))
+        (format t "cl-tls-kit tests: ~D groups passed; RFC 8448 client: ~A; RFC 8448 server trace: ~A~%"
+                passed client-result server-result)))
     (unless (plusp passed)
       (error "cl-tls-kit tests ran zero groups."))
     t))
