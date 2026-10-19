@@ -100,12 +100,14 @@
 (defun %server-driver-test-server
     (provider chain key ticket-key-store clock &key (groups '(#x001d #x0017))
                                                 (alpn '("http/1.1" "h2"))
-                                                (cipher-suites #( #x1301 #x1302 #x1303 #x1304)))
+                                                (cipher-suites #( #x1301 #x1302 #x1303 #x1304))
+                                                (max-consecutive-key-updates 32))
   (make-tls13-server-driver
    :provider provider :certificate-chain chain :private-key key
    :alpn-protocols alpn :ticket-key-store ticket-key-store
    :supported-groups groups :cipher-suites cipher-suites
-   :clock clock :random (%server-driver-test-random)))
+   :clock clock :random (%server-driver-test-random)
+   :max-consecutive-key-updates max-consecutive-key-updates))
 
 (defun %server-driver-test-state-snapshot (driver)
   (list (cl-tls-kit::tls13-server-driver-state driver)
@@ -127,6 +129,21 @@
     (and alert send
          (= (getf alert :description) description)
          (equalp (getf send :wire) (vector 2 description)))))
+
+(defun %server-driver-test-with-key-update-derivation-counter (function)
+  (let* ((symbol (find-symbol "%TLS13-SERVER-UPDATE-TRAFFIC-SECRET" :cl-tls-kit))
+         (original (and symbol (fboundp symbol) (symbol-function symbol)))
+         (calls 0))
+    (unless original
+      (error "TLS server KeyUpdate derivation function is unavailable"))
+    (unwind-protect
+         (progn
+           (setf (symbol-function symbol)
+                 (lambda (&rest arguments)
+                   (incf calls)
+                   (apply original arguments)))
+           (funcall function (lambda () calls)))
+      (setf (symbol-function symbol) original))))
 
 (defun %server-driver-test-assert-client-hello-rejected
     (name driver wire expected-alert check-case)
@@ -265,6 +282,9 @@
                      (plaintext (cl-tls-kit:decrypt-tls13-traffic-record wire state))
                      (content-type (cl-tls-kit:tls-plaintext-content-type plaintext))
                      (fragment (cl-tls-kit:tls-plaintext-fragment plaintext)))
+                (when (= content-type 23)
+                  (tls13-server-driver-note-application-data-received
+                   (gethash :server endpoint)))
                 (case content-type
                   (22 (dispatch-handshake endpoint fragment level))
                   (23
@@ -646,11 +666,141 @@
                          (incf assertions)
                          (check condition message))
                        (new-server (&key (groups '(#x001d #x0017))
-                             (cipher-suites #( #x1301 #x1302 #x1303 #x1304)))
+                             (cipher-suites #( #x1301 #x1302 #x1303 #x1304))
+                             (max-consecutive-key-updates 32))
                          (%server-driver-test-server
                           provider chain private-key ticket-key-store
                           (lambda () now) :groups groups
-                          :cipher-suites cipher-suites)))
+                          :cipher-suites cipher-suites
+                          :max-consecutive-key-updates max-consecutive-key-updates))
+                       (complete-server (limit)
+                         (let ((server
+                                 (new-server :max-consecutive-key-updates limit)))
+                           (setf (cl-tls-kit::tls13-server-driver-state server) :complete
+                                 (cl-tls-kit::tls13-server-driver-hash server) :sha256
+                                 (cl-tls-kit::tls13-server-driver-client-application-secret
+                                  server)
+                                 (make-array 32 :element-type '(unsigned-byte 8)
+                                             :initial-element 1)
+                                 (cl-tls-kit::tls13-server-driver-server-application-secret
+                                  server)
+                                 (make-array 32 :element-type '(unsigned-byte 8)
+                                             :initial-element 2))
+                           server)))
+                (incf selected)
+                (check-case
+                 (= (cl-tls-kit::tls13-server-driver-max-consecutive-key-updates
+                     (new-server))
+                    32)
+                 "KeyUpdate consecutive limit defaults to 32")
+                (incf selected)
+                (check-case
+                 (handler-case
+                     (progn (new-server :max-consecutive-key-updates -1) nil)
+                   (tls13-server-driver-error (condition)
+                     (eq (tls13-server-driver-error-reason condition)
+                         :invalid-server-driver-configuration)))
+                 "negative KeyUpdate consecutive limit is rejected")
+                (%server-driver-test-with-key-update-derivation-counter
+                 (lambda (derivation-calls)
+                   (let ((wire (encode-handshake 24 (make-tls13-key-update 0))))
+                     (let ((server (complete-server 0)))
+                       (incf selected)
+                       (multiple-value-bind (returned events)
+                           (tls13-server-driver-step server wire :level :application)
+                         (check-case
+                          (and (eq returned server)
+                               (%server-driver-test-alert-p events 10))
+                          "zero KeyUpdate limit rejects the first update with unexpected_message")
+                         (check-case
+                          (and (zerop (funcall derivation-calls))
+                               (= (cl-tls-kit::tls13-server-driver-consecutive-key-updates
+                                   server)
+                                  1))
+                          "over-limit KeyUpdate is counted and rejected before key derivation")))
+                     (let ((server (complete-server 1)))
+                       (incf selected)
+                       (multiple-value-bind (returned events)
+                           (tls13-server-driver-step server wire :level :application)
+                         (check-case
+                          (and (eq returned server)
+                               (null (%server-driver-test-event events :alert))
+                               (= (cl-tls-kit::tls13-server-driver-consecutive-key-updates
+                                   server)
+                                  1)
+                               (= (funcall derivation-calls) 1))
+                          "KeyUpdate exactly at the configured limit is accepted"))
+                       (incf selected)
+                       (let ((calls-before (funcall derivation-calls)))
+                         (multiple-value-bind (returned events)
+                             (tls13-server-driver-step server wire :level :application)
+                           (check-case
+                            (and (eq returned server)
+                                 (%server-driver-test-alert-p events 10))
+                            "limit plus one KeyUpdate emits fatal unexpected_message")
+                           (check-case
+                            (= (funcall derivation-calls) calls-before)
+                            "limit plus one KeyUpdate is rejected before key derivation")))
+                       (tls13-server-driver-note-application-data-received server)
+                       (check-case
+                        (zerop (cl-tls-kit::tls13-server-driver-consecutive-key-updates
+                                server))
+                        "application-data notification resets the consecutive count")
+                       (incf selected)
+                       (multiple-value-bind (returned events)
+                           (tls13-server-driver-step server wire :level :application)
+                         (check-case
+                          (and (eq returned server)
+                               (null (%server-driver-test-event events :alert))
+                               (= (cl-tls-kit::tls13-server-driver-consecutive-key-updates
+                                   server)
+                                  1))
+                          "KeyUpdate is accepted again after application-data notification"))))))
+                (%server-driver-test-with-key-update-derivation-counter
+                 (lambda (derivation-calls)
+                   (let* ((server (complete-server 0))
+                          (wire (encode-handshake 24 (make-tls13-key-update 1)))
+                          (calls-before (funcall derivation-calls)))
+                     (incf selected)
+                     (multiple-value-bind (returned events)
+                         (tls13-server-driver-step server wire :level :application)
+                       (check-case
+                        (and (eq returned server)
+                             (%server-driver-test-alert-p events 10))
+                        "over-limit KeyUpdate request=1 emits unexpected_message")
+                       (check-case
+                        (notany
+                         (lambda (event)
+                           (let ((wire (getf event :wire)))
+                             (and (eq (getf event :type) :send)
+                                  (eq (getf event :content-type) :handshake)
+                                  (vectorp wire)
+                                  (plusp (length wire))
+                                  (= (aref wire 0) 24))))
+                         events)
+                        "over-limit KeyUpdate request=1 sends no response KeyUpdate")
+                       (check-case
+                        (= (funcall derivation-calls) calls-before)
+                        "over-limit KeyUpdate request=1 performs no key derivation")))
+                   (let* ((server (complete-server 1))
+                          (wire #(24 0 0 1 2))
+                          (count-before
+                            (cl-tls-kit::tls13-server-driver-consecutive-key-updates
+                             server))
+                          (calls-before (funcall derivation-calls)))
+                     (incf selected)
+                     (multiple-value-bind (returned events)
+                         (tls13-server-driver-step server wire :level :application)
+                       (check-case
+                        (and (eq returned server)
+                             (%server-driver-test-alert-p events 50))
+                        "malformed KeyUpdate emits decode_error")
+                       (check-case
+                        (and (= (cl-tls-kit::tls13-server-driver-consecutive-key-updates
+                                 server)
+                                count-before)
+                             (= (funcall derivation-calls) calls-before))
+                        "malformed KeyUpdate leaves the count unchanged without key derivation")))))
                 (let ((client-hello nil)
                       (client-wire nil))
                   (multiple-value-bind (client outgoing)

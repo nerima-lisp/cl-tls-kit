@@ -21,6 +21,7 @@ integration.
 | `:cipher-suites` | Supported TLS 1.3 suite IDs. Only `#x1301` through `#x1304` are accepted; the default preference order uses that sequence. |
 | `:clock` | Function returning Common Lisp universal time. Defaults to `get-universal-time`. |
 | `:random` | Function accepting a byte count and returning that many random octets. The default uses cl-crypto-kit randomness. |
+| `:max-consecutive-key-updates` | Nonnegative integer limit for accepted KeyUpdate messages since the last successfully decrypted record with `TLSInnerPlaintext.content_type` equal to `application_data`. Defaults to `32`; `0` rejects the first KeyUpdate. |
 
 The constructor checks the DER chain, supported key type, and that the private
 key matches the leaf certificate. For an SNI-selected chain, the driver checks
@@ -57,14 +58,32 @@ The returned event list contains plists with a `:type` key:
 Send events at `:initial` contain ServerHello or HelloRetryRequest. Encrypted
 Extensions, Certificate, CertificateVerify, and Finished use `:handshake`.
 NewSessionTicket and application traffic secrets use `:application`. The step
-accepts ClientHello and client Finished in their expected states; other input,
-including post-handshake messages at `:application`, produces an alert. The
-`:send` event's `:wire` carries encoded handshake bytes, including the four-byte
-header, or the two alert bytes; it never contains a TLS record. A TCP adapter
-must frame outbound messages in records, decrypt inbound records, and install
-keys from secret events. A QUIC adapter passes handshake bytes and traffic
-secrets through its TLS integration without TLS record framing. Treat secret
-event values as key material and do not write them to logs.
+accepts ClientHello and client Finished in their expected states. At
+`:application`, it accepts KeyUpdate messages subject to the configured limit;
+other post-handshake messages produce an alert. The `:send` event's `:wire`
+carries encoded handshake bytes, including the four-byte header, or the two
+alert bytes; it never contains a TLS record. A TCP adapter must frame outbound
+messages in records, decrypt inbound records, and install keys from secret
+events. A QUIC adapter passes handshake bytes and traffic secrets through its
+TLS integration without TLS record framing. Treat secret event values as key
+material and do not write them to logs.
+
+## Limit KeyUpdate messages
+
+The driver counts accepted KeyUpdate messages since the last successfully
+decrypted record whose `TLSInnerPlaintext.content_type` is `application_data`.
+If another KeyUpdate would exceed `:max-consecutive-key-updates`, the driver
+returns a fatal `unexpected_message` alert before deriving keys for that
+update. Pass KeyUpdate handshake messages to `tls13-server-driver-step` with
+`:level :application`.
+
+The driver does not decrypt records. After successfully decrypting an inbound
+record, the connection adapter must call
+`(tls13-server-driver-note-application-data-received driver)` only when the
+inner `TLSInnerPlaintext.content_type` is `application_data`. Call it for every
+such record, including one with an empty fragment. Do not call it for an
+encrypted record whose inner content type is `handshake`, such as one carrying
+KeyUpdate.
 
 ## Negotiation and resumption
 

@@ -157,6 +157,7 @@
    #:tls13-client-driver-resumed-p
    #:tls13-server-driver #:tls13-server-driver-p
    #:make-tls13-server-driver #:tls13-server-driver-step
+   #:tls13-server-driver-note-application-data-received
    #:tls13-server-driver-error #:tls13-server-driver-error-reason
    #:tls13-server-ticket-key-store #:tls13-server-ticket-key-store-p
    #:make-tls13-server-ticket-key-store
