@@ -380,6 +380,26 @@
           (funcall check-case
                    (zerop (gethash :certificate-verify-count resumed))
                    "resumed handshake omits CertificateVerify")
+          (let* ((client-read-state
+                   (cl-tls-kit::tls13-client-driver-application-read-state resumed-client))
+                 (client-write-state
+                   (cl-tls-kit::tls13-client-driver-application-write-state resumed-client))
+                 (old-client-read-secret
+                   (copy-seq (tls13-traffic-state-secret client-read-state)))
+                 (old-client-write-secret
+                   (copy-seq (tls13-traffic-state-secret client-write-state))))
+            (tls13-client-driver-key-update resumed-client 1)
+            (funcall check-case
+                     (null (tls13-client-driver-read-record resumed-client))
+                     "server replies to a client KeyUpdate request")
+            (funcall check-case
+                     (not (equalp old-client-read-secret
+                                  (tls13-traffic-state-secret client-read-state)))
+                     "client updates its read key after the server KeyUpdate")
+            (funcall check-case
+                     (not (equalp old-client-write-secret
+                                  (tls13-traffic-state-secret client-write-state)))
+                     "client updates its write key after sending KeyUpdate"))
           (let* ((payload #(99 108 105 101 110 116 45 100 97 116 97))
                  (reply nil))
             (tls13-client-driver-write resumed-client payload)
@@ -391,7 +411,25 @@
                      (and reply
                           (= (tls-plaintext-content-type reply) 23)
                           (equalp (tls-plaintext-fragment reply) payload))
-                     "client receives the encrypted application-data response"))))
+                     "client receives the encrypted application-data response")
+            (funcall check-case
+                     (equalp
+                      (tls13-traffic-state-secret
+                       (gethash (list :read :application)
+                                (gethash :read-states resumed)))
+                      (tls13-traffic-state-secret
+                       (cl-tls-kit::tls13-client-driver-application-write-state
+                        resumed-client)))
+                     "server installs the client write key after KeyUpdate")
+            (funcall check-case
+                     (equalp
+                      (tls13-traffic-state-secret
+                       (gethash (list :write :application)
+                                (gethash :write-states resumed)))
+                      (tls13-traffic-state-secret
+                       (cl-tls-kit::tls13-client-driver-application-read-state
+                        resumed-client)))
+                     "client and server use matching application keys after KeyUpdate"))))
       t)))
 
 (defun %server-driver-test-psk-client-hello
@@ -621,7 +659,91 @@
                     (multiple-value-bind (wire hello)
                         (%server-driver-test-client-hello client outgoing)
                       (setf client-hello hello
-                            client-wire wire)))
+                            client-wire wire))
+                    (let* ((marker #(71 82 83 69 67 82 69 84))
+                           (marker-text "71 82 83 69 67 82 69 84")
+                           (server (new-server))
+                           (key (cl-tls-kit::tls13-server-ticket-key-store-current
+                                 ticket-key-store))
+                           (original-key-secret
+                             (cl-tls-kit::%tls13-server-ticket-key-secret key)))
+                      (unwind-protect
+                           (progn
+                             (setf (cl-tls-kit::%tls13-server-ticket-key-secret key)
+                                   (copy-seq marker)
+                                   (cl-tls-kit::tls13-server-driver-client-handshake-secret
+                                    server)
+                                   (copy-seq marker)
+                                   (cl-tls-kit::tls13-client-driver-handshake-secret client)
+                                   (copy-seq marker))
+                             (check-case
+                              (not (search marker-text (write-to-string server)))
+                              "server driver printer hides handshake secrets")
+                             (check-case
+                              (not (search marker-text
+                                           (write-to-string ticket-key-store)))
+                              "ticket store printer hides ticket-key secrets")
+                             (check-case
+                              (not (search marker-text (write-to-string key)))
+                              "ticket key printer hides its secret")
+                             (check-case
+                              (not (search marker-text (write-to-string client)))
+                              "client driver printer hides handshake secrets"))
+                        (setf (cl-tls-kit::%tls13-server-ticket-key-secret key)
+                              original-key-secret)))
+                    (let* ((server (new-server))
+                           (short-finished
+                             (encode-handshake
+                              20 (make-tls13-finished
+                                  (make-array 31 :element-type '(unsigned-byte 8)
+                                              :initial-element 0)))))
+                      (setf (cl-tls-kit::tls13-server-driver-state server)
+                            :awaiting-client-finished
+                            (cl-tls-kit::tls13-server-driver-hash server) :sha256
+                            (cl-tls-kit::tls13-server-driver-client-finished-key server)
+                            (make-array 32 :element-type '(unsigned-byte 8)
+                                        :initial-element 1))
+                      (incf selected)
+                      (multiple-value-bind (returned events)
+                          (tls13-server-driver-step server short-finished :level :handshake)
+                        (check-case
+                         (and (eq returned server)
+                              (%server-driver-test-alert-p events 50))
+                         "Finished with verify_data shorter than SHA-256 is rejected")))
+                    (let* ((server (new-server))
+                           (decoder (find-symbol "DECODE-FINISHED" :cl-tls-kit))
+                           (original (symbol-function decoder))
+                           (decode-calls 0)
+                           (oversized
+                             (make-array (+ 5 cl-tls-kit::+tls13-server-max-handshake-size+)
+                                         :element-type '(unsigned-byte 8)
+                                         :initial-element 0)))
+                      (setf (aref oversized 0) 20)
+                      (replace oversized
+                               (cl-tls-kit::%tls13-server-u24 (- (length oversized) 4))
+                               :start1 1)
+                      (setf (cl-tls-kit::tls13-server-driver-state server)
+                            :awaiting-client-finished
+                            (cl-tls-kit::tls13-server-driver-hash server) :sha256
+                            (cl-tls-kit::tls13-server-driver-client-finished-key server)
+                            (make-array 32 :element-type '(unsigned-byte 8)
+                                        :initial-element 1))
+                      (incf selected)
+                      (unwind-protect
+                           (progn
+                             (setf (symbol-function decoder)
+                                   (lambda (bytes)
+                                     (incf decode-calls)
+                                     (funcall original bytes)))
+                             (multiple-value-bind (returned events)
+                                 (tls13-server-driver-step server oversized :level :handshake)
+                               (check-case
+                                (and (eq returned server)
+                                     (%server-driver-test-alert-p events 50))
+                                "Finished larger than one MiB is rejected"))
+                             (check-case (zerop decode-calls)
+                                         "oversized Finished is rejected before decoding"))
+                        (setf (symbol-function decoder) original)))
                   (let* ((duplicate-hello
                            (%server-driver-test-duplicate-extension-wire
                             client-wire 13))
@@ -786,11 +908,31 @@
                              :cipher-suites #( #x1302))
                           (declare (ignore ignored))
                           (incf selected)
-                          (%server-driver-test-assert-client-hello-rejected
-                           "PSK hash mismatch" hash-mismatch-server hash-mismatch-wire
-                           47 #'check-case)
-                          (check-case (= (funcall signature-calls) 1)
-                                      "PSK with a different suite hash is rejected before signing")))
+                          (multiple-value-bind (returned events)
+                              (tls13-server-driver-step
+                               hash-mismatch-server hash-mismatch-wire :level :initial)
+                            (setf hash-mismatch-server returned)
+                            (let ((sent-types
+                                    (mapcar (lambda (event)
+                                              (aref (getf event :wire) 0))
+                                            (%server-driver-test-events events :send))))
+                              (check-case
+                               (and (null (%server-driver-test-event events :alert))
+                                    (eq (cl-tls-kit::tls13-server-driver-state
+                                         hash-mismatch-server)
+                                        :awaiting-client-finished)
+                                    (not (cl-tls-kit::tls13-server-driver-resumed-p
+                                          hash-mismatch-server))
+                                    (= (cl-tls-kit::tls13-server-driver-selected-suite
+                                        hash-mismatch-server)
+                                       #x1302))
+                               "PSK with a different suite hash falls back to a full handshake")
+                              (check-case (member 11 sent-types)
+                                          "hash-mismatched PSK fallback sends Certificate")
+                              (check-case (member 15 sent-types)
+                                          "hash-mismatched PSK fallback sends CertificateVerify")
+                              (check-case (= (funcall signature-calls) 2)
+                                          "hash-mismatched PSK fallback signs once")))))
                       (let ((bad-binder-server (new-server)))
                         (multiple-value-bind (ignored bad-binder-wire)
                             (%server-driver-test-psk-client-hello
@@ -800,7 +942,7 @@
                           (incf selected)
                           (%server-driver-test-assert-client-hello-rejected
                            "bad PSK binder" bad-binder-server bad-binder-wire 51 #'check-case)
-                          (check-case (= (funcall signature-calls) 1)
+                          (check-case (= (funcall signature-calls) 2)
                                       "invalid PSK binder is rejected before signing"))))
                     (let* ((expired-now (+ now (getf ticket-fields :lifetime) 1))
                            (expired-server
@@ -819,7 +961,7 @@
                         (incf selected)
                         (%server-driver-test-assert-client-hello-rejected
                          "expired PSK ticket" expired-server expired-wire 47 #'check-case)
-                        (check-case (= (funcall signature-calls) 1)
+                        (check-case (= (funcall signature-calls) 2)
                                     "expired ticket is rejected before signing")))
                     (let* ((unknown-identity (copy-seq (getf ticket :identity)))
                            (unknown-server (new-server)))
@@ -849,7 +991,7 @@
                                 (not (cl-tls-kit::tls13-server-driver-resumed-p
                                       unknown-server)))
                            "unknown PSK identity begins a full handshake")
-                          (check-case (= (funcall signature-calls) 2)
+                          (check-case (= (funcall signature-calls) 3)
                                       "unknown PSK fallback signs CertificateVerify once"))))))
                 (incf selected)
                 (multiple-value-bind (server client alpn ticket hrr-count
@@ -857,33 +999,43 @@
                     (%server-driver-test-memory-handshake
                      provider chain private-key anchor ticket-key-store now
                      :groups '(#x0017))
-                  (declare (ignore server alpn ticket events outgoing))
+                  (declare (ignore alpn ticket events outgoing))
                   (check-case (= hrr-count 1)
                               "server requests the mutually supported P-256 share")
                   (check-case (eq (cl-tls-kit::tls13-client-driver-state client) :connected)
                               "memory client completes a HelloRetryRequest handshake")
                   (check-case (= client-cv-count 1)
                               "client verifies CertificateVerify after HelloRetryRequest")
-                  (check-case (= (funcall signature-calls) 3)
+                  (check-case
+                   (and (null (cl-tls-kit::tls13-server-driver-client-handshake-secret
+                               server))
+                        (null (cl-tls-kit::tls13-server-driver-server-handshake-secret
+                               server))
+                        (null (cl-tls-kit::tls13-server-driver-client-finished-key server))
+                        (null (cl-tls-kit::tls13-server-driver-master-secret server))
+                        (null (cl-tls-kit::tls13-server-driver-resumption-master-secret
+                               server)))
+                   "server clears transient secrets after client Finished")
+                  (check-case (= (funcall signature-calls) 4)
                               "HelloRetryRequest full handshake signs once"))
                 (progn
                   (incf selected)
                   (%server-driver-test-client-server-resumption-roundtrip
                    provider chain private-key anchor ticket-key-store now (function check-case))
-                  (check-case (= (funcall signature-calls) 4)
+                  (check-case (= (funcall signature-calls) 5)
                               "client and server drivers resume without another signature")
                   (incf selected)
                   (%server-driver-test-client-server-resumption-roundtrip
                    provider chain private-key anchor ticket-key-store now (function check-case)
                    :suite #x1302)
-                  (check-case (= (funcall signature-calls) 5)
+                  (check-case (= (funcall signature-calls) 6)
                               "SHA-384 client and server drivers resume without another signature")
                   (incf selected)
                   (%server-driver-test-client-server-resumption-roundtrip
                    provider chain private-key anchor ticket-key-store now (function check-case)
                    :suite #x1302 :hello-retry-p t
                    :client-cipher-suites #( #x1301 #x1302))
-                  (check-case (= (funcall signature-calls) 6)
+                  (check-case (= (funcall signature-calls) 7)
                               "SHA-384 HelloRetryRequest resumption signs only the full handshake")
                   (check-case (plusp selected)
                               "server driver selected nonzero test cases"))
@@ -891,7 +1043,7 @@
                             "server driver executed nonzero assertions")
                 (format t "TLS 1.3 server driver: selected test count: ~D; assertions: ~D~%"
                         selected assertions)
-                t))))
+                t)))))
       (when (probe-file certificate) (ignore-errors (delete-file certificate)))
       (when (probe-file key-path) (ignore-errors (delete-file key-path)))
       (when (probe-file directory)

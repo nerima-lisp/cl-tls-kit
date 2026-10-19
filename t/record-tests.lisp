@@ -14,6 +14,23 @@
     copy))
 
 (defun run-record-tests ()
+  (let* ((sentinel "provider-private-sentinel")
+         (failure
+           (handler-case
+               (progn
+                 (cl-tls-kit::%provider-result
+                  (lambda (&rest arguments)
+                    (declare (ignore arguments))
+                    (error 'tls-record-error :reason sentinel))
+                  #() #() #() #() :decrypt)
+                 nil)
+             (tls-record-error (condition) condition))))
+    (record-test-check
+     (and failure
+          (eq (class-name (class-of failure)) 'tls-record-error)
+          (string= (tls-record-error-reason failure) "AEAD provider failed")
+          (not (search sentinel (tls-record-error-reason failure))))
+     "provider errors preserve record condition type with fixed public reason"))
   (let* ((payload #(1 2 3))
          (plain (make-tls-plaintext 23 payload))
          (encoded (encode-tls-plaintext plain))

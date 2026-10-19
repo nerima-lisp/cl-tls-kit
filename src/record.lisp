@@ -173,10 +173,11 @@
   (unless (functionp provider)
     (%record-fail 'tls-aead-error (format nil "~A provider is not callable" operation)))
   (handler-case (%record-octets (funcall provider key nonce input aad))
-    (tls-record-error (condition) (error condition))
-    (error (condition)
-      (%record-fail 'tls-aead-error
-                    (format nil "~A provider failed: ~A" operation condition)))))
+    (tls-record-error (condition)
+      (error (make-condition (class-name (class-of condition))
+                             :reason "AEAD provider failed")))
+    (error ()
+      (%record-fail 'tls-aead-error "AEAD provider failed"))))
 
 (defun encrypt-tls-record (plaintext key iv sequence-number aead-encrypt
                            &key (padding-length 0) (tag-length 16))

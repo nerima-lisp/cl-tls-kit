@@ -5,6 +5,7 @@
   driver
   suite
   negotiated-suite
+  negotiated-group
   (read-states (make-hash-table :test #'equal))
   (write-states (make-hash-table :test #'equal))
   (handshake-complete-p nil)
@@ -90,6 +91,9 @@
     (#x1302
      (cl-tls-kit::make-tls13-traffic-state
       provider :sha384 :aes-256-gcm secret 32 12))
+    (#x1303
+     (cl-tls-kit::make-tls13-traffic-state
+      provider :sha256 :chacha20-poly1305 secret 32 12))
     (otherwise
      (error "OpenSSL E2E has no traffic-state parameters for suite ~X" suite))))
 
@@ -171,7 +175,9 @@
     (multiple-value-bind (driver events)
         (cl-tls-kit:tls13-server-driver-step
          (%server-openssl-e2e-session-driver session) wire :level level)
-      (setf (%server-openssl-e2e-session-driver session) driver)
+      (setf (%server-openssl-e2e-session-driver session) driver
+            (%server-openssl-e2e-session-negotiated-group session)
+            (cl-tls-kit::tls13-server-driver-selected-group driver))
       (%server-openssl-e2e-process-events session provider stream events))))
 
 (defun %server-openssl-e2e-feed-handshakes
@@ -261,8 +267,11 @@
    (when session-out
      (list "-sess_out" session-out "-msg" "-trace" "-msgfile"
            (format nil "~A.trace" session-out)))
-   (when (= suite #x1302)
-     (list "-ciphersuites" "TLS_AES_256_GCM_SHA384"))))
+   (when (or (= suite #x1302) (= suite #x1303))
+     (list "-ciphersuites"
+           (case suite
+             (#x1302 "TLS_AES_256_GCM_SHA384")
+             (#x1303 "TLS_CHACHA20_POLY1305_SHA256"))))))
 
 (defun %server-openssl-e2e-run-connection
     (openssl provider certificate-chain private-key ticket-key-store groups
@@ -450,8 +459,30 @@
                    (check (string= (%server-openssl-e2e-session-negotiated-alpn resumed)
                                    "http/1.1")
                           "OpenSSL retains ALPN on a resumed handshake")))
-               (check (= selected 4) "OpenSSL server E2E selects all four cases")
-               (check (= assertions 17) "OpenSSL server E2E runs all assertions")
+               (progn
+                 (incf selected)
+                 (let ((chacha
+                         (%server-openssl-e2e-run-connection
+                          openssl provider certificate-chain private-key
+                          ticket-key-store "P-256" :suite #x1303
+                          :server-groups '(#x0017))))
+                   (incf assertions)
+                   (check (and (= (%server-openssl-e2e-session-negotiated-group chacha)
+                                  #x0017)
+                               (= (%server-openssl-e2e-session-negotiated-suite chacha)
+                                  #x1303)
+                               (zerop (%server-openssl-e2e-session-hello-retry-count chacha)))
+                          "OpenSSL negotiates P-256 with ChaCha20-Poly1305 without HelloRetryRequest")
+                   (incf assertions)
+                   (check (and (%server-openssl-e2e-session-handshake-complete-p chacha)
+                               (not (%server-openssl-e2e-session-resumed-p chacha)))
+                          "OpenSSL completes a full P-256 ChaCha20-Poly1305 handshake")
+                   (incf assertions)
+                   (check (string= (%server-openssl-e2e-session-negotiated-alpn chacha)
+                                   "http/1.1")
+                          "OpenSSL negotiates ALPN with P-256 and ChaCha20-Poly1305")))
+               (check (= selected 5) "OpenSSL server E2E selects all five cases")
+               (check (= assertions 20) "OpenSSL server E2E runs all assertions")
                (format t "OpenSSL server E2E: selected test count: ~D; assertions: ~D~%"
                        selected assertions)
                t)
