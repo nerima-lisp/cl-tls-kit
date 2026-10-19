@@ -357,9 +357,25 @@
                     (equalp finished *rfc8448-server-finished-wire*)
                     :server-finished-wire)
                    (multiple-value-setq (driver finish-events)
-                     (tls13-server-driver-step
-                      continuation-driver *rfc8448-client-finished-wire*
-                      :level :handshake))))
+                     (let* ((symbol (find-symbol "%TLS13-SERVER-ISSUE-TICKET" "CL-TLS-KIT"))
+                            (original (symbol-function symbol))
+                            (captured nil))
+                       (unwind-protect
+                            (progn
+                              (setf (symbol-function symbol)
+                                    (lambda (driver resumption-master-secret)
+                                      (setf captured (copy-seq resumption-master-secret))
+                                      (funcall original driver resumption-master-secret)))
+                              (multiple-value-prog1
+                                  (tls13-server-driver-step
+                                   continuation-driver *rfc8448-client-finished-wire*
+                                   :level :handshake)
+                                (%rfc8448-server-check
+                                 (equalp captured *rfc8448-server-resumption-master-secret*)
+                                 :resumption-master-secret)))
+                         (setf (symbol-function symbol) original)
+                         (when captured
+                           (cl-tls-kit::%tls13-server-zero-octets captured)))))))
                (let* ((event (%rfc8448-server-event
                               events :send :level :handshake :wire-type 11))
                       (wire (and event (getf event :wire)))
@@ -425,10 +441,8 @@
                         *rfc8448-server-application-traffic-secret*)
                 :server-application-traffic-secret)
                (%rfc8448-server-check
-                (equalp
-                 (cl-tls-kit::tls13-server-driver-resumption-master-secret driver)
-                 *rfc8448-server-resumption-master-secret*)
-                :resumption-master-secret)
+                (null (cl-tls-kit::tls13-server-driver-resumption-master-secret driver))
+                :resumption-master-secret-slot-cleared)
                (%rfc8448-server-check
                 (and (%rfc8448-server-event finish-events :ticket-issued)
                      (let ((complete
@@ -546,9 +560,9 @@
                                   (tls13-certificate-verify-signature-input
                                    :server transcript-hash))
                                 (signature
-                                  (tls13-certificate-verify-signature verify-message)))
+                                  (cl-tls-kit::tls13-certificate-verify-signature verify-message)))
                            (%rfc8448-server-check
-                            (and (= (tls13-certificate-verify-algorithm verify-message)
+                            (and (= (cl-tls-kit::tls13-certificate-verify-algorithm verify-message)
                                     #x0807)
                                  (= (length signature) 64))
                             :production-ed25519-certificate-verify-shape)
