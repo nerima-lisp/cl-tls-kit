@@ -11,8 +11,17 @@
             (:constructor %make-tls13-server-ticket-key-store))
   current previous random ticket-lifetime lock)
 
+(defmethod print-object ((store tls13-server-ticket-key-store) stream)
+  (print-unreadable-object (store stream :type t)
+    (format stream "current key ~:[absent~;present~], previous keys ~D"
+            (not (null (tls13-server-ticket-key-store-current store)))
+            (length (tls13-server-ticket-key-store-previous store)))))
+
 (defstruct (%tls13-server-ticket-key (:constructor %make-tls13-server-ticket-key))
   id secret decrypt-until)
+
+(defmethod print-object ((key %tls13-server-ticket-key) stream)
+  (print-unreadable-object (key stream :type t)))
 
 (defstruct (tls13-server-driver (:constructor %make-tls13-server-driver))
   provider certificate-chain private-key alpn-protocols sni-callback
@@ -25,6 +34,13 @@
   client-handshake-secret server-handshake-secret client-finished-key
   master-secret resumption-master-secret
   client-application-secret server-application-secret)
+
+(defmethod print-object ((driver tls13-server-driver) stream)
+  (print-unreadable-object (driver stream :type t)
+    (format stream "state ~A, suite ~S, group ~S"
+            (tls13-server-driver-state driver)
+            (tls13-server-driver-selected-suite driver)
+            (tls13-server-driver-selected-group driver))))
 
 (defconstant +tls13-server-max-handshake-size+ (* 1024 1024))
 (defconstant +tls13-server-ticket-aead+ :aes-256-gcm)
@@ -56,6 +72,11 @@
 (defun %tls13-server-octets-p (value)
   (and (vectorp value)
        (subtypep (array-element-type value) '(unsigned-byte 8))))
+
+(defun %tls13-server-zero-octets (value)
+  (when (%tls13-server-octets-p value)
+    (fill value 0))
+  nil)
 
 (defun %tls13-server-octets (value reason alert)
   (unless (%tls13-server-octets-p value)
@@ -610,23 +631,31 @@ random octets. TICKET-LIFETIME is the maximum ticket lifetime in seconds."
          (now (%tls13-server-clock-unix driver))
          (key (%tls13-server-find-ticket-key store key-id now)))
     (unless key (return-from %tls13-server-open-ticket nil))
-    (when (< (length identity) 32)
-      (%tls13-server-fail :malformed-ticket 47))
-    (let* ((nonce (subseq identity 4 16))
-           (ciphertext (subseq identity 16))
-           (aad (%tls13-server-cat #(99 108 45 116 108 115 45 107 105 116 45 116 105 99 107 101 116 45 118 49)
-                                  key-id))
-           (payload (handler-case
-                        (tls13-aead-open (tls13-server-driver-provider driver)
-                                         +tls13-server-ticket-aead+ key nonce ciphertext aad)
-                      (error () nil))))
-      (unless payload (return-from %tls13-server-open-ticket nil))
-      (let* ((fields (%tls13-server-decode-ticket-payload driver payload))
-             (issued (getf fields :issued))
-             (lifetime (getf fields :lifetime)))
-        (unless (and (<= issued now) (< (- now issued) lifetime))
-          (%tls13-server-fail :expired-ticket 47))
-        fields))))
+    (unwind-protect
+         (progn
+           (when (< (length identity) 32)
+             (%tls13-server-fail :malformed-ticket 47))
+           (let* ((nonce (subseq identity 4 16))
+                  (ciphertext (subseq identity 16))
+                  (aad (%tls13-server-cat
+                        #(99 108 45 116 108 115 45 107 105 116 45 116 105 99 107
+                          101 116 45 118 49)
+                        key-id))
+                  (payload (handler-case
+                               (tls13-aead-open
+                                (tls13-server-driver-provider driver)
+                                +tls13-server-ticket-aead+ key nonce ciphertext aad)
+                             (error () nil))))
+             (unless payload (return-from %tls13-server-open-ticket nil))
+             (unwind-protect
+                  (let* ((fields (%tls13-server-decode-ticket-payload driver payload))
+                         (issued (getf fields :issued))
+                         (lifetime (getf fields :lifetime)))
+                    (unless (and (<= issued now) (< (- now issued) lifetime))
+                      (%tls13-server-fail :expired-ticket 47))
+                    fields)
+               (%tls13-server-zero-octets payload))))
+      (%tls13-server-zero-octets key))))
 
 (defun %tls13-server-validate-ticket-age (driver psk-fields ticket)
   (let* ((now (%tls13-server-clock-unix driver))
@@ -658,36 +687,56 @@ random octets. TICKET-LIFETIME is the maximum ticket lifetime in seconds."
              (ticket (%tls13-server-open-ticket driver (getf psk-fields :identity)))
              (ticket-suite (and ticket (getf ticket :suite))))
         (when ticket
-          (unless (eq (tls13-cipher-suite-hash suite)
-                      (tls13-cipher-suite-hash ticket-suite))
-            (%tls13-server-fail :psk-hash-mismatch 47))
-          (%tls13-server-validate-ticket-age driver psk-fields ticket)
-          (unless (equal (getf ticket :alpn) selected-alpn)
-            (%tls13-server-fail :psk-alpn-mismatch 47))
-          (unless (equal (getf ticket :hostname) (getf fields :hostname))
-            (%tls13-server-fail :psk-server-name-mismatch 47))
-          (let* ((hash (tls13-cipher-suite-hash ticket-suite))
-                 (early-secret (tls13-early-secret (tls13-server-driver-provider driver)
-                                                   hash (getf ticket :psk)))
-                 (binder-key (tls13-derive-secret
-                              (tls13-server-driver-provider driver) hash early-secret
-                              "res binder"
-                              (tls13-empty-hash (tls13-server-driver-provider driver) hash)))
-                 (finished-key (tls13-finished-key (tls13-server-driver-provider driver)
-                                                   hash binder-key))
-                 (prefix-length (%tls13-server-psk-prefix-length wire))
-                 (binder-transcript
-                   (%tls13-server-cat transcript-prefix (subseq wire 0 prefix-length)))
-                 (expected (tls13-compute-finished-verify-data
-                            (tls13-server-driver-provider driver) hash finished-key
-                            (%tls13-server-digest-hash driver hash binder-transcript))))
-            (unless (tls13-provider-constant-time-equal-p
-                     (tls13-server-driver-provider driver) expected
-                     (getf psk-fields :binder))
-              (%tls13-server-fail :psk-binder-mismatch 51)))
-          (setf (getf ticket :age) (getf psk-fields :age)
-                (getf ticket :identity) (copy-seq (getf psk-fields :identity)))
-          ticket)))))
+          (let ((accepted-p nil))
+            (unwind-protect
+                 (when (eq (tls13-cipher-suite-hash suite)
+                           (tls13-cipher-suite-hash ticket-suite))
+                   (%tls13-server-validate-ticket-age driver psk-fields ticket)
+                   (unless (equal (getf ticket :alpn) selected-alpn)
+                     (%tls13-server-fail :psk-alpn-mismatch 47))
+                   (unless (equal (getf ticket :hostname) (getf fields :hostname))
+                     (%tls13-server-fail :psk-server-name-mismatch 47))
+                   (let ((early-secret nil)
+                         (binder-key nil)
+                         (finished-key nil)
+                         (prefix-length (%tls13-server-psk-prefix-length wire))
+                         (expected nil))
+                     (unwind-protect
+                          (let ((hash (tls13-cipher-suite-hash ticket-suite)))
+                            (setf early-secret
+                                  (tls13-early-secret
+                                   (tls13-server-driver-provider driver) hash
+                                   (getf ticket :psk))
+                                  binder-key
+                                  (tls13-derive-secret
+                                   (tls13-server-driver-provider driver) hash early-secret
+                                   "res binder"
+                                   (tls13-empty-hash
+                                    (tls13-server-driver-provider driver) hash))
+                                  finished-key
+                                  (tls13-finished-key
+                                   (tls13-server-driver-provider driver) hash binder-key)
+                                  expected
+                                  (tls13-compute-finished-verify-data
+                                   (tls13-server-driver-provider driver) hash finished-key
+                                   (%tls13-server-digest-hash
+                                    driver hash
+                                    (%tls13-server-cat
+                                     transcript-prefix
+                                     (subseq wire 0 prefix-length)))))
+                            (unless (tls13-provider-constant-time-equal-p
+                                     (tls13-server-driver-provider driver) expected
+                                     (getf psk-fields :binder))
+                              (%tls13-server-fail :psk-binder-mismatch 51)))
+                       (dolist (secret (list expected finished-key binder-key early-secret))
+                         (%tls13-server-zero-octets secret))))
+                   (setf (getf ticket :age) (getf psk-fields :age)
+                         (getf ticket :identity)
+                         (copy-seq (getf psk-fields :identity))
+                         accepted-p t)
+                   ticket)
+              (unless accepted-p
+                (%tls13-server-zero-octets (getf ticket :psk))))))))))
 
 (defun %tls13-server-error-alert (condition)
   (typecase condition
@@ -808,11 +857,13 @@ random octets. TICKET-LIFETIME is the maximum ticket lifetime in seconds."
 (defun %tls13-server-seal-ticket (driver payload)
   (multiple-value-bind (key-id key)
       (%tls13-server-current-ticket-key (tls13-server-driver-ticket-key-store driver))
-    (let* ((nonce (%tls13-server-random driver 12))
-           (ciphertext (tls13-aead-seal (tls13-server-driver-provider driver)
-                                        +tls13-server-ticket-aead+ key nonce payload
-                                        (%tls13-server-ticket-aad key-id))))
-      (%tls13-server-cat key-id nonce ciphertext))))
+    (unwind-protect
+         (let* ((nonce (%tls13-server-random driver 12))
+                (ciphertext (tls13-aead-seal (tls13-server-driver-provider driver)
+                                             +tls13-server-ticket-aead+ key nonce payload
+                                             (%tls13-server-ticket-aad key-id))))
+           (%tls13-server-cat key-id nonce ciphertext))
+      (%tls13-server-zero-octets key))))
 
 (defun %tls13-server-issue-ticket (driver resumption-master-secret)
   (let* ((store (tls13-server-driver-ticket-key-store driver))
@@ -824,16 +875,23 @@ random octets. TICKET-LIFETIME is the maximum ticket lifetime in seconds."
                (tls13-server-driver-provider driver)
                (tls13-server-driver-hash driver)
                resumption-master-secret nonce))
-         (payload (%tls13-server-ticket-payload
-                   issued lifetime age-add (tls13-server-driver-selected-suite driver)
-                   (tls13-server-driver-selected-alpn driver)
-                   (tls13-server-driver-sni-hostname driver) psk))
-         (identity (%tls13-server-seal-ticket driver payload))
-         (message (encode-handshake
-                   4 (make-tls13-new-session-ticket lifetime nonce identity nil age-add))))
-    (values message
-            (list :type :ticket-issued :identity (copy-seq identity)
-                  :lifetime lifetime))))
+         (payload nil))
+    (unwind-protect
+         (progn
+           (setf payload
+                 (%tls13-server-ticket-payload
+                  issued lifetime age-add (tls13-server-driver-selected-suite driver)
+                  (tls13-server-driver-selected-alpn driver)
+                  (tls13-server-driver-sni-hostname driver) psk))
+           (let* ((identity (%tls13-server-seal-ticket driver payload))
+                  (message (encode-handshake
+                            4 (make-tls13-new-session-ticket
+                               lifetime nonce identity nil age-add))))
+             (values message
+                     (list :type :ticket-issued :identity (copy-seq identity)
+                           :lifetime lifetime))))
+      (%tls13-server-zero-octets payload)
+      (%tls13-server-zero-octets psk))))
 
 (defun %tls13-server-send-event (level wire &optional (content-type :handshake))
   (list :type :send :level level :content-type content-type :wire wire))
@@ -854,47 +912,69 @@ random octets. TICKET-LIFETIME is the maximum ticket lifetime in seconds."
            (hash (tls13-server-driver-hash driver))
            (server-finished-key
              (tls13-finished-key
-              provider hash (tls13-server-driver-server-handshake-secret driver)))
-           (server-finished-data
-             (tls13-compute-finished-verify-data
-              provider hash server-finished-key
-              (%tls13-server-digest-hash driver hash transcript-before-finished)))
-           (server-finished-wire
-             (encode-handshake 20 (make-tls13-finished server-finished-data)))
-           (transcript-through-finished
-             (%tls13-server-handshake-transcript transcript-before-finished
-                                                 server-finished-wire))
-           (application-transcript-hash
-             (%tls13-server-digest-hash driver hash transcript-through-finished))
-           (client-application-secret
-             (tls13-traffic-secret
-              provider hash (tls13-server-driver-master-secret driver) :client
-              application-transcript-hash :phase :application))
-           (server-application-secret
-             (tls13-traffic-secret
-              provider hash (tls13-server-driver-master-secret driver) :server
-              application-transcript-hash :phase :application)))
-      (setf (tls13-server-driver-transcript driver) transcript-through-finished
-            (tls13-server-driver-client-application-secret driver)
-            client-application-secret
-            (tls13-server-driver-server-application-secret driver)
-            server-application-secret)
-      server-finished-wire)))
+              provider hash (tls13-server-driver-server-handshake-secret driver))))
+       (unwind-protect
+            (let* ((server-finished-data
+                     (tls13-compute-finished-verify-data
+                      provider hash server-finished-key
+                      (%tls13-server-digest-hash driver hash transcript-before-finished)))
+                   (server-finished-wire
+                     (encode-handshake 20 (make-tls13-finished server-finished-data)))
+                   (transcript-through-finished
+                     (%tls13-server-handshake-transcript transcript-before-finished
+                                                         server-finished-wire))
+                   (application-transcript-hash
+                     (%tls13-server-digest-hash driver hash transcript-through-finished))
+                   (client-application-secret
+                     (tls13-traffic-secret
+                      provider hash (tls13-server-driver-master-secret driver) :client
+                      application-transcript-hash :phase :application))
+                   (server-application-secret
+                     (tls13-traffic-secret
+                      provider hash (tls13-server-driver-master-secret driver) :server
+                      application-transcript-hash :phase :application)))
+              (setf (tls13-server-driver-transcript driver) transcript-through-finished
+                    (tls13-server-driver-client-application-secret driver)
+                    client-application-secret
+                    (tls13-server-driver-server-application-secret driver)
+                    server-application-secret)
+              server-finished-wire)
+         (%tls13-server-zero-octets server-finished-key)))))
 
 (defun %tls13-server-build-flight (driver hello hello-fields hello-wire transcript-prefix
                                    suite group share alpn credential-chain credential-key
                                    signature-scheme ticket)
   (multiple-value-bind (server-private server-share)
       (%tls13-server-generate-share driver group)
-    (let* ((dhe (%tls13-server-share-secret driver group server-private share))
+    (let ((owned-server-private server-private)
+          (owned-dhe nil)
+          (owned-early-secret nil)
+          (owned-handshake-secret nil))
+      (unwind-protect
+           (let* ((dhe (progn
+                         (setf owned-dhe
+                               (%tls13-server-share-secret driver group server-private share))
+                         (%tls13-server-zero-octets server-private)
+                         (setf owned-server-private nil
+                               server-private nil)
+                         owned-dhe))
            (hash (tls13-cipher-suite-hash suite))
            (psk (and ticket (getf ticket :psk)))
            (provider (tls13-server-driver-provider driver))
            (early-secret
-             (unwind-protect
-                  (tls13-early-secret provider hash psk)
-               (when psk (fill psk 0))))
-           (handshake-secret (tls13-handshake-secret provider hash early-secret dhe))
+             (setf owned-early-secret
+                   (unwind-protect
+                        (tls13-early-secret provider hash psk)
+                     (when psk (%tls13-server-zero-octets psk)))))
+           (handshake-secret
+             (progn
+               (setf owned-handshake-secret
+                     (tls13-handshake-secret provider hash early-secret dhe))
+               (%tls13-server-zero-octets dhe)
+               (setf owned-dhe nil)
+               (%tls13-server-zero-octets early-secret)
+               (setf owned-early-secret nil)
+               owned-handshake-secret))
            (server-random (%tls13-server-random driver 32))
            (server-hello-extensions
              (append
@@ -969,6 +1049,8 @@ random octets. TICKET-LIFETIME is the maximum ticket lifetime in seconds."
                      (tls13-master-secret provider hash handshake-secret)
                      (tls13-server-driver-server-flight-prefix driver)
                      transcript-through-server-hello)
+               (%tls13-server-zero-octets handshake-secret)
+               (setf owned-handshake-secret nil)
                (%tls13-server-finish-flight driver transcript-before-finished)))
            (client-finished-key (tls13-finished-key
                                  provider hash client-handshake-secret))
@@ -996,7 +1078,17 @@ random octets. TICKET-LIFETIME is the maximum ticket lifetime in seconds."
             (tls13-server-driver-client-finished-key driver) client-finished-key
             (tls13-server-driver-resumption-master-secret driver) nil
             (tls13-server-driver-state driver) :awaiting-client-finished)
-      events)))
+      (%tls13-server-zero-octets
+       (tls13-server-driver-client-handshake-secret driver))
+      (%tls13-server-zero-octets
+       (tls13-server-driver-server-handshake-secret driver))
+      (setf (tls13-server-driver-client-handshake-secret driver) nil
+            (tls13-server-driver-server-handshake-secret driver) nil
+            (tls13-server-driver-private-key driver) nil)
+      events)
+        (dolist (secret (list owned-server-private owned-dhe
+                              owned-early-secret owned-handshake-secret))
+          (%tls13-server-zero-octets secret))))))
 
 (defun %tls13-server-retry-request (driver hello wire suite group)
   (let* ((cookie (%tls13-server-random driver 32))
@@ -1035,68 +1127,123 @@ random octets. TICKET-LIFETIME is the maximum ticket lifetime in seconds."
                                           fields alpn))
          (cookie-extension (%tls13-server-extension (getf fields :extensions) 44))
          (share-pair (find group (getf fields :shares) :key #'car)))
-    (unless (= (tls13-client-hello-legacy-version hello) #x0303)
-      (%tls13-server-fail :invalid-legacy-version 70))
-    (when second-p
-      (%tls13-server-check-second-client-hello driver hello fields wire)
-      (unless (and share-pair (= group (tls13-server-driver-selected-group driver)))
-        (%tls13-server-fail :invalid-retry-key-share 47)))
-    (when (and (not second-p) cookie-extension)
-      (%tls13-server-fail :unexpected-cookie-extension 47))
-    (unless share-pair
-      (return-from %tls13-server-process-client-hello
-        (%tls13-server-retry-request driver hello wire suite group)))
-    (let* ((scheme (unless psk
-                     (multiple-value-bind (chain key)
-                         (%tls13-server-select-credential driver (getf fields :hostname))
-                       (setf (getf fields :selected-chain) chain
-                             (getf fields :selected-key) key)
-                       (%tls13-server-select-signature driver key (getf fields :schemes)))))
-           (chain (getf fields :selected-chain))
-           (key (getf fields :selected-key)))
-      (%tls13-server-build-flight driver hello fields wire transcript-prefix suite group
-                                   (cdr share-pair) alpn chain key scheme psk))))
+    (unwind-protect
+         (progn
+           (unless (= (tls13-client-hello-legacy-version hello) #x0303)
+             (%tls13-server-fail :invalid-legacy-version 70))
+           (when second-p
+             (%tls13-server-check-second-client-hello driver hello fields wire)
+             (unless (and share-pair (= group (tls13-server-driver-selected-group driver)))
+               (%tls13-server-fail :invalid-retry-key-share 47)))
+           (when (and (not second-p) cookie-extension)
+             (%tls13-server-fail :unexpected-cookie-extension 47))
+           (unless share-pair
+             (return-from %tls13-server-process-client-hello
+               (%tls13-server-retry-request driver hello wire suite group)))
+           (let* ((scheme (unless psk
+                            (multiple-value-bind (chain key)
+                                (%tls13-server-select-credential driver (getf fields :hostname))
+                              (setf (getf fields :selected-chain) chain
+                                    (getf fields :selected-key) key)
+                              (%tls13-server-select-signature
+                               driver key (getf fields :schemes)))))
+                  (chain (getf fields :selected-chain))
+                  (key (getf fields :selected-key)))
+             (%tls13-server-build-flight driver hello fields wire transcript-prefix suite group
+                                          (cdr share-pair) alpn chain key scheme psk)))
+      (when psk
+        (%tls13-server-zero-octets (getf psk :psk))))))
 
 (defun %tls13-server-process-finished (driver wire)
-  (unless (and (%tls13-server-octets-p wire) (>= (length wire) 4)
+  (unless (and (%tls13-server-octets-p wire)
+               (<= 4 (length wire) +tls13-server-max-handshake-size+)
                (= (aref wire 0) 20)
                (= (%tls13-server-read-u24 wire 1) (- (length wire) 4)))
     (%tls13-server-fail :malformed-finished 50))
-  (let* ((finished (handler-case (decode-finished (subseq wire 4))
-                     (error () (%tls13-server-fail :malformed-finished 50))))
-         (expected (tls13-compute-finished-verify-data
-                    (tls13-server-driver-provider driver)
-                    (tls13-server-driver-hash driver)
-                    (tls13-server-driver-client-finished-key driver)
-                    (%tls13-server-digest driver
-                                          (tls13-server-driver-transcript driver)))))
-    (unless (tls13-provider-constant-time-equal-p
-             (tls13-server-driver-provider driver) expected
-             (tls13-finished-verify-data finished))
-      (%tls13-server-fail :client-finished-mismatch 51))
-    (let* ((transcript (%tls13-server-cat (tls13-server-driver-transcript driver) wire))
-           (resumption-master
-             (tls13-resumption-secret
-              (tls13-server-driver-provider driver)
-              (tls13-server-driver-hash driver)
-              (tls13-server-driver-master-secret driver)
-              (%tls13-server-digest driver transcript))))
-      (multiple-value-bind (ticket-wire metadata)
-          (%tls13-server-issue-ticket driver resumption-master)
-        (setf (tls13-server-driver-transcript driver) transcript
-              (tls13-server-driver-resumption-master-secret driver) resumption-master
-              (tls13-server-driver-state driver) :complete)
-        (append
-         (list (%tls13-server-secret-event
-                :read :application
-                (tls13-server-driver-client-application-secret driver))
-               (%tls13-server-secret-event
-                :write :application
-                (tls13-server-driver-server-application-secret driver))
-               (%tls13-server-send-event :application ticket-wire)
-               metadata
-               (list :type :handshake-complete
-                     :resumed-p (not (null (tls13-server-driver-resumed-p driver))))))))))
+  (let* ((provider (tls13-server-driver-provider driver))
+         (hash (tls13-server-driver-hash driver))
+         (verify-length (%tls13-hash-length provider hash)))
+    (unless (= (- (length wire) 4) verify-length)
+      (%tls13-server-fail :malformed-finished 50))
+    (let* ((finished (handler-case (decode-finished (subseq wire 4))
+                       (error () (%tls13-server-fail :malformed-finished 50))))
+           (expected (tls13-compute-finished-verify-data
+                      provider hash
+                      (tls13-server-driver-client-finished-key driver)
+                      (%tls13-server-digest driver
+                                            (tls13-server-driver-transcript driver)))))
+      (unless (tls13-provider-constant-time-equal-p
+               provider expected (tls13-finished-verify-data finished))
+        (%tls13-server-fail :client-finished-mismatch 51))
+      (let* ((transcript (%tls13-server-cat (tls13-server-driver-transcript driver) wire))
+             (resumption-master
+               (tls13-resumption-secret
+                provider hash (tls13-server-driver-master-secret driver)
+                (%tls13-server-digest driver transcript))))
+        (multiple-value-bind (ticket-wire metadata)
+            (%tls13-server-issue-ticket driver resumption-master)
+          (let ((events
+                  (append
+                   (list (%tls13-server-secret-event
+                          :read :application
+                          (tls13-server-driver-client-application-secret driver))
+                         (%tls13-server-secret-event
+                          :write :application
+                          (tls13-server-driver-server-application-secret driver))
+                         (%tls13-server-send-event :application ticket-wire)
+                         metadata
+                         (list :type :handshake-complete
+                               :resumed-p
+                               (not (null (tls13-server-driver-resumed-p driver))))))))
+            (%tls13-server-zero-octets resumption-master)
+            (dolist (secret
+                     (list (tls13-server-driver-client-finished-key driver)
+                           (tls13-server-driver-master-secret driver)))
+              (%tls13-server-zero-octets secret))
+            (setf (tls13-server-driver-transcript driver) transcript
+                  (tls13-server-driver-client-finished-key driver) nil
+                  (tls13-server-driver-master-secret driver) nil
+                  (tls13-server-driver-resumption-master-secret driver) nil
+                  (tls13-server-driver-state driver) :complete)
+            events))))))
+
+(defun %tls13-server-update-traffic-secret (driver secret)
+  (tls13-hkdf-expand-label
+   (tls13-server-driver-provider driver)
+   (tls13-server-driver-hash driver)
+   secret "traffic upd" (make-array 0 :element-type '(unsigned-byte 8))
+   (%tls13-hash-length (tls13-server-driver-provider driver)
+                       (tls13-server-driver-hash driver))))
+
+(defun %tls13-server-process-key-update (driver wire)
+  (unless (and (%tls13-server-octets-p wire)
+               (<= 5 (length wire) +tls13-server-max-handshake-size+)
+               (= (aref wire 0) 24)
+               (= (%tls13-server-read-u24 wire 1) (- (length wire) 4)))
+    (%tls13-server-fail :malformed-key-update 50))
+  (let* ((message (handler-case (decode-handshake wire)
+                    (error () (%tls13-server-fail :malformed-key-update 50))))
+         (read-secret (tls13-server-driver-client-application-secret driver))
+         (next-read-secret (%tls13-server-update-traffic-secret driver read-secret))
+         (reply-p (= (tls13-key-update-request message) 1))
+         (write-secret (and reply-p
+                            (tls13-server-driver-server-application-secret driver)))
+         (next-write-secret (and reply-p
+                                 (%tls13-server-update-traffic-secret driver write-secret)))
+         (events
+           (append
+            (list (%tls13-server-secret-event :read :application next-read-secret))
+            (when reply-p
+              (list (%tls13-server-send-event
+                     :application (encode-handshake 24 (make-tls13-key-update 0)))
+                    (%tls13-server-secret-event :write :application next-write-secret))))))
+    (%tls13-server-zero-octets read-secret)
+    (setf (tls13-server-driver-client-application-secret driver) next-read-secret)
+    (when reply-p
+      (%tls13-server-zero-octets write-secret)
+      (setf (tls13-server-driver-server-application-secret driver)
+            next-write-secret))
+    events))
 
 (defun tls13-server-driver-step (driver wire &key level)
   "Consume one complete handshake message and return DRIVER and output events.
@@ -1108,17 +1255,27 @@ is :INITIAL for ClientHello and :HANDSHAKE for the client's Finished."
   (handler-case
       (values
        driver
-       (cond
-         ((member (tls13-server-driver-state driver)
-                  '(:awaiting-client-hello :awaiting-second-client-hello))
-          (unless (eq level :initial)
-            (%tls13-server-fail :unexpected-encryption-level 10))
-          (%tls13-server-process-client-hello driver wire))
-         ((eq (tls13-server-driver-state driver) :awaiting-client-finished)
-          (unless (eq level :handshake)
-            (%tls13-server-fail :unexpected-encryption-level 10))
-          (%tls13-server-process-finished driver wire))
-         (t (%tls13-server-fail :unexpected-handshake-message 10))))
+       (progn
+         (unless (and (vectorp wire)
+                      (<= (length wire) +tls13-server-max-handshake-size+))
+           (%tls13-server-fail :handshake-message-too-large 50))
+         (cond
+           ((member (tls13-server-driver-state driver)
+                    '(:awaiting-client-hello :awaiting-second-client-hello))
+            (unless (eq level :initial)
+              (%tls13-server-fail :unexpected-encryption-level 10))
+            (%tls13-server-process-client-hello driver wire))
+           ((eq (tls13-server-driver-state driver) :awaiting-client-finished)
+            (unless (eq level :handshake)
+              (%tls13-server-fail :unexpected-encryption-level 10))
+            (when (and (plusp (length wire)) (= (aref wire 0) 24))
+              (%tls13-server-fail :unexpected-key-update 10))
+            (%tls13-server-process-finished driver wire))
+           ((eq (tls13-server-driver-state driver) :complete)
+            (unless (eq level :application)
+              (%tls13-server-fail :unexpected-encryption-level 10))
+            (%tls13-server-process-key-update driver wire))
+           (t (%tls13-server-fail :unexpected-handshake-message 10)))))
     (tls13-server-driver-error (condition)
       (values driver (%tls13-server-alert-events
                       (%tls13-server-driver-error-alert condition)

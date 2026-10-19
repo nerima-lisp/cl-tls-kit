@@ -165,11 +165,63 @@
           (incf position (+ 4 body-length))))
       (unless (= position wire-length)
         (error "RFC 8448 trace handshake flight has trailing bytes")))
-    (cl-tls-kit::%tls13-server-finish-flight
-     driver
-     (cl-tls-kit::%tls13-server-cat
-      (cl-tls-kit::tls13-server-driver-server-flight-prefix driver)
-      opaque-flight)))
+    (let* ((continuation-driver
+             (cl-tls-kit::copy-tls13-server-driver driver))
+           (master-secret
+             (copy-seq (cl-tls-kit::tls13-server-driver-master-secret driver)))
+           (client-finished-key
+             (copy-seq
+              (cl-tls-kit::tls13-server-driver-client-finished-key driver)))
+           (client-application-secret
+             (copy-seq
+              (cl-tls-kit::tls13-server-driver-client-application-secret driver)))
+           (server-application-secret
+             (copy-seq
+              (cl-tls-kit::tls13-server-driver-server-application-secret driver)))
+           (resumption-master-secret
+             (and (cl-tls-kit::tls13-server-driver-resumption-master-secret driver)
+                  (copy-seq
+                   (cl-tls-kit::tls13-server-driver-resumption-master-secret driver))))
+           (server-flight-prefix
+             (cl-tls-kit::tls13-server-driver-server-flight-prefix driver)))
+      ;; The continuation uses isolated copies because production wiped handshake secrets.
+      (setf (cl-tls-kit::tls13-server-driver-server-handshake-secret
+             continuation-driver)
+            (copy-seq *rfc8448-server-handshake-traffic-secret*)
+            (cl-tls-kit::tls13-server-driver-master-secret continuation-driver)
+            master-secret
+            (cl-tls-kit::tls13-server-driver-client-finished-key continuation-driver)
+            client-finished-key
+            (cl-tls-kit::tls13-server-driver-client-application-secret
+             continuation-driver)
+            client-application-secret
+            (cl-tls-kit::tls13-server-driver-server-application-secret
+             continuation-driver)
+            server-application-secret
+            (cl-tls-kit::tls13-server-driver-resumption-master-secret
+             continuation-driver)
+            resumption-master-secret
+            (cl-tls-kit::tls13-server-driver-ticket-key-store continuation-driver)
+            (make-tls13-server-ticket-key-store))
+      (let ((finished
+              (cl-tls-kit::%tls13-server-finish-flight
+               continuation-driver
+               (cl-tls-kit::%tls13-server-cat server-flight-prefix opaque-flight))))
+        (%rfc8448-server-check
+         (and (null (cl-tls-kit::tls13-server-driver-client-handshake-secret driver))
+              (null (cl-tls-kit::tls13-server-driver-server-handshake-secret driver))
+              (equalp master-secret
+                      (cl-tls-kit::tls13-server-driver-master-secret driver))
+              (equalp client-finished-key
+                      (cl-tls-kit::tls13-server-driver-client-finished-key driver))
+              (equalp client-application-secret
+                      (cl-tls-kit::tls13-server-driver-client-application-secret driver))
+              (equalp server-application-secret
+                      (cl-tls-kit::tls13-server-driver-server-application-secret driver))
+              (equalp resumption-master-secret
+                      (cl-tls-kit::tls13-server-driver-resumption-master-secret driver)))
+         :production-driver-secrets-unchanged-after-test-copy)
+        (values finished continuation-driver))))
   (defun run-rfc8448-server-trace-tests ()
     (unless (find-package "CRYPTO-KIT")
       (format t "RFC 8448 section 3 server trace: SKIPPED (cl-crypto-kit unavailable)~%")
@@ -297,21 +349,80 @@
                        (equalp (tls-extension-data groups-extension)
                                #(0 4 0 29 0 23)))
                   :production-supported-groups-only)
-                 (let ((finished
-                         (%rfc8448-server-continue-with-opaque-flight
-                          driver opaque-flight)))
+                 (multiple-value-bind
+                     (finished continuation-driver)
+                     (%rfc8448-server-continue-with-opaque-flight
+                      driver opaque-flight)
                    (%rfc8448-server-check
                     (equalp finished *rfc8448-server-finished-wire*)
                     :server-finished-wire)
                    (multiple-value-setq (driver finish-events)
-                     (tls13-server-driver-step
-                      driver *rfc8448-client-finished-wire* :level :handshake))))
+                     (let* ((symbol (find-symbol "%TLS13-SERVER-ISSUE-TICKET" "CL-TLS-KIT"))
+                            (original (symbol-function symbol))
+                            (captured nil))
+                       (unwind-protect
+                            (progn
+                              (setf (symbol-function symbol)
+                                    (lambda (driver resumption-master-secret)
+                                      (setf captured (copy-seq resumption-master-secret))
+                                      (funcall original driver resumption-master-secret)))
+                              (multiple-value-prog1
+                                  (tls13-server-driver-step
+                                   continuation-driver *rfc8448-client-finished-wire*
+                                   :level :handshake)
+                                (%rfc8448-server-check
+                                 (equalp captured *rfc8448-server-resumption-master-secret*)
+                                 :resumption-master-secret)))
+                         (setf (symbol-function symbol) original)
+                         (when captured
+                           (cl-tls-kit::%tls13-server-zero-octets captured)))))))
+               (let* ((event (%rfc8448-server-event
+                              events :send :level :handshake :wire-type 11))
+                      (wire (and event (getf event :wire)))
+                      (message (and wire (decode-handshake wire)))
+                      (entries (and (typep message 'cl-tls-kit:tls13-certificate)
+                                    (cl-tls-kit:tls13-certificate-entries message))))
+                 (%rfc8448-server-check
+                  (and wire (= (aref wire 0) 11))
+                  :production-certificate-wire-type)
+                 (%rfc8448-server-check
+                  (and wire
+                       (equalp
+                        wire
+                        (encode-handshake
+                         11 (make-tls13-certificate
+                             #() (list (make-tls13-certificate-entry (first chain) nil)))))
+                       entries (= (length entries) 1)
+                       (zerop
+                        (length (cl-tls-kit::tls13-certificate-request-context message)))
+                       (equalp
+                        (cl-tls-kit::tls13-certificate-entry-certificate (first entries))
+                        (first chain))
+                       (null
+                        (cl-tls-kit::tls13-certificate-entry-extensions (first entries))))
+                  :production-certificate-shape))
                (%rfc8448-server-check
-                (%rfc8448-server-event events :send :level :handshake :wire-type 11)
-                :production-ecdsa-certificate)
+                (let* ((event (%rfc8448-server-event
+                               events :send :level :handshake :wire-type 15))
+                       (wire (and event (getf event :wire)))
+                       (message (and wire (decode-handshake wire))))
+                  (and wire (= (aref wire 0) 15)
+                       (typep message 'cl-tls-kit:tls13-certificate-verify)))
+                :production-certificate-verify-wire)
                (%rfc8448-server-check
-                (%rfc8448-server-event events :send :level :handshake :wire-type 15)
-                :production-certificate-verify)
+                (let* ((event (%rfc8448-server-event
+                               events :send :level :handshake :wire-type 15))
+                       (wire (and event (getf event :wire)))
+                       (message (and wire (decode-handshake wire)))
+                       (signature (and (typep message 'cl-tls-kit:tls13-certificate-verify)
+                                       (cl-tls-kit::tls13-certificate-verify-signature
+                                        message))))
+                  (and signature
+                       (= (cl-tls-kit::tls13-certificate-verify-algorithm message) #x0403)
+                       (<= 8 (length signature) 72)
+                       (= (aref signature 0) #x30)
+                       (= (aref signature 1) (- (length signature) 2))))
+                :production-ecdsa-certificate-verify-shape)
                (%rfc8448-server-check
                 (null (%rfc8448-server-event finish-events :alert))
                 :client-finished-accepted)
@@ -330,10 +441,8 @@
                         *rfc8448-server-application-traffic-secret*)
                 :server-application-traffic-secret)
                (%rfc8448-server-check
-                (equalp
-                 (cl-tls-kit::tls13-server-driver-resumption-master-secret driver)
-                 *rfc8448-server-resumption-master-secret*)
-                :resumption-master-secret)
+                (null (cl-tls-kit::tls13-server-driver-resumption-master-secret driver))
+                :resumption-master-secret-slot-cleared)
                (%rfc8448-server-check
                 (and (%rfc8448-server-event finish-events :ticket-issued)
                      (let ((complete
@@ -341,7 +450,150 @@
                               finish-events :handshake-complete)))
                        (and complete (not (getf complete :resumed-p)))))
                 :handshake-completion-and-ticket)
-               (%rfc8448-server-check (= selected 1) :one-rfc-server-trace-selected)
+               (progn
+                 (%rfc8448-server-check (= selected 1) :one-rfc-server-trace-selected)
+                 (let* ((seed
+                          (rfc8448-%hex
+                           "9d 61 b1 9d ef fd 5a 60 ba 84 4a f4 92 ec 2c c4 44 49 c5 69 7b 32 69 19 70 3b ac 03 1c ae 7f 60"))
+                        (private-key-der
+                          (concatenate '(vector (unsigned-byte 8))
+                                       (rfc8448-%hex
+                                        "30 2e 02 01 00 30 05 06 03 2b 65 70 04 22 04 20")
+                                       seed))
+                        (key-der-path
+                          (namestring (merge-pathnames "ed25519-test-key.der" directory)))
+                        (key-path
+                          (namestring (merge-pathnames "ed25519-test-key.pem" directory)))
+                        (certificate-path
+                          (namestring (merge-pathnames "ed25519-test-cert.pem" directory)))
+                        (input-path
+                          (namestring (merge-pathnames "ed25519-cv-input.bin" directory)))
+                        (signature-path
+                          (namestring (merge-pathnames "ed25519-cv-signature.bin" directory)))
+                        (private-key
+                          (funcall
+                           (symbol-function
+                            (find-symbol "MAKE-ED25519-PRIVATE-KEY" "CRYPTO-KIT"))
+                           seed))
+                        (base-hello (decode-handshake *rfc8448-server-client-hello-wire*))
+                        (client-hello-wire
+                          (encode-handshake
+                           1
+                           (make-tls13-client-hello
+                            (tls13-client-hello-legacy-version base-hello)
+                            (tls13-client-hello-random base-hello)
+                            (tls13-client-hello-session-id base-hello)
+                            (tls13-client-hello-cipher-suites base-hello)
+                            (mapcar
+                             (lambda (extension)
+                               (if (= (tls-extension-type extension) 13)
+                                   (make-tls-extension 13 #(0 2 8 7))
+                                   extension))
+                             (tls13-client-hello-extensions base-hello))))))
+                   (with-open-file (stream key-der-path :direction :output
+                                           :if-exists :supersede
+                                           :element-type '(unsigned-byte 8))
+                     (write-sequence private-key-der stream))
+                   (multiple-value-bind (output error-output exit-code)
+                       (uiop:run-program
+                        (list openssl "pkey" "-inform" "DER" "-in" key-der-path
+                              "-out" key-path)
+                        :output :string :error-output :string :ignore-error-status t)
+                     (declare (ignore output error-output))
+                     (%rfc8448-server-check (zerop exit-code)
+                                            :ed25519-test-key-created))
+                   (multiple-value-bind (output error-output exit-code)
+                       (uiop:run-program
+                        (list openssl "req" "-new" "-x509" "-key" key-path
+                              "-out" certificate-path "-subj" "/CN=ed25519-test"
+                              "-days" "1" "-set_serial" "1")
+                        :output :string :error-output :string :ignore-error-status t)
+                     (declare (ignore output error-output))
+                     (%rfc8448-server-check (zerop exit-code)
+                                            :ed25519-test-certificate-created))
+                   (let* ((chain
+                            (list (pem-block-der
+                                   (first (pem-decode
+                                           (uiop:read-file-string certificate-path))))))
+                          (driver
+                            (make-tls13-server-driver
+                             :provider provider :certificate-chain chain
+                             :private-key private-key :alpn-protocols nil
+                             :ticket-key-store (make-tls13-server-ticket-key-store)
+                             :clock (lambda () 4000000000)
+                             :random (function %rfc8448-server-random))))
+                     (setf *rfc8448-server-random-calls* 0)
+                     (multiple-value-bind (driver events)
+                         (tls13-server-driver-step
+                          driver client-hello-wire :level :initial)
+                       (declare (ignore driver))
+                       (let* ((server-hello-event
+                                (%rfc8448-server-event
+                                 events :send :level :initial :wire-type 2))
+                              (extensions-event
+                                (%rfc8448-server-event
+                                 events :send :level :handshake :wire-type 8))
+                              (certificate-event
+                                (%rfc8448-server-event
+                                 events :send :level :handshake :wire-type 11))
+                              (verify-event
+                                (%rfc8448-server-event
+                                 events :send :level :handshake :wire-type 15)))
+                         (%rfc8448-server-check
+                          (and (null (%rfc8448-server-event events :alert))
+                               server-hello-event extensions-event
+                               certificate-event verify-event)
+                          :ed25519-production-flight-present)
+                         (let* ((verify-message
+                                  (decode-handshake (getf verify-event :wire)))
+                                (transcript
+                                  (cl-tls-kit::%tls13-server-cat
+                                   client-hello-wire
+                                   (getf server-hello-event :wire)
+                                   (getf extensions-event :wire)
+                                   (getf certificate-event :wire)))
+                                (transcript-hash
+                                  (funcall
+                                   (cl-tls-kit::tls13-crypto-provider-digest provider)
+                                   :sha256 transcript))
+                                (signature-input
+                                  (tls13-certificate-verify-signature-input
+                                   :server transcript-hash))
+                                (signature
+                                  (cl-tls-kit::tls13-certificate-verify-signature verify-message)))
+                           (%rfc8448-server-check
+                            (and (= (cl-tls-kit::tls13-certificate-verify-algorithm verify-message)
+                                    #x0807)
+                                 (= (length signature) 64))
+                            :production-ed25519-certificate-verify-shape)
+                           (with-open-file (stream input-path :direction :output
+                                                   :if-exists :supersede
+                                                   :element-type '(unsigned-byte 8))
+                             (write-sequence signature-input stream))
+                           (multiple-value-bind (output error-output exit-code)
+                               (uiop:run-program
+                                (list openssl "pkeyutl" "-sign" "-rawin" "-inkey"
+                                      key-path "-in" input-path "-out" signature-path)
+                                :output :string :error-output :string
+                                :ignore-error-status t)
+                             (declare (ignore output error-output))
+                             (%rfc8448-server-check
+                              (zerop exit-code) :openssl-ed25519-signature-created))
+                           (let ((expected-signature
+                                   (with-open-file
+                                       (stream signature-path :direction :input
+                                               :element-type '(unsigned-byte 8))
+                                     (let ((octets
+                                             (make-array
+                                              (file-length stream)
+                                              :element-type '(unsigned-byte 8))))
+                                       (unless (= (read-sequence octets stream)
+                                                  (length octets))
+                                         (error "OpenSSL returned a truncated Ed25519 signature"))
+                                       octets))))
+                             (%rfc8448-server-check
+                              (equalp signature expected-signature)
+                              :production-ed25519-certificate-verify-byte-match))))))))
                (%rfc8448-server-check
                 (plusp *rfc8448-server-assertions*) :assertions-executed)))
         (ignore-errors (delete-file certificate-path))
