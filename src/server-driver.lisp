@@ -699,6 +699,7 @@ random octets. TICKET-LIFETIME is the maximum ticket lifetime in seconds."
                    (let ((early-secret nil)
                          (binder-key nil)
                          (finished-key nil)
+                         (prefix-length (%tls13-server-psk-prefix-length wire))
                          (expected nil))
                      (unwind-protect
                           (let ((hash (tls13-cipher-suite-hash ticket-suite)))
@@ -722,7 +723,7 @@ random octets. TICKET-LIFETIME is the maximum ticket lifetime in seconds."
                                     driver hash
                                     (%tls13-server-cat
                                      transcript-prefix
-                                     (subseq wire (%tls13-server-psk-prefix-length wire))))))
+                                     (subseq wire 0 prefix-length)))))
                             (unless (tls13-provider-constant-time-equal-p
                                      (tls13-server-driver-provider driver) expected
                                      (getf psk-fields :binder))
