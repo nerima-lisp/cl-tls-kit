@@ -1328,8 +1328,104 @@
              "EncryptedExtensions rejects unoffered early_data")
       (let ((alert
               (decrypt-tls13-traffic-record (first writes) alert-reader)))
-        (check (and (= (tls-plaintext-content-type alert)
-                       cl-tls-kit::+tls-content-type-alert+)
-                    (equalp (tls-plaintext-fragment alert) #(2 110)))
-               "unoffered early_data sends encrypted unsupported_extension"))))
+        (progn
+          (check (and (= (tls-plaintext-content-type alert)
+                         cl-tls-kit::+tls-content-type-alert+)
+                      (equalp (tls-plaintext-fragment alert) #(2 110)))
+                 "unoffered early_data sends encrypted unsupported_extension")
+          (let ((api-assertions 0))
+            (let* ((secret (make-array 32 :element-type '(unsigned-byte 8)
+                                       :initial-element 21))
+                   (read-state
+                     (cl-tls-kit::make-tls13-traffic-state
+                      provider :sha256 :aes-128-gcm secret 16 12))
+                   (peer-write
+                     (cl-tls-kit::make-tls13-traffic-state
+                      provider :sha256 :aes-128-gcm secret 16 12))
+                   (wire
+                     (cl-tls-kit::encrypt-tls13-traffic-record
+                      (cl-tls-kit::make-tls-plaintext
+                       cl-tls-kit::+tls-content-type-application-data+
+                       #(0 1 128 255))
+                      peer-write))
+                   (driver
+                     (cl-tls-kit::%make-tls13-client-driver
+                      :state :connected
+                      :application-read-state read-state
+                      :transport-read
+                      (lambda (ignored)
+                        (declare (ignore ignored))
+                        wire))))
+              (multiple-value-bind (status octets)
+                  (cl-tls-kit:tls13-client-driver-read-application-data driver)
+                (incf api-assertions)
+                (check (and (eq status :data)
+                            (equalp octets #(0 1 128 255)))
+                       "application-data read returns exact octets")))
+            (let ((driver
+                    (cl-tls-kit::%make-tls13-client-driver
+                     :state :connected
+                     :transport-read
+                     (lambda (ignored)
+                       (declare (ignore ignored))
+                       :would-block))))
+              (multiple-value-bind (status octets)
+                  (cl-tls-kit:tls13-client-driver-read-application-data driver)
+                (incf api-assertions)
+                (check (and (eq status :would-block) (null octets))
+                       "application-data read reports would-block")))
+            (let* ((secret (make-array 32 :element-type '(unsigned-byte 8)
+                                       :initial-element 22))
+                   (read-state
+                     (cl-tls-kit::make-tls13-traffic-state
+                      provider :sha256 :aes-128-gcm secret 16 12))
+                   (write-state
+                     (cl-tls-kit::make-tls13-traffic-state
+                      provider :sha256 :aes-128-gcm secret 16 12))
+                   (peer-write
+                     (cl-tls-kit::make-tls13-traffic-state
+                      provider :sha256 :aes-128-gcm secret 16 12))
+                   (wire
+                     (cl-tls-kit::encrypt-tls13-traffic-record
+                      (cl-tls-kit::make-tls-plaintext
+                       cl-tls-kit::+tls-content-type-alert+ #(1 0))
+                      peer-write))
+                   (driver
+                     (cl-tls-kit::%make-tls13-client-driver
+                      :state :connected
+                      :application-read-state read-state
+                      :application-write-state write-state
+                      :transport-read
+                      (lambda (ignored)
+                        (declare (ignore ignored))
+                        wire)
+                      :transport-write
+                      (lambda (ignored output)
+                        (declare (ignore ignored output)))
+                      :transport-close
+                      (lambda (ignored)
+                        (declare (ignore ignored))))))
+              (let ((status
+                      (cl-tls-kit:tls13-client-driver-read-application-data driver)))
+                (incf api-assertions)
+                (check (eq status :eof)
+                       "application-data read reports close_notify as EOF")))
+            (let ((driver
+                    (cl-tls-kit::%make-tls13-client-driver
+                     :state :connected
+                     :transport-read
+                     (lambda (ignored)
+                       (declare (ignore ignored))
+                       nil))))
+              (incf api-assertions)
+              (check (handler-case
+                         (progn
+                           (cl-tls-kit:tls13-client-driver-read-application-data driver)
+                           nil)
+                       (tls13-client-driver-error (condition)
+                         (eq (tls13-client-driver-error-reason condition) :eof)))
+                     "raw transport EOF remains an error"))
+            (assert (= api-assertions 4))
+            (format t "TLS 1.3 client application-data read API: assertions: ~D~%"
+                    api-assertions))))))
   t))))

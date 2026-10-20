@@ -26,6 +26,7 @@
 (defstruct (tls13-server-driver (:constructor %make-tls13-server-driver))
   provider certificate-chain private-key alpn-protocols sni-callback
   ticket-key-store supported-groups cipher-suites clock random key-exchange
+  quic-transport-parameters
   (state :awaiting-client-hello)
   (max-consecutive-key-updates 32)
   (consecutive-key-updates 0)
@@ -410,12 +411,16 @@ random octets. TICKET-LIFETIME is the maximum ticket lifetime in seconds."
           (cipher-suites (%tls13-server-default-suites))
           (clock (function get-universal-time))
           (random (function %tls13-server-default-random))
-          (max-consecutive-key-updates 32))
+          (max-consecutive-key-updates 32)
+          (quic-transport-parameters nil quic-transport-parameters-supplied-p))
   "Create a socket-independent TLS 1.3 server handshake driver."
   (unless (and (integerp max-consecutive-key-updates)
                (not (minusp max-consecutive-key-updates))
                (functionp clock) (functionp random)
-               (or (null sni-callback) (functionp sni-callback)))
+               (or (null sni-callback) (functionp sni-callback))
+               (or (not quic-transport-parameters-supplied-p)
+                   (and (%tls13-server-octets-p quic-transport-parameters)
+                        (<= (length quic-transport-parameters) #xffff))))
     (%tls13-server-fail :invalid-server-driver-configuration 80))
   (%tls13-server-validate-options provider supported-groups cipher-suites)
   (%tls13-server-eager-p256-initialization)
@@ -431,6 +436,9 @@ random octets. TICKET-LIFETIME is the maximum ticket lifetime in seconds."
      :supported-groups (copy-list supported-groups)
      :cipher-suites (copy-seq cipher-suites) :clock clock :random random
      :max-consecutive-key-updates max-consecutive-key-updates
+     :quic-transport-parameters
+     (when quic-transport-parameters-supplied-p
+       (copy-seq quic-transport-parameters))
      :key-exchange exchange)))
 
 (defun %tls13-server-validate-credential (chain private-key)
@@ -539,7 +547,9 @@ random octets. TICKET-LIFETIME is the maximum ticket lifetime in seconds."
                           (decode-sni-extension (tls-extension-data sni-extension))))
            (modes-extension (%tls13-server-extension extensions 45))
            (modes (and modes-extension
-                       (%tls13-server-extension-u8-list modes-extension))))
+                       (%tls13-server-extension-u8-list modes-extension)))
+           (quic-transport-parameters-extension
+             (%tls13-server-extension extensions #x0039)))
       (when (and (%tls13-server-extension extensions 41)
                  (null modes-extension))
         (%tls13-server-fail :missing-extension 109))
@@ -548,7 +558,9 @@ random octets. TICKET-LIFETIME is the maximum ticket lifetime in seconds."
                    (%tls13-server-unique-p (mapcar #'car shares)))
         (%tls13-server-fail :duplicate-negotiation-value 47))
       (list :extensions extensions :groups groups :schemes schemes
-            :shares shares :alpn alpn :hostname hostname :modes modes))))
+            :shares shares :alpn alpn :hostname hostname :modes modes
+            :quic-transport-parameters-extension
+            quic-transport-parameters-extension))))
 
 (defun %tls13-server-select-alpn (driver offered)
   (cond ((null offered) nil)
@@ -802,6 +814,13 @@ random octets. TICKET-LIFETIME is the maximum ticket lifetime in seconds."
                  (equalp cookie (tls13-server-driver-cookie driver))
                  (not (%tls13-server-extension (getf fields :extensions) 42)))
       (%tls13-server-fail :invalid-second-client-hello 47))
+    (let ((first-quic (getf first-fields :quic-transport-parameters-extension))
+          (second-quic (getf fields :quic-transport-parameters-extension)))
+      (unless (and (eq (null first-quic) (null second-quic))
+                   (or (null first-quic)
+                       (equalp (tls-extension-data first-quic)
+                               (tls-extension-data second-quic))))
+        (%tls13-server-fail :inconsistent-second-client-hello 47)))
     (let ((mutable '(21 41 42 44 51)))
       (dolist (entry first-extensions)
         (unless (or (member (car entry) mutable)
@@ -1004,20 +1023,31 @@ random octets. TICKET-LIFETIME is the maximum ticket lifetime in seconds."
            (server-handshake-secret (tls13-traffic-secret
                                      provider hash handshake-secret :server transcript-hash))
            (encrypted-extensions-wire
-             (encode-handshake
-              8 (make-tls13-encrypted-extensions
-                 (append
-                  (list
-                   (make-tls-extension
-                    10
-                    (%encode-vector
-                     (apply #'%cat
-                            (mapcar #'%tls13-server-u16
-                                    (tls13-server-driver-supported-groups driver)))
-                     2)))
-                  (when alpn
-                    (list (make-tls-extension
-                           16 (encode-alpn-extension (list alpn)))))))))
+             (let* ((extensions
+                     (append
+                      (list
+                       (make-tls-extension
+                        10
+                        (%encode-vector
+                         (apply #'%cat
+                                (mapcar #'%tls13-server-u16
+                                        (tls13-server-driver-supported-groups driver)))
+                         2)))
+                      (when alpn
+                        (list (make-tls-extension
+                               16 (encode-alpn-extension (list alpn)))))
+                      (when (tls13-server-driver-quic-transport-parameters driver)
+                        (list (make-tls-extension
+                               #x0039
+                               (copy-seq
+                                (tls13-server-driver-quic-transport-parameters driver)))))))
+                    (extensions-length
+                     (loop for extension in extensions
+                           sum (+ 4 (length (tls-extension-data extension))))))
+               (when (> extensions-length #xffff)
+                 (%tls13-server-fail :encrypted-extensions-too-large 80))
+               (encode-handshake
+                8 (make-tls13-encrypted-extensions extensions))))
            (certificate-wire
              (and (null ticket)
                   (encode-handshake
@@ -1125,9 +1155,20 @@ random octets. TICKET-LIFETIME is the maximum ticket lifetime in seconds."
 (defun %tls13-server-process-client-hello (driver wire)
   (let* ((hello (%tls13-server-parse-client-hello wire))
          (fields (%tls13-server-clienthello-fields hello))
+         (peer-parameters-extension
+           (getf fields :quic-transport-parameters-extension))
+         (peer-event
+           (when peer-parameters-extension
+             (list :peer-quic-transport-parameters
+                   (copy-seq (tls-extension-data peer-parameters-extension)))))
          (second-p (eq (tls13-server-driver-state driver) :awaiting-second-client-hello))
          (transcript-prefix (if second-p (tls13-server-driver-transcript driver) #()))
-         (suite (%tls13-server-select-suite driver hello))
+         (suite
+           (progn
+             (when (and (tls13-server-driver-quic-transport-parameters driver)
+                        (null peer-parameters-extension))
+               (%tls13-server-fail :missing-extension 109))
+             (%tls13-server-select-suite driver hello)))
          (group (%tls13-server-select-group driver (getf fields :groups)))
          (alpn (%tls13-server-select-alpn driver (getf fields :alpn)))
          (psk (%tls13-server-validate-psk driver hello wire transcript-prefix suite
@@ -1146,7 +1187,8 @@ random octets. TICKET-LIFETIME is the maximum ticket lifetime in seconds."
              (%tls13-server-fail :unexpected-cookie-extension 47))
            (unless share-pair
              (return-from %tls13-server-process-client-hello
-               (%tls13-server-retry-request driver hello wire suite group)))
+               (append (when peer-event (list peer-event))
+                       (%tls13-server-retry-request driver hello wire suite group))))
            (let* ((scheme (unless psk
                             (multiple-value-bind (chain key)
                                 (%tls13-server-select-credential driver (getf fields :hostname))
@@ -1156,8 +1198,10 @@ random octets. TICKET-LIFETIME is the maximum ticket lifetime in seconds."
                                driver key (getf fields :schemes)))))
                   (chain (getf fields :selected-chain))
                   (key (getf fields :selected-key)))
-             (%tls13-server-build-flight driver hello fields wire transcript-prefix suite group
-                                          (cdr share-pair) alpn chain key scheme psk)))
+             (append (when peer-event (list peer-event))
+                     (%tls13-server-build-flight
+                      driver hello fields wire transcript-prefix suite group
+                      (cdr share-pair) alpn chain key scheme psk))))
       (when psk
         (%tls13-server-zero-octets (getf psk :psk))))))
 

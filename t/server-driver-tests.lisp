@@ -99,15 +99,21 @@
 
 (defun %server-driver-test-server
     (provider chain key ticket-key-store clock &key (groups '(#x001d #x0017))
-                                                (alpn '("http/1.1" "h2"))
-                                                (cipher-suites #( #x1301 #x1302 #x1303 #x1304))
-                                                (max-consecutive-key-updates 32))
-  (make-tls13-server-driver
-   :provider provider :certificate-chain chain :private-key key
-   :alpn-protocols alpn :ticket-key-store ticket-key-store
-   :supported-groups groups :cipher-suites cipher-suites
-   :clock clock :random (%server-driver-test-random)
-   :max-consecutive-key-updates max-consecutive-key-updates))
+              (alpn '("http/1.1" "h2"))
+              (cipher-suites #( #x1301 #x1302 #x1303 #x1304))
+              (max-consecutive-key-updates 32)
+              (quic-transport-parameters nil quic-transport-parameters-supplied-p))
+  (let ((arguments
+          (list :provider provider :certificate-chain chain :private-key key
+                :alpn-protocols alpn :ticket-key-store ticket-key-store
+                :supported-groups groups :cipher-suites cipher-suites
+                :clock clock :random (%server-driver-test-random)
+                :max-consecutive-key-updates max-consecutive-key-updates)))
+    (when quic-transport-parameters-supplied-p
+      (setf arguments
+            (append arguments
+                    (list :quic-transport-parameters quic-transport-parameters))))
+    (apply #'make-tls13-server-driver arguments)))
 
 (defun %server-driver-test-state-snapshot (driver)
   (list (cl-tls-kit::tls13-server-driver-state driver)
@@ -161,13 +167,17 @@
 
 (defun %server-driver-test-memory-handshake
     (provider chain key anchor ticket-key-store now &key (groups '(#x001d #x0017))
-                                                   (alpn '("h2" "http/1.1")))
+                                                   (alpn '("h2" "http/1.1"))
+                                                   quic-transport-parameters
+                                                   client-quic-transport-parameters)
   (let ((client-outgoing (list nil))
         (client-certificate-verify-count 0)
         (server-alpn nil)
         (ticket-event nil)
         (hrr-count 0)
         (events-seen nil)
+        (client-hello-wires nil)
+        (client-quic-injected-p nil)
         (client nil)
         (server nil))
     (setf client
@@ -181,12 +191,35 @@
            :on-send (lambda (ignored wire)
                       (declare (ignore ignored))
                       (push wire (car client-outgoing))))
-          server (%server-driver-test-server provider chain key ticket-key-store
-                                             (lambda () now) :groups groups))
+          server
+          (apply #'%server-driver-test-server
+                 provider chain key ticket-key-store (lambda () now)
+                 (append
+                  (list :groups groups :alpn
+                        (if (member "http/1.1" alpn :test #'string=)
+                            '("http/1.1" "h2")
+                            alpn))
+                  (when quic-transport-parameters
+                    (list :quic-transport-parameters
+                          quic-transport-parameters)))))
     (tls13-client-driver-start client)
     (loop repeat 8
           for client-wire = (pop (car client-outgoing))
           while client-wire
+          do (when (= (aref client-wire 0) 1)
+               (when (and client-quic-transport-parameters
+                          (not client-quic-injected-p))
+                 (let* ((hello (decode-handshake client-wire))
+                        (quic-hello
+                          (%server-driver-test-rewrite-client-hello
+                           hello #x0039 client-quic-transport-parameters)))
+                   (setf client-wire (encode-handshake 1 quic-hello)
+                         client-quic-injected-p t
+                         (cl-tls-kit::tls13-client-driver-client-hello client)
+                         quic-hello
+                         (cl-tls-kit::tls13-client-driver-transcript client)
+                         (copy-seq client-wire))))
+               (push (copy-seq client-wire) client-hello-wires))
           do (multiple-value-bind (returned events)
                  (tls13-server-driver-step
                   server client-wire
@@ -194,20 +227,27 @@
                (setf server returned
                      events-seen (append events-seen events))
                (dolist (event events)
-                 (case (getf event :type)
-                   (:send
-                    (when (eq (getf event :content-type) :alert)
-                      (error "Memory handshake server emitted alert ~S"
-                             (getf (%server-driver-test-event events :alert)
-                                   :description)))
-                    (let ((message (decode-handshake (getf event :wire))))
-                      (when (typep message 'tls13-hello-retry-request)
-                        (incf hrr-count))
-                      (tls13-client-driver-step client (getf event :wire))))
-                   (:alpn (setf server-alpn (getf event :protocol)))
-                   (:ticket-issued (setf ticket-event event))))))
+                 (if (and (consp event)
+                          (eq (first event) :peer-quic-transport-parameters))
+                     nil
+                   (case (getf event :type)
+                     (:send
+                      (when (eq (getf event :content-type) :alert)
+                        (error "Memory handshake server emitted alert ~S"
+                               (getf (%server-driver-test-event events :alert)
+                                     :description)))
+                      (let ((message (decode-handshake (getf event :wire))))
+                        (when (typep message 'tls13-hello-retry-request)
+                          (incf hrr-count))
+                        (tls13-client-driver-step client (getf event :wire))))
+                     (:alpn (setf server-alpn (getf event :protocol)))
+                     (:ticket-issued (setf ticket-event event))
+                     ((:cipher-suite :secret :handshake-complete) nil)
+                     (otherwise (error "Unknown server driver event ~S"
+                                       (getf event :type))))))))
     (values server client server-alpn ticket-event hrr-count
-            client-certificate-verify-count events-seen (car client-outgoing))))
+            client-certificate-verify-count events-seen (car client-outgoing)
+            (nreverse client-hello-wires))))
 (defun %server-driver-test-client-server-resumption-roundtrip
     (provider chain key anchor ticket-key-store now check-case &key (suite #x1301)
                                                         hello-retry-p client-cipher-suites)
@@ -1189,8 +1229,297 @@
                               "SHA-384 HelloRetryRequest resumption signs only the full handshake")
                   (check-case (plusp selected)
                               "server driver selected nonzero test cases"))
-                (check-case (plusp assertions)
-                            "server driver executed nonzero assertions")
+                (progn
+  (incf selected)
+  (let ((quic-assertions 0)
+        (server-parameters
+          (make-array 6 :element-type '(unsigned-byte 8)
+                        :initial-contents '(9 0 17 128 255 54)))
+        (client-parameters
+          (make-array 5 :element-type '(unsigned-byte 8)
+                        :initial-contents '(3 0 255 17 128))))
+    (labels ((check-quic-case (condition message)
+               (incf quic-assertions)
+               (check-case condition
+                           (format nil "QUIC transport parameter: ~A" message)))
+             (wire-event (events handshake-type level)
+               (find-if
+                (lambda (event)
+                  (let ((wire (getf event :wire)))
+                    (and (eq (getf event :type) :send)
+                         (eq (getf event :level) level)
+                         (eq (getf event :content-type) :handshake)
+                         (vectorp wire) (plusp (length wire))
+                         (= (aref wire 0) handshake-type))))
+                events))
+             (client-parameter-data (wire)
+               (let* ((hello (decode-handshake wire))
+                      (extension
+                        (find #x0039 (tls13-client-hello-extensions hello)
+                              :key #'tls-extension-type)))
+                 (and extension (tls-extension-data extension))))
+             (peer-parameter-events (events)
+               (remove-if-not
+                (lambda (event)
+                  (and (consp event)
+                       (eq (first event) :peer-quic-transport-parameters)))
+                events)))
+      (multiple-value-bind (server client alpn ticket hrr-count client-cv-count
+                            events outgoing client-hello-wires)
+          (%server-driver-test-memory-handshake
+           provider chain private-key anchor ticket-key-store now
+           :groups '(#x0017)
+           :quic-transport-parameters server-parameters
+           :client-quic-transport-parameters client-parameters)
+        (declare (ignore outgoing))
+        (let* ((ee-event (wire-event events 8 :handshake))
+               (ee-message (and ee-event
+                                (decode-handshake (getf ee-event :wire))))
+               (server-extension
+                 (and ee-message
+                      (find #x0039
+                            (cl-tls-kit::tls13-encrypted-extensions-extensions
+                             ee-message)
+                            :key #'tls-extension-type)))
+               (ticket-wire-event (wire-event events 4 :application))
+               (ticket-message (and ticket-wire-event
+                                    (decode-handshake
+                                     (getf ticket-wire-event :wire))))
+               (peer-events (peer-parameter-events events))
+               (handshake-complete
+                 (%server-driver-test-event events :handshake-complete)))
+          (check-quic-case (= hrr-count 1)
+                           "direct client/server handshake exercises HelloRetryRequest")
+          (check-quic-case (and (equal alpn "http/1.1")
+                                (equal
+                                 (cl-tls-kit:tls13-client-driver-negotiated-alpn client)
+                                 "http/1.1"))
+                           "ALPN remains negotiated through the QUIC handshake")
+          (check-quic-case (= client-cv-count 1)
+                           "client verifies CertificateVerify in the QUIC handshake")
+          (check-quic-case
+           (and (eq (cl-tls-kit::tls13-client-driver-state client) :connected)
+                (eq (cl-tls-kit::tls13-server-driver-state server) :complete)
+                handshake-complete)
+           "server verifies the real client Finished with QUIC parameters in the transcript")
+          (check-quic-case
+           (and (= (length client-hello-wires) 2)
+                (equalp (client-parameter-data (first client-hello-wires))
+                        client-parameters))
+           "ClientHello1 carries the exact peer QUIC parameter bytes")
+          (check-quic-case
+           (and (= (length client-hello-wires) 2)
+                (equalp (client-parameter-data (second client-hello-wires))
+                        (client-parameter-data (first client-hello-wires))))
+           "HelloRetryRequest ClientHello2 preserves ClientHello1 QUIC parameter bytes")
+          (check-quic-case
+           (and (= (length peer-events) 2)
+                (every (lambda (event)
+                         (equalp event
+                                 (list :peer-quic-transport-parameters
+                                       client-parameters)))
+                       peer-events))
+           "each accepted ClientHello emits the exact peer QUIC parameter event")
+          (check-quic-case
+           (and server-extension
+                (equalp (tls-extension-data server-extension) server-parameters))
+           "EncryptedExtensions contains the exact opaque server QUIC parameter bytes")
+          (check-quic-case
+           (and ticket (getf ticket :identity) ticket-message
+                (null (find 42
+                            (cl-tls-kit::tls13-new-session-ticket-extensions
+                             ticket-message)
+                            :key #'tls-extension-type)))
+           "NewSessionTicket is issued after Finished without early_data")
+          (let ((duplicate-wire
+                  (%server-driver-test-duplicate-extension-wire
+                   (first client-hello-wires) #x0039)))
+            (incf selected)
+            (%server-driver-test-assert-client-hello-rejected
+             "duplicate QUIC transport-parameters extension"
+             (%server-driver-test-server provider chain private-key ticket-key-store
+                                         (lambda () now)
+                                         :quic-transport-parameters server-parameters)
+             duplicate-wire 47 #'check-quic-case))))
+      (multiple-value-bind (server client alpn ticket hrr-count client-cv-count
+                            events outgoing client-hello-wires)
+          (%server-driver-test-memory-handshake
+           provider chain private-key anchor ticket-key-store now)
+        (declare (ignore alpn ticket hrr-count client-cv-count outgoing
+                         client-hello-wires))
+        (let* ((ee-event (wire-event events 8 :handshake))
+               (ee-message (and ee-event
+                                (decode-handshake (getf ee-event :wire))))
+               (server-extension
+                 (and ee-message
+                      (find #x0039
+                            (cl-tls-kit::tls13-encrypted-extensions-extensions
+                             ee-message)
+                            :key #'tls-extension-type)))
+               (peer-events (peer-parameter-events events)))
+          (check-quic-case
+           (and (eq (cl-tls-kit::tls13-client-driver-state client) :connected)
+                (eq (cl-tls-kit::tls13-server-driver-state server) :complete))
+           "omitted server keyword retains the TLS-over-TCP handshake")
+          (check-quic-case (null server-extension)
+                           "omitted server keyword sends no QUIC EncryptedExtensions")
+          (check-quic-case (null peer-events)
+                           "omitted server keyword emits no peer QUIC parameter event")))
+      (multiple-value-bind (client outgoing)
+          (%server-driver-test-client provider :trust-anchors (list anchor) :now now)
+        (multiple-value-bind (wire hello)
+            (%server-driver-test-client-hello client outgoing)
+          (declare (ignore hello))
+          (incf selected)
+          (%server-driver-test-assert-client-hello-rejected
+           "QUIC parameters without ClientHello extension"
+           (%server-driver-test-server provider chain private-key ticket-key-store
+                                       (lambda () now)
+                                       :quic-transport-parameters server-parameters)
+           wire 109 #'check-quic-case)))
+      (let* ((invalid #(71 82 83 69 67 82 69 84))
+             (marker-text "71 82 83 69 67 82 69 84")
+             (condition
+               (handler-case
+                   (progn
+                     (%server-driver-test-server
+                      provider chain private-key ticket-key-store (lambda () now)
+                      :quic-transport-parameters invalid)
+                     nil)
+                 (tls13-server-driver-error (condition) condition))))
+        (incf selected)
+        (check-quic-case
+         (and condition
+              (eq (tls13-server-driver-error-reason condition)
+                  :invalid-server-driver-configuration)
+              (not (search marker-text (write-to-string condition))))
+         "constructor rejects invalid bytes without printing input bytes"))
+      (let* ((marker #(71 82 83 69 67 82 69 84))
+             (marker-text "71 82 83 69 67 82 69 84")
+             (oversized
+               (make-array #x10000 :element-type '(unsigned-byte 8)
+                                    :initial-element 200)))
+        (replace oversized marker)
+        (let ((condition
+                (handler-case
+                    (progn
+                      (%server-driver-test-server
+                       provider chain private-key ticket-key-store (lambda () now)
+                       :quic-transport-parameters oversized)
+                      nil)
+                  (tls13-server-driver-error (condition) condition))))
+          (incf selected)
+          (check-quic-case
+           (and condition
+                (eq (tls13-server-driver-error-reason condition)
+                    :invalid-server-driver-configuration)
+                (not (search marker-text (write-to-string condition))))
+           "constructor rejects oversized bytes without printing input bytes")))
+      (flet
+          ((check-changed-second-client-hello ()
+             (let ((first-parameters #(3 0 255 17 128))
+                   (changed-parameters #(3 0 255 17 129)))
+               (multiple-value-bind (client outgoing)
+                   (%server-driver-test-client
+                    provider :groups '(#x001d #x0017)
+                    :trust-anchors (list anchor) :now now)
+                 (multiple-value-bind (ignored-wire hello)
+                     (%server-driver-test-client-hello client outgoing)
+                   (declare (ignore ignored-wire))
+                   (let* ((client-hello
+                            (%server-driver-test-rewrite-client-hello
+                             hello #x0039 first-parameters))
+                          (wire (encode-handshake 1 client-hello))
+                          (server
+                            (%server-driver-test-server
+                             provider chain private-key ticket-key-store
+                             (lambda () now) :groups '(#x0017))))
+                     (setf (cl-tls-kit::tls13-client-driver-client-hello client)
+                           client-hello
+                           (cl-tls-kit::tls13-client-driver-transcript client)
+                           (copy-seq wire))
+                     (multiple-value-bind (returned events)
+                         (tls13-server-driver-step server wire :level :initial)
+                       (setf server returned)
+                       (let ((hrr-event
+                               (find-if
+                                (lambda (event)
+                                  (and (eq (getf event :type) :send)
+                                       (eq (getf event :content-type) :handshake)
+                                       (typep (decode-handshake (getf event :wire))
+                                              'tls13-hello-retry-request)))
+                                events)))
+                         (check-quic-case
+                          (and (eq returned server) hrr-event)
+                          "ClientHello with QUIC parameters receives HelloRetryRequest")
+                         (tls13-client-driver-step client (getf hrr-event :wire))
+                         (let* ((second-wire (pop (car outgoing)))
+                                (second-hello (decode-handshake second-wire))
+                                (changed-hello
+                                  (%server-driver-test-rewrite-client-hello
+                                   second-hello #x0039 changed-parameters))
+                                (changed-wire (encode-handshake 1 changed-hello)))
+                           (%server-driver-test-assert-client-hello-rejected
+                            "changed QUIC parameters in second ClientHello"
+                            server changed-wire 47 #'check-quic-case)))))))))
+           (check-explicit-nil-quic-parameters ()
+             (let ((condition
+                     (handler-case
+                         (progn
+                           (%server-driver-test-server
+                            provider chain private-key ticket-key-store (lambda () now)
+                            :quic-transport-parameters nil)
+                           nil)
+                       (tls13-server-driver-error (condition) condition))))
+               (check-quic-case
+                (and condition
+                     (eq (tls13-server-driver-error-reason condition)
+                         :invalid-server-driver-configuration))
+                "constructor rejects explicitly supplied NIL QUIC parameters")))
+           (check-encrypted-extensions-size-limit ()
+             (let* ((marker #(71 82 83 69 67 82 69 84))
+                    (marker-text "71 82 83 69 67 82 69 84")
+                    (server-parameters
+                      (make-array #xffff :element-type '(unsigned-byte 8)
+                                         :initial-element 200)))
+               (replace server-parameters marker)
+               (multiple-value-bind (client outgoing)
+                   (%server-driver-test-client
+                    provider :trust-anchors (list anchor) :now now)
+                 (multiple-value-bind (ignored-wire hello)
+                     (%server-driver-test-client-hello client outgoing)
+                   (declare (ignore ignored-wire))
+                   (let* ((wire
+                            (encode-handshake
+                             1 (%server-driver-test-rewrite-client-hello
+                                hello #x0039 #(3 1 4))))
+                          (server
+                            (%server-driver-test-server
+                             provider chain private-key ticket-key-store
+                             (lambda () now)
+                             :quic-transport-parameters server-parameters))
+                          (before (%server-driver-test-state-snapshot server)))
+                     (multiple-value-bind (returned events)
+                         (tls13-server-driver-step server wire :level :initial)
+                       (check-quic-case
+                        (and (eq returned server)
+                             (%server-driver-test-alert-p events 80)
+                             (equalp before (%server-driver-test-state-snapshot server)))
+                        "u16-sized QUIC payload with oversized EncryptedExtensions fails closed")
+                       (check-quic-case
+                        (not (search marker-text (write-to-string events)))
+                        "oversized EncryptedExtensions output does not print parameter bytes"))))))))
+        (incf selected)
+        (check-changed-second-client-hello)
+        (incf selected)
+        (check-explicit-nil-quic-parameters)
+        (incf selected)
+        (check-encrypted-extensions-size-limit)
+        (check-case (plusp quic-assertions)
+                    "QUIC transport-parameter test group ran nonzero assertions"))
+      (format t "TLS 1.3 server driver QUIC transport parameters: assertions: ~D~%"
+              quic-assertions)))
+  (check-case (plusp assertions) "server driver executed nonzero assertions"))
                 (format t "TLS 1.3 server driver: selected test count: ~D; assertions: ~D~%"
                         selected assertions)
                 t)))))

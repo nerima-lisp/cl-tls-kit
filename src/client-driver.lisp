@@ -1057,9 +1057,12 @@ Returns DRIVER; outgoing messages are delivered to ON-SEND."
                        (tls13-client-driver-key-update driver 0)))
                    (%driver-client-step driver message-wire)))))
 
-(defun %driver-client-read-record (driver)
-  "Read one blocking TLS record, process handshake/control records, and close on peer close_notify."
-  (let ((wire (or (%driver-read-record driver) (%driver-fail :eof))))
+(defun %driver-client-read-record (driver &optional allow-would-block-p)
+  "Read one TLS record, processing handshake/control records and close_notify."
+  (let ((wire (%driver-read-record driver)))
+    (when (and allow-would-block-p (eq wire :would-block))
+      (return-from %driver-client-read-record :would-block))
+    (unless wire (%driver-fail :eof))
     (when (= (aref wire 0) +tls-content-type-change-cipher-spec+)
       (unless (and (member (tls13-client-driver-state driver)
                            '(:awaiting-server-hello :awaiting-encrypted-extensions
@@ -1210,9 +1213,45 @@ Returns DRIVER; outgoing messages are delivered to ON-SEND."
         (%driver-close-transport driver t)
         (error condition)))))
 
+(defun tls13-client-driver-read-application-data (driver)
+  "Read application data, returning (values :DATA octets), :WOULD-BLOCK, or :EOF.
+A transport reader must retain partial record bytes when returning :WOULD-BLOCK."
+  (when (tls13-client-driver-close-notify-received driver)
+    (return-from tls13-client-driver-read-application-data :eof))
+  (unless (eq (tls13-client-driver-state driver) :connected)
+    (%driver-fail :not-connected))
+  (let ((*driver-transport-failure* nil))
+    (handler-case
+        (loop for record = (%driver-client-read-record driver t)
+              do (cond
+                   ((eq record :would-block)
+                    (return :would-block))
+                   ((null record)
+                    (when (tls13-client-driver-close-notify-received driver)
+                      (return :eof)))
+                   (t
+                    (return (values :data
+                                    (tls-plaintext-fragment record))))))
+      (tls13-client-driver-error (condition)
+        (%driver-handle-fatal-condition driver condition)
+        (error condition))
+      (tls13-negotiation-error (condition)
+        (%driver-handle-fatal-condition driver condition)
+        (error condition))
+      (tls13-decode-error (condition)
+        (%driver-handle-fatal-condition driver condition)
+        (error condition))
+      (tls-record-error (condition)
+        (%driver-handle-fatal-condition driver condition)
+        (error condition))
+      (error (condition)
+        (%driver-close-transport driver t)
+        (error condition)))))
+
 (export '(tls13-client-driver tls13-client-driver-p
   make-tls13-client-driver tls13-client-driver-start tls13-client-driver-step
   tls13-client-driver-connect tls13-client-driver-read-record
+  tls13-client-driver-read-application-data
   tls13-client-driver-write tls13-client-driver-close
   tls13-client-driver-key-update make-tls13-client-driver-over-tcp
   tls13-client-driver-negotiated-alpn tls13-client-driver-error
