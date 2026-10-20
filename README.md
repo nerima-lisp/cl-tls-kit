@@ -128,12 +128,20 @@ A raw transport EOF signals `tls13-client-driver-error` with reason `:eof`.
 `make-tls13-server-driver` accepts an optional `:quic-transport-parameters`
 octet vector. When supplied, the driver copies the opaque value into extension
 `#x0039` in `EncryptedExtensions`, where it is covered by the handshake
-transcript. If the ClientHello contains extension `#x0039`, the returned event
-list includes `(:peer-quic-transport-parameters octets)` with its opaque value.
+transcript. When the server is configured with this keyword, events returned
+while processing a ClientHello containing extension `#x0039` include
+`(:peer-quic-transport-parameters octets)` with its opaque value.
+The event may be returned before the server verifies the client's Finished
+message, so the value is provisional and unauthenticated. Consumers must defer
+any decision that depends on its authenticity until the driver emits
+`:handshake-complete`.
+
 A configured server value requires that the ClientHello contain the extension;
 otherwise the driver rejects the handshake with `missing_extension`. Omitting
 the keyword means the driver does not require the ClientHello extension or add
 it to `EncryptedExtensions`, preserving the existing TCP handshake behavior.
+With the keyword omitted, a ClientHello that contains extension `#x0039` is
+rejected with the fatal `unsupported_extension` alert.
 
 The lower-level `make-tls-client` boundary requires a
 `:verify-certificate` callback whenever a peer certificate is received. It
