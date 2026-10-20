@@ -920,31 +920,40 @@ Returns DRIVER; outgoing messages are delivered to ON-SEND."
              (tls13-client-driver-compatibility-ccs-count driver) 0
              (tls13-client-driver-state driver) :awaiting-encrypted-extensions))
       (tls13-encrypted-extensions
- (when (find 42 (tls13-encrypted-extensions-extensions message)
-             :key #'tls-extension-type)
-   (%driver-fail :unsupported-extension))
- (let ((extension
-         (find +tls13-extension-application-layer-protocol-negotiation+
-               (tls13-encrypted-extensions-extensions message)
-               :key #'tls-extension-type)))
-   (when extension
-     (let ((protocols (decode-alpn-extension (tls-extension-data extension))))
-       (unless (= (length protocols) 1)
-         (%driver-fail :unexpected-alpn))
-       (unless (member (first protocols) (tls13-client-driver-alpn driver)
-                       :test #'string=)
-         (%driver-fail :unexpected-alpn))
-       (setf (tls13-client-driver-negotiated-alpn driver)
-             (first protocols)))))
- (when (and (tls13-client-driver-resumed-p driver)
-            (not (equal (tls13-client-driver-negotiated-alpn driver)
-                        (%tls13-session-ticket-alpn
-                         (tls13-client-driver-offered-ticket driver)))))
-   (%driver-fail :resumed-alpn-mismatch))
- (setf (tls13-client-driver-state driver)
-       (if (tls13-client-driver-resumed-p driver)
-           :awaiting-finished
-         :awaiting-certificate)))
+       (let* ((extensions
+                (tls13-encrypted-extensions-extensions message))
+              (client-hello (tls13-client-driver-client-hello driver))
+              (offered-extensions
+                (and client-hello
+                     (tls13-client-hello-extensions client-hello))))
+         (when (or (find 42 extensions :key #'tls-extension-type)
+                   (and (find #x0039 extensions :key #'tls-extension-type)
+                        (not (find #x0039 offered-extensions
+                                   :key #'tls-extension-type))))
+           (%driver-fail :unsupported-extension)))
+       (let ((extension
+              (find +tls13-extension-application-layer-protocol-negotiation+
+                    (tls13-encrypted-extensions-extensions message)
+                    :key #'tls-extension-type)))
+         (when extension
+           (let ((protocols (decode-alpn-extension
+                             (tls-extension-data extension))))
+             (unless (= (length protocols) 1)
+               (%driver-fail :unexpected-alpn))
+             (unless (member (first protocols) (tls13-client-driver-alpn driver)
+                             :test #'string=)
+               (%driver-fail :unexpected-alpn))
+             (setf (tls13-client-driver-negotiated-alpn driver)
+                   (first protocols)))))
+       (when (and (tls13-client-driver-resumed-p driver)
+                  (not (equal (tls13-client-driver-negotiated-alpn driver)
+                              (%tls13-session-ticket-alpn
+                               (tls13-client-driver-offered-ticket driver)))))
+         (%driver-fail :resumed-alpn-mismatch))
+       (setf (tls13-client-driver-state driver)
+             (if (tls13-client-driver-resumed-p driver)
+                 :awaiting-finished
+               :awaiting-certificate)))
       (tls13-certificate
        (when (tls13-client-driver-resumed-p driver)
          (%driver-fail :unexpected-message))
