@@ -117,6 +117,24 @@ and `transport-write` callbacks, or use
 `tls13-client-driver-key-update` write application data, close the connection,
 and update the write traffic secret.
 
+After `tls13-client-driver-connect`, use
+the exported `tls13-client-driver-read-application-data` to read without
+inspecting the driver's state. It returns `(values :data octets)` for application data,
+`:would-block` when `make-tls13-client-driver`'s custom `transport-read`
+callback returns that marker, or `:eof` after receiving `close_notify`. That
+callback must retain any partial record bytes when it returns `:would-block`.
+A raw transport EOF signals `tls13-client-driver-error` with reason `:eof`.
+
+`make-tls13-server-driver` accepts an optional `:quic-transport-parameters`
+octet vector. When supplied, the driver copies the opaque value into extension
+`#x0039` in `EncryptedExtensions`, where it is covered by the handshake
+transcript. If the ClientHello contains extension `#x0039`, the returned event
+list includes `(:peer-quic-transport-parameters octets)` with its opaque value.
+A configured server value requires that the ClientHello contain the extension;
+otherwise the driver rejects the handshake with `missing_extension`. Omitting
+the keyword means the driver does not require the ClientHello extension or add
+it to `EncryptedExtensions`, preserving the existing TCP handshake behavior.
+
 The lower-level `make-tls-client` boundary requires a
 `:verify-certificate` callback whenever a peer certificate is received. It
 receives the certificate and must return non-`nil` to accept it; a missing
@@ -161,8 +179,4 @@ the QUIC implementation owns those layers and supplies CRYPTO offsets and
 callbacks. QUIC transport parameters are a separate extension from SNI and
 ALPN.
 
-## Public API
-
-The package exports the DER, PEM, `cl-tls-kit.x509`, certificate verification,
-TLS 1.3 record/handshake/key schedule, callback client, handshake driver, and
-QUIC boundary APIs described above. The project is MIT licensed.
+The project is MIT licensed.

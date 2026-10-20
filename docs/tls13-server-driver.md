@@ -17,6 +17,7 @@ integration.
 | `:alpn-protocols` | Optional server preference order as strings. `nil` means no configured protocols. An offered list with no match produces `no_application_protocol`. |
 | `:sni-callback` | Optional function called only for a full handshake. It receives the decoded hostname, or `nil` when the client omits SNI, and returns `(values der-chain private-key)`. If it returns no chain, the driver uses the default certificate and key. Return a chain and its matching key together to select another credential. PSK resumption skips credential selection and this callback. |
 | `:ticket-key-store` | Optional store created by `make-tls13-server-ticket-key-store`. If omitted, the driver creates a private store. Pass one shared store to instances that should resume one another's tickets. The default maximum ticket lifetime is 86400 seconds; the accepted range is 1 to 604800 seconds. |
+| `:quic-transport-parameters` | Optional octet vector containing opaque QUIC transport-parameter bytes. When supplied, the driver copies the value into extension `#x0039` in `EncryptedExtensions`. The full encoded extensions vector, including its other extensions and their headers, must fit TLS's 16-bit length. |
 | `:supported-groups` | Supported TLS group IDs. Only X25519 (`#x001d`) and secp256r1 (`#x0017`) are accepted. The default preference order is X25519, then secp256r1. |
 | `:cipher-suites` | Supported TLS 1.3 suite IDs. Only `#x1301` through `#x1304` are accepted; the default preference order uses that sequence. |
 | `:clock` | Function returning Common Lisp universal time. Defaults to `get-universal-time`. |
@@ -43,7 +44,7 @@ including its four-byte handshake header. Do not pass a TLS record. Use level
 ```
 
 The driver updates its state in place and returns `(values driver events)`.
-The returned event list contains plists with a `:type` key:
+Most entries in the returned event list are plists with a `:type` key:
 
 | Event | Fields |
 | --- | --- |
@@ -54,6 +55,17 @@ The returned event list contains plists with a `:type` key:
 | `:ticket-issued` | `:identity`, an opaque encrypted ticket, and `:lifetime` in seconds. |
 | `:handshake-complete` | `:resumed-p`, true when a PSK ticket resumed the connection. |
 | `:alert` | `:description`, the TLS alert description. The matching `:send` event carries the alert bytes. |
+
+When a ClientHello contains QUIC transport parameters, the event list also
+contains `(:peer-quic-transport-parameters octets)`. The octets are an opaque
+copy of the extension data. This entry is emitted for each processed
+ClientHello, including the first ClientHello that produces HelloRetryRequest
+and the accepted second ClientHello. If
+`:quic-transport-parameters` was supplied to the server constructor, a
+ClientHello without extension `#x0039` is rejected with a fatal
+`missing_extension` alert. If the keyword was omitted, the driver neither
+requires extension `#x0039` in ClientHello nor adds it to
+`EncryptedExtensions`, retaining its existing TCP behavior.
 
 Send events at `:initial` contain ServerHello or HelloRetryRequest. Encrypted
 Extensions, Certificate, CertificateVerify, and Finished use `:handshake`.
@@ -183,4 +195,3 @@ handshake limits, rejecting connections that exceed either cap. The driver
 does not choose numeric cap values. FR-016 does not define a handshake-rate
 limit. The listener should separately limit handshake frequency to reduce CPU
 exhaustion from repeated handshakes.
-

@@ -161,7 +161,7 @@
    #:tls13-server-driver-error #:tls13-server-driver-error-reason
    #:tls13-server-ticket-key-store #:tls13-server-ticket-key-store-p
    #:make-tls13-server-ticket-key-store
-   #:rotate-tls13-server-ticket-key-store))
+   #:rotate-tls13-server-ticket-key-store #:tls13-client-driver-read-application-data))
 
 (defpackage #:cl-tls-kit.x509
   (:use #:cl #:cl-tls-kit)
