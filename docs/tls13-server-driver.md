@@ -56,16 +56,22 @@ Most entries in the returned event list are plists with a `:type` key:
 | `:handshake-complete` | `:resumed-p`, true when a PSK ticket resumed the connection. |
 | `:alert` | `:description`, the TLS alert description. The matching `:send` event carries the alert bytes. |
 
-When a ClientHello contains QUIC transport parameters, the event list also
-contains `(:peer-quic-transport-parameters octets)`. The octets are an opaque
-copy of the extension data. This entry is emitted for each processed
-ClientHello, including the first ClientHello that produces HelloRetryRequest
-and the accepted second ClientHello. If
-`:quic-transport-parameters` was supplied to the server constructor, a
-ClientHello without extension `#x0039` is rejected with a fatal
-`missing_extension` alert. If the keyword was omitted, the driver neither
-requires extension `#x0039` in ClientHello nor adds it to
-`EncryptedExtensions`, retaining its existing TCP behavior.
+With `:quic-transport-parameters` configured, events returned while
+processing a ClientHello containing extension `#x0039` include
+`(:peer-quic-transport-parameters octets)`. The octets are an opaque copy of
+the extension data. The event is returned before the server verifies the
+client's Finished message, so the octets are provisional and unauthenticated.
+A consumer may parse or buffer them, but must defer any decision that depends
+on their authenticity until the driver emits `:handshake-complete`, after it
+verifies Finished. The event is returned for the first ClientHello that
+produces HelloRetryRequest and for the accepted second ClientHello.
+
+With `:quic-transport-parameters` configured, the driver rejects a ClientHello
+without extension `#x0039` with a fatal `missing_extension` alert. Without the
+keyword, it neither requires extension `#x0039` in ClientHello nor adds it to
+`EncryptedExtensions`, retaining its existing TCP behavior. In this mode, a
+ClientHello that contains extension `#x0039` is rejected with a fatal
+`unsupported_extension` alert.
 
 Send events at `:initial` contain ServerHello or HelloRetryRequest. Encrypted
 Extensions, Certificate, CertificateVerify, and Finished use `:handshake`.

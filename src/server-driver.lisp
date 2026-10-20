@@ -1165,6 +1165,9 @@ random octets. TICKET-LIFETIME is the maximum ticket lifetime in seconds."
          (transcript-prefix (if second-p (tls13-server-driver-transcript driver) #()))
          (suite
            (progn
+             (when (and (null (tls13-server-driver-quic-transport-parameters driver))
+                        peer-parameters-extension)
+               (%tls13-server-fail :unsupported-extension 110))
              (when (and (tls13-server-driver-quic-transport-parameters driver)
                         (null peer-parameters-extension))
                (%tls13-server-fail :missing-extension 109))
@@ -1307,10 +1310,16 @@ random octets. TICKET-LIFETIME is the maximum ticket lifetime in seconds."
   driver)
 
 (defun tls13-server-driver-step (driver wire &key level)
-  "Consume one complete handshake message and return DRIVER and output events.
+  "Consume one complete handshake message. Return DRIVER and output events as two values.
 
-WIRE is raw TLS handshake framing, with the four-byte handshake header. LEVEL
-is :INITIAL for ClientHello and :HANDSHAKE for the client's Finished."
+WIRE is a TLS handshake message with its four-byte header; do not include a TLS
+record. LEVEL is :INITIAL for ClientHello, :HANDSHAKE for the client Finished,
+or :APPLICATION for post-handshake KeyUpdate messages.
+
+A :PEER-QUIC-TRANSPORT-PARAMETERS event can precede verification of the client
+Finished. Its value is provisional and unauthenticated until
+:HANDSHAKE-COMPLETE is returned. Make authenticity-dependent decisions only
+after :HANDSHAKE-COMPLETE."
   (unless (typep driver 'tls13-server-driver)
     (%tls13-server-fail :invalid-server-driver 80))
   (handler-case

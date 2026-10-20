@@ -1297,11 +1297,21 @@
                            "ALPN remains negotiated through the QUIC handshake")
           (check-quic-case (= client-cv-count 1)
                            "client verifies CertificateVerify in the QUIC handshake")
-          (check-quic-case
-           (and (eq (cl-tls-kit::tls13-client-driver-state client) :connected)
-                (eq (cl-tls-kit::tls13-server-driver-state server) :complete)
-                handshake-complete)
-           "server verifies the real client Finished with QUIC parameters in the transcript")
+          (progn
+            (check-quic-case
+             (and (eq (cl-tls-kit::tls13-client-driver-state client) :connected)
+                  (eq (cl-tls-kit::tls13-server-driver-state server) :complete)
+                  handshake-complete)
+             "server verifies the real client Finished with QUIC parameters in the transcript")
+            (check-quic-case
+             (let ((peer-index
+                     (and peer-events
+                          (position (car (last peer-events)) events)))
+                   (complete-index
+                     (and handshake-complete
+                          (position handshake-complete events))))
+               (and peer-index complete-index (< peer-index complete-index)))
+             "last peer QUIC parameter event precedes handshake completion"))
           (check-quic-case
            (and (= (length client-hello-wires) 2)
                 (equalp (client-parameter-data (first client-hello-wires))
@@ -1364,7 +1374,31 @@
           (check-quic-case (null server-extension)
                            "omitted server keyword sends no QUIC EncryptedExtensions")
           (check-quic-case (null peer-events)
-                           "omitted server keyword emits no peer QUIC parameter event")))
+                           "omitted server keyword emits no peer QUIC parameter event")
+          (let ((assertions-before quic-assertions))
+            (multiple-value-bind (client outgoing)
+                (%server-driver-test-client
+                 provider :trust-anchors (list anchor) :now now)
+              (multiple-value-bind (wire)
+                  (%server-driver-test-client-hello client outgoing)
+                (let* ((tcp-wire
+                         (encode-handshake
+                          1 (%server-driver-test-rewrite-client-hello
+                             (decode-handshake wire) #x0039 client-parameters)))
+                       (tcp-server
+                         (%server-driver-test-server
+                          provider chain private-key ticket-key-store
+                          (lambda () now))))
+                  (incf selected)
+                  (let ((events
+                          (%server-driver-test-assert-client-hello-rejected
+                           "QUIC transport parameters received on TCP"
+                           tcp-server tcp-wire 110 (function check-quic-case))))
+                    (check-quic-case
+                     (null (peer-parameter-events events))
+                     "TCP rejection emits no peer QUIC parameter event")))))
+            (format t "TLS 1.3 server rejects QUIC transport parameters over TCP: assertions: ~D~%"
+                    (- quic-assertions assertions-before)))))
       (multiple-value-bind (client outgoing)
           (%server-driver-test-client provider :trust-anchors (list anchor) :now now)
         (multiple-value-bind (wire hello)
@@ -1433,7 +1467,8 @@
                           (server
                             (%server-driver-test-server
                              provider chain private-key ticket-key-store
-                             (lambda () now) :groups '(#x0017))))
+                             (lambda () now) :groups (list #x0017)
+                             :quic-transport-parameters server-parameters)))
                      (setf (cl-tls-kit::tls13-client-driver-client-hello client)
                            client-hello
                            (cl-tls-kit::tls13-client-driver-transcript client)

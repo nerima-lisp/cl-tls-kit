@@ -1333,6 +1333,72 @@
                          cl-tls-kit::+tls-content-type-alert+)
                       (equalp (tls-plaintext-fragment alert) #(2 110)))
                  "unoffered early_data sends encrypted unsupported_extension")
+          (let* ((writes '())
+                 (client-hello-wire nil)
+                 (quic-transport-parameters-driver
+                   (make-tls13-client-driver
+                    :provider provider
+                    :key-exchange key-exchange
+                    :hostname "example.test"
+                    :on-send (lambda (ignored wire)
+                               (declare (ignore ignored))
+                               (setf client-hello-wire wire))
+                    :transport-write
+                    (lambda (ignored wire)
+                      (declare (ignore ignored))
+                      (push wire writes))))
+                 (assertions 0))
+            (tls13-client-driver-start quic-transport-parameters-driver)
+            (let ((client-hello (decode-handshake client-hello-wire)))
+              (check (not (find #x0039 (tls13-client-hello-extensions client-hello)
+                                :key #'tls-extension-type))
+                     "client does not offer QUIC transport_parameters")
+              (incf assertions))
+            (tls13-client-driver-step
+             quic-transport-parameters-driver
+             (encode-handshake
+              2 (make-tls13-server-hello
+                 #x0303
+                 (make-array 32 :element-type '(unsigned-byte 8) :initial-element 8)
+                 #() #x1301
+                 (list (make-tls-extension 43 #(3 4))
+                       (make-tls-extension
+                        51 (encode-key-share-server-extension
+                            #x001d
+                            (make-array 32 :element-type '(unsigned-byte 8)
+                                        :initial-element 9)))))))
+            (let* ((write-state
+                     (cl-tls-kit::tls13-client-driver-handshake-write-state
+                      quic-transport-parameters-driver))
+                   (alert-reader
+                     (make-tls13-traffic-state
+                      provider :sha256 :aes-128-gcm
+                      (tls13-traffic-state-secret write-state) 16 12))
+                   (failure
+                     (handler-case
+                         (progn
+                           (tls13-client-driver-step
+                            quic-transport-parameters-driver
+                            (encode-handshake
+                             8 (make-tls13-encrypted-extensions
+                                (list (make-tls-extension #x0039 #())))))
+                           nil)
+                       (tls13-client-driver-error (condition)
+                         (eq (tls13-client-driver-error-reason condition)
+                             :unsupported-extension)))))
+              (check failure
+                     "EncryptedExtensions rejects unsolicited QUIC transport_parameters")
+              (incf assertions)
+              (let ((alert
+                      (decrypt-tls13-traffic-record (first writes) alert-reader)))
+                (check (and (= (tls-plaintext-content-type alert)
+                               cl-tls-kit::+tls-content-type-alert+)
+                            (equalp (tls-plaintext-fragment alert) #(2 110)))
+                       "unsolicited QUIC transport_parameters sends encrypted unsupported_extension")
+                (incf assertions)))
+            (assert (= assertions 3))
+            (format t "TLS 1.3 client QUIC transport parameter rejection: assertions: ~D~%"
+                    assertions))
           (let ((api-assertions 0))
             (let* ((secret (make-array 32 :element-type '(unsigned-byte 8)
                                        :initial-element 21))
