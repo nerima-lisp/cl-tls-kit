@@ -117,6 +117,10 @@ and `transport-write` callbacks, or use
 `tls13-client-driver-key-update` write application data, close the connection,
 and update the write traffic secret.
 
+For client resumption, create a store with `make-tls13-ticket-store` and pass it
+as `:ticket-store` to client drivers. `clear-tls13-ticket-store` removes all
+currently stored tickets and zeroizes each stored ticket PSK.
+
 After `tls13-client-driver-connect`, use
 the exported `tls13-client-driver-read-application-data` to read without
 inspecting the driver's state. It returns `(values :data octets)` for application data,

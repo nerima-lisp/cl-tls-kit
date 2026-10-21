@@ -3,9 +3,269 @@
 (defvar *client-resumption-assertions* 0)
 (declaim (ftype (function (t) t) run-client-resumption-regression-tests))
 
-(defun %client-resumption-check (condition message)
-  (incf *client-resumption-assertions*)
-  (check condition message))
+(progn
+  (defun %client-resumption-check (condition message)
+    (incf *client-resumption-assertions*)
+    (check condition message))
+  (defun %client-resumption-ticket-store-clear-tests ()
+    (let ((selected 0))
+      (incf selected)
+      (let* ((store (make-tls13-ticket-store))
+             (stored
+               (loop for index from 1 to 3
+                     collect
+                     (cl-tls-kit::%tls13-ticket-store-put
+                      store
+                      (if (= index 3) "other.example.test" "example.test")
+                      "h2"
+                      (make-array 1 :element-type '(unsigned-byte 8)
+                                  :initial-element index)
+                      (make-array 32 :element-type '(unsigned-byte 8)
+                                  :initial-element #x42)
+                      :sha256 600 0))))
+        (clear-tls13-ticket-store store)
+        (%client-resumption-check
+         (and (zerop (cl-tls-kit::%tls13-ticket-store-count store))
+              (zerop (hash-table-count
+                      (cl-tls-kit::tls13-ticket-store-entries store))))
+         "clear removes all stored tickets")
+        (%client-resumption-check
+         (every (lambda (ticket)
+                  (every #'zerop
+                         (cl-tls-kit::%tls13-session-ticket-psk ticket)))
+                stored)
+         "clear zeroizes every stored PSK buffer"))
+      (incf selected)
+      (let ((store (make-tls13-ticket-store)))
+        (cl-tls-kit::%tls13-ticket-store-put
+         store "old.example.test" "h2"
+         (%client-resumption-hex "01")
+         (make-array 32 :element-type '(unsigned-byte 8)
+                     :initial-element #x42)
+         :sha256 600 0)
+        (clear-tls13-ticket-store store)
+        (let* ((identity (%client-resumption-hex "17"))
+               (psk (make-array 32 :element-type '(unsigned-byte 8)
+                                :initial-element #x24))
+               (stored
+                 (cl-tls-kit::%tls13-ticket-store-put
+                  store "example.test" "h2" identity psk :sha256 600 0))
+               (fetched
+                 (cl-tls-kit::%tls13-ticket-store-take
+                  store "example.test" "h2" '(:sha256))))
+          (%client-resumption-check
+           (and (eq stored fetched)
+                (equalp identity
+                        (cl-tls-kit::%tls13-session-ticket-identity fetched))
+                (equalp psk
+                        (cl-tls-kit::%tls13-session-ticket-psk fetched)))
+           "ticket storage and fetch work after clear")
+          (when fetched
+            (cl-tls-kit::%tls13-ticket-clear-secret fetched))))
+      #+sb-thread
+      (progn
+        (incf selected)
+        (let* ((store (make-tls13-ticket-store))
+               (ready (sb-thread:make-semaphore))
+               (start (sb-thread:make-semaphore))
+               (stored-gate (sb-thread:make-semaphore))
+               (cleared-gate (sb-thread:make-semaphore))
+               (success-gate (sb-thread:make-semaphore))
+               (results (make-array 4 :initial-element :pending))
+               (successful-fetches 0)
+               (concurrent-successful-fetches 0)
+               (worker
+                 (lambda ()
+                   (sb-thread:signal-semaphore ready)
+                   (sb-thread:wait-on-semaphore start)
+                   (let ((ticket nil)
+                         (sequence-valid-p t))
+                     (handler-case
+                         (setf ticket
+                               (cl-tls-kit::%tls13-ticket-store-put
+                                store "concurrent.example.test" "h2"
+                                (make-array 1 :element-type '(unsigned-byte 8)
+                                            :initial-element #x51)
+                                (make-array 32 :element-type '(unsigned-byte 8)
+                                            :initial-element #x42)
+                                :sha256 600 0))
+                       (error (condition)
+                         (declare (ignore condition))
+                         (setf sequence-valid-p nil)))
+                     (sb-thread:signal-semaphore stored-gate)
+                     (sb-thread:wait-on-semaphore cleared-gate)
+                     (handler-case
+                         (let ((fetched
+                                 (cl-tls-kit::%tls13-ticket-store-take
+                                  store "concurrent.example.test" "h2"
+                                  '(:sha256))))
+                           (unless
+                               (and ticket
+                                    (null fetched)
+                                    (every
+                                     #'zerop
+                                     (cl-tls-kit::%tls13-session-ticket-psk
+                                      ticket)))
+                             (setf sequence-valid-p nil))
+                           (when fetched
+                             (cl-tls-kit::%tls13-ticket-clear-secret fetched)))
+                       (error (condition)
+                         (declare (ignore condition))
+                         (setf sequence-valid-p nil)))
+                     (setf (aref results 0) sequence-valid-p))
+                   (let ((success-p
+                           (handler-case
+                               (let* ((identity (%client-resumption-hex "33"))
+                                      (psk (make-array
+                                            32 :element-type '(unsigned-byte 8)
+                                            :initial-element #x24))
+                                      (stored
+                                        (cl-tls-kit::%tls13-ticket-store-put
+                                         store "concurrent.example.test" "h2"
+                                         identity psk :sha256 600 0))
+                                      (fetched
+                                        (cl-tls-kit::%tls13-ticket-store-take
+                                         store "concurrent.example.test" "h2"
+                                         '(:sha256))))
+                                 (prog1
+                                     (and (eq stored fetched)
+                                          (equalp
+                                           identity
+                                           (cl-tls-kit::%tls13-session-ticket-identity
+                                            fetched))
+                                          (equalp
+                                           psk
+                                           (cl-tls-kit::%tls13-session-ticket-psk
+                                            fetched)))
+                                   (when fetched
+                                     (cl-tls-kit::%tls13-ticket-clear-secret
+                                      fetched))))
+                             (error (condition)
+                               (declare (ignore condition))
+                               nil))))
+                     (setf (aref results 1) success-p)
+                     (when success-p
+                       (incf successful-fetches)))
+                   (sb-thread:signal-semaphore success-gate)
+                   (let ((loop-valid-p
+                           (handler-case
+                               (let ((valid-p t))
+                                 (loop for index below 256
+                                       do (let* ((identity
+                                                   (make-array
+                                                    1
+                                                    :element-type '(unsigned-byte 8)
+                                                    :initial-element index))
+                                                 (stored
+                                                   (cl-tls-kit::%tls13-ticket-store-put
+                                                    store "concurrent.example.test" "h2"
+                                                    identity
+                                                    (make-array
+                                                     32
+                                                     :element-type '(unsigned-byte 8)
+                                                     :initial-element #x42)
+                                                    :sha256 600 0))
+                                                 (fetched
+                                                   (cl-tls-kit::%tls13-ticket-store-take
+                                                    store "concurrent.example.test" "h2"
+                                                    '(:sha256))))
+                                         (unless stored
+                                           (setf valid-p nil))
+                                         (when fetched
+                                           (incf successful-fetches)
+                                           (incf concurrent-successful-fetches)
+                                           (unwind-protect
+                                                (unless
+                                                    (and (eq stored fetched)
+                                                         (equalp
+                                                          identity
+                                                          (cl-tls-kit::%tls13-session-ticket-identity
+                                                           fetched))
+                                                         (every
+                                                          (lambda (byte)
+                                                            (= byte #x42))
+                                                          (cl-tls-kit::%tls13-session-ticket-psk
+                                                           fetched)))
+                                                  (setf valid-p nil))
+                                             (cl-tls-kit::%tls13-ticket-clear-secret
+                                              fetched)))
+                                         (sb-thread:thread-yield)))
+                                 (and valid-p
+                                      (plusp concurrent-successful-fetches)))
+                             (error () nil))))
+                     (setf (aref results 2) loop-valid-p)
+                     loop-valid-p)))
+               (clearer
+                 (lambda ()
+                   (sb-thread:signal-semaphore ready)
+                   (sb-thread:wait-on-semaphore start)
+                   (sb-thread:wait-on-semaphore stored-gate)
+                   (let ((clear-p
+                           (handler-case
+                               (progn
+                                 (clear-tls13-ticket-store store)
+                                 t)
+                             (error (condition)
+                               (declare (ignore condition))
+                               nil))))
+                     (sb-thread:signal-semaphore cleared-gate)
+                     (sb-thread:wait-on-semaphore success-gate)
+                     (let ((loop-valid-p
+                             (handler-case
+                                 (progn
+                                   (loop repeat 256
+                                         do (clear-tls13-ticket-store store)
+                                            (sb-thread:thread-yield))
+                                   t)
+                               (error () nil))))
+                       (setf (aref results 3) (and clear-p loop-valid-p))
+                       (and clear-p loop-valid-p)))))
+               (threads (list (sb-thread:make-thread worker)
+                              (sb-thread:make-thread clearer))))
+          (loop repeat 2 do (sb-thread:wait-on-semaphore ready))
+          (loop repeat 2 do (sb-thread:signal-semaphore start))
+          (let ((thread-results
+                  (loop for thread in threads
+                        collect
+                        (handler-case
+                            (sb-thread:join-thread thread)
+                          (error (condition)
+                            (declare (ignore condition))
+                            nil)))))
+            (%client-resumption-check
+             (eq (aref results 0) t)
+             "clear removes and zeroizes a ticket before the worker fetches it")
+            (%client-resumption-check
+             (and (eq (aref results 1) t)
+                  (plusp successful-fetches))
+             "worker completes a successful ticket fetch")
+            (%client-resumption-check
+             (and (equal thread-results '(t t))
+                  (eq (aref results 2) t)
+                  (eq (aref results 3) t)
+                  (plusp concurrent-successful-fetches))
+             "concurrent store, fetch, and clear finish without errors or corruption"))
+          (clear-tls13-ticket-store store)
+          (let* ((identity (%client-resumption-hex "52"))
+                 (psk (make-array 32 :element-type '(unsigned-byte 8)
+                                  :initial-element #x24))
+                 (stored
+                   (cl-tls-kit::%tls13-ticket-store-put
+                    store "after-concurrent.example.test" "h2" identity psk
+                    :sha256 600 0))
+                 (fetched
+                   (cl-tls-kit::%tls13-ticket-store-take
+                    store "after-concurrent.example.test" "h2" '(:sha256))))
+            (%client-resumption-check
+             (and (eq stored fetched)
+                  (equalp identity
+                          (cl-tls-kit::%tls13-session-ticket-identity fetched))
+                  (equalp psk
+                          (cl-tls-kit::%tls13-session-ticket-psk fetched)))
+             "ticket storage and fetch remain usable after concurrent clear")
+            (when fetched
+              (cl-tls-kit::%tls13-ticket-clear-secret fetched)))))
+        selected)))
 
 (defun %client-resumption-hex (string)
   (let ((result (make-array (/ (length string) 2)
@@ -497,9 +757,13 @@
                            (cl-tls-kit:make-cl-crypto-kit-provider))))
         (*client-resumption-assertions* 0)
         (selected 0))
-    (unless provider
-      (format t "TLS 1.3 client resumption security: SKIPPED (crypto provider unavailable)~%")
-      (return-from run-client-resumption-security-tests :skipped))
+    (progn
+      (incf selected (%client-resumption-ticket-store-clear-tests))
+      (unless provider
+        (format t "TLS 1.3 client resumption security: SKIPPED (crypto provider unavailable)~%")
+        (format t "TLS 1.3 client resumption security: selected test count: ~D; assertions: ~D~%"
+                selected *client-resumption-assertions*)
+        (return-from run-client-resumption-security-tests t)))
     (incf selected)
     (let* ((now 1000)
            (store (make-tls13-ticket-store :clock (lambda () now)))

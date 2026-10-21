@@ -86,6 +86,20 @@ store and does not put it back."
   (defun %tls13-ticket-clear-secret (ticket)
     (fill (%tls13-session-ticket-psk ticket) 0)
     ticket)
+  (defun clear-tls13-ticket-store (store)
+    "Remove all stored tickets from STORE and zeroize their PSKs."
+    (%tls13-ticket-store-call
+     store
+     (lambda ()
+       (let ((entries (tls13-ticket-store-entries store)))
+         (maphash
+          (lambda (key tickets)
+            (declare (ignore key))
+            (dolist (ticket tickets)
+              (%tls13-ticket-clear-secret ticket)))
+          entries)
+         (clrhash entries))))
+    store)
   (defun %tls13-ticket-store-count (store)
     (loop for tickets being the hash-values of (tls13-ticket-store-entries store)
           sum (length tickets)))
