@@ -9,7 +9,7 @@
     };
     # The crypto kit is consumed by the certificate verifier when available.
     cl-crypto-kit = {
-      url = "github:nerima-lisp/cl-crypto-kit/v0.2.1";
+      url = "github:nerima-lisp/cl-crypto-kit/v0.2.2";
       flake = false;
     };
   };
@@ -36,7 +36,7 @@
         system: pkgs: {
           default = pkgs.stdenvNoCC.mkDerivation {
             pname = "cl-tls-kit";
-            version = "0.1.0";
+            version = "0.4.0";
             src = self;
             dontBuild = true;
             installPhase = ''
@@ -69,7 +69,7 @@
         system: pkgs: {
           default = pkgs.stdenvNoCC.mkDerivation {
             pname = "cl-tls-kit-tests";
-            version = "0.1.0";
+            version = "0.4.0";
             src = self;
             nativeBuildInputs = [
               pkgs.sbcl
