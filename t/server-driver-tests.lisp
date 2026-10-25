@@ -102,6 +102,7 @@
               (alpn '("http/1.1" "h2"))
               (cipher-suites #( #x1301 #x1302 #x1303 #x1304))
               (max-consecutive-key-updates 32)
+              (session-tickets t session-tickets-supplied-p)
               (quic-transport-parameters nil quic-transport-parameters-supplied-p))
   (let ((arguments
           (list :provider provider :certificate-chain chain :private-key key
@@ -109,6 +110,9 @@
                 :supported-groups groups :cipher-suites cipher-suites
                 :clock clock :random (%server-driver-test-random)
                 :max-consecutive-key-updates max-consecutive-key-updates)))
+    (when session-tickets-supplied-p
+      (setf arguments
+            (append arguments (list :session-tickets session-tickets))))
     (when quic-transport-parameters-supplied-p
       (setf arguments
             (append arguments
@@ -175,7 +179,10 @@
     (provider chain key anchor ticket-key-store now &key (groups '(#x001d #x0017))
                                                    (alpn '("h2" "http/1.1"))
                                                    quic-transport-parameters
-                                                   client-quic-transport-parameters)
+                                                   client-quic-transport-parameters
+                                                   (session-tickets nil
+                                                    session-tickets-supplied-p)
+                                                   (client-ticket-store nil))
   (let ((client-outgoing (list nil))
         (client-certificate-verify-count 0)
         (server-alpn nil)
@@ -190,6 +197,7 @@
           (make-tls13-client-driver
            :provider provider :hostname "server.test" :alpn alpn
            :trust-anchors (list anchor) :now now
+           :ticket-store client-ticket-store
            :verify-certificate-verify
            (lambda (message)
              (declare (ignore message))
@@ -205,6 +213,8 @@
                         (if (member "http/1.1" alpn :test #'string=)
                             '("http/1.1" "h2")
                             alpn))
+                  (when session-tickets-supplied-p
+                    (list :session-tickets session-tickets))
                   (when quic-transport-parameters
                     (list :quic-transport-parameters
                           quic-transport-parameters)))))
@@ -253,7 +263,7 @@
                                        (getf event :type))))))))
     (values server client server-alpn ticket-event hrr-count
             client-certificate-verify-count events-seen (car client-outgoing)
-            (nreverse client-hello-wires))))
+            (nreverse client-hello-wires) client-ticket-store)))
 (defun %server-driver-test-client-server-resumption-roundtrip
     (provider chain key anchor ticket-key-store now check-case &key (suite #x1301)
                                                         hello-retry-p client-cipher-suites)
@@ -2068,12 +2078,169 @@
       (setf (symbol-function digest-symbol) digest-original
             (symbol-function issue-symbol) issue-original)))
   (progn
-                  (incf selected)
-                  (%server-driver-test-ticket-key-store-lifecycle
-                   provider chain private-key now (function check-case))
-                  (check-case
-                   (plusp assertions)
-                   "server driver executed nonzero assertions")))
+  (incf selected)
+  (%server-driver-test-ticket-key-store-lifecycle
+   provider chain private-key now (function check-case))
+  (flet ((destroyed-store-p (store)
+           (handler-case
+               (progn
+                 (rotate-tls13-server-ticket-key-store
+                  store :clock (lambda () now))
+                 nil)
+             (tls13-server-driver-error (condition)
+               (eq (tls13-server-driver-error-reason condition)
+                   :ticket-key-store-destroyed))))
+         (sent-type-p (events type)
+           (some (lambda (event)
+                   (let ((wire (getf event :wire)))
+                     (and (eq (getf event :type) :send)
+                          (vectorp wire)
+                          (plusp (length wire))
+                          (= (aref wire 0) type))))
+                 events)))
+    (incf selected)
+    (multiple-value-bind (server client alpn ticket hrr-count cv-count events outgoing
+                          client-hello-wires client-store)
+        (%server-driver-test-memory-handshake
+         provider chain private-key anchor nil now
+         :client-ticket-store (make-tls13-ticket-store :clock (lambda () 0)))
+      (declare (ignore alpn hrr-count cv-count events outgoing client-hello-wires))
+      (check-case
+       (and (eq (cl-tls-kit::tls13-client-driver-state client) :connected)
+            (eq (cl-tls-kit::tls13-server-driver-state server) :complete)
+            ticket
+            (getf ticket :identity)
+            (= (cl-tls-kit::%tls13-ticket-store-count client-store) 1))
+       "default server settings issue a ticket received by the in-memory client")
+      (clear-tls13-ticket-store client-store)
+      (let* ((ticket-fields
+               (cl-tls-kit::%tls13-server-open-ticket
+                server (getf ticket :identity)))
+             (ticket-store
+               (cl-tls-kit::tls13-server-driver-ticket-key-store server))
+             (disabled-server
+               (%server-driver-test-server
+                provider chain private-key ticket-store (lambda () now)
+                :session-tickets nil)))
+        (multiple-value-bind (psk-client psk-wire)
+            (%server-driver-test-psk-client-hello
+             provider ticket-fields (getf ticket :identity)
+             (getf ticket-fields :age-add) now)
+          (declare (ignore psk-client))
+          (incf selected)
+          (multiple-value-bind (returned response-events)
+              (tls13-server-driver-step
+               disabled-server psk-wire :level :initial)
+            (let ((send-events (%server-driver-test-events response-events :send)))
+              (check-case
+               (and ticket-store
+                    (eq (cl-tls-kit::tls13-server-driver-ticket-key-store disabled-server)
+                        ticket-store)
+                    (eq returned disabled-server)
+                    (null (%server-driver-test-event response-events :alert))
+                    (eq (cl-tls-kit::tls13-server-driver-state disabled-server)
+                        :awaiting-client-finished)
+                    (not (cl-tls-kit::tls13-server-driver-resumed-p disabled-server))
+                    (some (lambda (event)
+                            (= (aref (getf event :wire) 0) 11))
+                          send-events)
+                    (some (lambda (event)
+                            (= (aref (getf event :wire) 0) 15))
+                          send-events))
+               "server with tickets disabled and a store declines a valid PSK and starts a full handshake")))
+          (tls13-server-driver-close disabled-server))
+        (let ((missing-modes-server
+                (%server-driver-test-server
+                 provider chain private-key nil (lambda () now)
+                 :session-tickets nil)))
+          (multiple-value-bind (ignored invalid-wire)
+              (%server-driver-test-psk-client-hello
+               provider ticket-fields (getf ticket :identity)
+               (getf ticket-fields :age-add) now :remove-psk-modes-p t)
+            (declare (ignore ignored))
+            (incf selected)
+            (multiple-value-bind (returned response-events)
+                (tls13-server-driver-step
+                 missing-modes-server invalid-wire :level :initial)
+              (check-case
+               (and (eq returned missing-modes-server)
+                    (%server-driver-test-alert-p response-events 109)
+                    (eq (cl-tls-kit::tls13-server-driver-state missing-modes-server)
+                        :failed))
+               "server without a ticket store still rejects PSK without key exchange modes")))))
+      (tls13-server-driver-close server))
+    (incf selected)
+    (multiple-value-bind (server client alpn ticket hrr-count cv-count events outgoing
+                          client-hello-wires client-store)
+        (%server-driver-test-memory-handshake
+         provider chain private-key anchor nil now :session-tickets nil
+         :client-ticket-store (make-tls13-ticket-store :clock (lambda () 0)))
+      (declare (ignore alpn hrr-count cv-count outgoing client-hello-wires))
+      (check-case
+       (and (eq (cl-tls-kit::tls13-client-driver-state client) :connected)
+            (eq (cl-tls-kit::tls13-server-driver-state server) :complete))
+       "ticket-disabled server completes an in-memory client handshake")
+      (check-case
+       (and (null ticket)
+            (not (member :ticket-issued events :key (lambda (event) (getf event :type))))
+            (not (sent-type-p events 4))
+            (zerop (cl-tls-kit::%tls13-ticket-store-count client-store))
+            (null (cl-tls-kit::tls13-server-driver-ticket-key-store server)))
+       "ticket-disabled handshake emits and stores no NewSessionTicket")
+      (clear-tls13-ticket-store client-store)
+      (tls13-server-driver-close server))
+    (incf selected)
+    (let* ((driver
+             (%server-driver-test-server
+              provider chain private-key nil (lambda () now)))
+           (store (cl-tls-kit::tls13-server-driver-ticket-key-store driver)))
+      (check-case
+       (and store (cl-tls-kit::tls13-server-driver-ticket-key-store-owned-p driver))
+       "default server owns its internally created ticket-key store")
+      (tls13-server-driver-close driver)
+      (tls13-server-driver-close driver)
+      (check-case
+       (destroyed-store-p store)
+       "closing a server destroys its internal ticket-key store idempotently"))
+    (incf selected)
+    (let* ((driver
+             (%server-driver-test-server
+              provider chain private-key nil (lambda () now)))
+           (store (cl-tls-kit::tls13-server-driver-ticket-key-store driver)))
+      (multiple-value-bind (returned events)
+          (tls13-server-driver-step driver #(1 0 0 0) :level :initial)
+        (check-case
+         (and (eq returned driver)
+              (%server-driver-test-alert-p events 50)
+              (eq (cl-tls-kit::tls13-server-driver-state driver) :failed))
+         "fatal alert fails the server driver"))
+      (check-case
+       (destroyed-store-p store)
+       "fatal alert cleanup destroys the internal ticket-key store"))
+    (incf selected)
+    (let* ((store
+             (make-tls13-server-ticket-key-store
+              :random (%server-driver-test-random)))
+           (driver
+             (%server-driver-test-server
+              provider chain private-key store (lambda () now)))
+           (usable nil))
+      (unwind-protect
+           (progn
+             (tls13-server-driver-close driver)
+             (setf usable
+                   (handler-case
+                       (eq store
+                           (rotate-tls13-server-ticket-key-store
+                            store :clock (lambda () now)))
+                     (tls13-server-driver-error () nil)))
+             (check-case usable
+                         "closing a server preserves its caller-supplied ticket-key store"))
+        (destroy-tls13-server-ticket-key-store store)))
+  (check-case
+   (plusp assertions)
+   "server driver executed nonzero assertions"))
+))
                 (format t "TLS 1.3 server driver: selected test count: ~D; assertions: ~D~%"
                         selected assertions)
                 t)))))

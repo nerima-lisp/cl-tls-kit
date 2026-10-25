@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.5.0
+
+### Added
+
+- Add the `:session-tickets` server-driver option to disable session-ticket issuance.
+
+### Security
+
+- Destroy and zero internally created server ticket keys when a driver closes or fails, while preserving caller-owned stores.
+
 ## 0.4.1
 
 ### Security

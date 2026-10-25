@@ -16,7 +16,8 @@ integration.
 | `:private-key` | A matching cl-crypto-kit ECDSA P-256 or Ed25519 private key. |
 | `:alpn-protocols` | Optional server preference order as strings. `nil` means no configured protocols. An offered list with no match produces `no_application_protocol`. |
 | `:sni-callback` | Optional function called only for a full handshake. It receives the decoded hostname, or `nil` when the client omits SNI, and returns `(values der-chain private-key)`. If it returns no chain, the driver uses the default certificate and key. Return a chain and its matching key together to select another credential. PSK resumption skips credential selection and this callback. |
-| `:ticket-key-store` | Optional store created by `make-tls13-server-ticket-key-store`. If omitted, the driver creates a private store. Pass one shared store to instances that should resume one another's tickets. The default maximum ticket lifetime is 86400 seconds; the accepted range is 1 to 604800 seconds. |
+| `:ticket-key-store` | Optional store created by `make-tls13-server-ticket-key-store`. When session tickets are enabled, omitting this option makes the driver create a private store. Pass one shared store to instances that should resume one another's tickets. The default maximum ticket lifetime is 86400 seconds; the accepted range is 1 to 604800 seconds. |
+| `:session-tickets` | Whether to issue NewSessionTicket messages and accept PSK resumption. Defaults to `t`. With `nil`, the driver creates no internal ticket-key store, parses an offered PSK extension, checks that `psk_dhe_ke` was offered, then declines resumption without opening the ticket or verifying its binder. It continues with a full handshake. |
 | `:quic-transport-parameters` | Optional octet vector containing opaque QUIC transport-parameter bytes. When supplied, the driver copies the value into extension `#x0039` in `EncryptedExtensions`. The full encoded extensions vector, including its other extensions and their headers, must fit TLS's 16-bit length. |
 | `:supported-groups` | Supported TLS group IDs. Only X25519 (`#x001d`) and secp256r1 (`#x0017`) are accepted. The default preference order is X25519, then secp256r1. |
 | `:cipher-suites` | Supported TLS 1.3 suite IDs. Only `#x1301` through `#x1304` are accepted; the default preference order uses that sequence. |
@@ -52,7 +53,7 @@ Most entries in the returned event list are plists with a `:type` key:
 | `:secret` | `:direction` (`:read` for client traffic, `:write` for server traffic), `:level` (`:handshake` or `:application`), and octet-vector `:secret`. |
 | `:cipher-suite` | `:suite`, the negotiated suite ID. |
 | `:alpn` | `:protocol`, the negotiated application protocol string. |
-| `:ticket-issued` | `:identity`, an opaque encrypted ticket, and `:lifetime` in seconds. |
+| `:ticket-issued` | `:identity`, an opaque encrypted ticket, and `:lifetime` in seconds. Emitted only when `:session-tickets` is enabled. |
 | `:handshake-complete` | `:resumed-p`, true when a PSK ticket resumed the connection. |
 | `:alert` | `:description`, the TLS alert description. The matching `:send` event carries the alert bytes. |
 
@@ -88,18 +89,18 @@ material and do not write them to logs.
 
 ## Terminate a connection
 
-The driver does not read TLS records. When the record or transport layer reports
-a read failure or receives a peer alert, call
-`(tls13-server-driver-close driver)`. This clears per-connection secret
-buffers, releases the driver's callbacks and ticket-store reference, and marks
-the driver failed. It emits no alert, and later calls to
-`tls13-server-driver-step` return no events. The adapter may also call it when
-the connection ends normally.
+The driver does not read TLS records. Call
+`(tls13-server-driver-close driver)` when the record or transport layer reports
+a read failure, receives a peer alert, or ends the connection normally. Close
+clears per-connection secret buffers and callback references, releases the
+driver's ticket-store reference, and marks the driver failed. If the driver
+created the store, close also destroys it and wipes its keys. A store passed by
+the caller remains usable. Fatal-alert cleanup also destroys an internally
+created store. Close emits no alert, and later calls to
+`tls13-server-driver-step` return no events.
 
 ## Limit KeyUpdate messages
 
-The driver counts accepted KeyUpdate messages since the last successfully
-decrypted record whose `TLSInnerPlaintext.content_type` is `application_data`.
 If another KeyUpdate would exceed `:max-consecutive-key-updates`, the driver
 returns a fatal `unexpected_message` alert before deriving keys for that
 update. Pass KeyUpdate handshake messages to `tls13-server-driver-step` with
@@ -120,12 +121,12 @@ protocol.
 
 If no offered key share matches a mutually supported group, the driver sends a
 cookie-bearing HelloRetryRequest and validates the second ClientHello before
-continuing. Known-invalid or doomed ClientHellos fail before CertificateVerify
-signing. This includes malformed or duplicate extensions, no common group or
+continuing. Malformed or invalid ClientHellos fail before CertificateVerify
+signing. This includes duplicate extensions, no common group or
 signature scheme, invalid key-share encoding, ALPN mismatch, invalid retry
 state, an authenticated expired ticket, invalid ticket age, and a bad binder
-for a recognized ticket. A ticket
-with an unknown key ID or failed authentication is treated as an unknown PSK;
+for a recognized ticket. A ticket with an unknown key ID or an invalid AEAD tag
+is treated as an unknown PSK;
 the driver continues with a full handshake when possible. A full handshake
 uses an ECDSA P-256 or Ed25519 CertificateVerify signature. The driver does not
 authenticate clients and rejects early data. Resumption accepts `psk_dhe_ke`
@@ -179,12 +180,15 @@ exceeded, terminate with a fatal `unexpected_message` alert and stop draining.
 RFC 8446 §4.6.1 recommends this alert when the plaintext Application Data
 limit is exceeded. This contract also applies the same alert when the stricter
 wire-byte or record-count budget is exceeded; record overhead can therefore
-cause closure before the plaintext limit is reached. Outside the explicit
-rejection paths, use normal TLS record error handling; in particular, a
-decryption failure for accepted early data is fatal with `bad_record_mac` as
-required by [RFC 8446 §5.2](https://www.rfc-editor.org/rfc/rfc8446#section-5.2).
+cause closure before the plaintext limit is reached. The current driver rejects
+early data. If a future version accepts it, a decryption failure outside the
+explicit rejection paths must follow normal TLS record error handling and use
+fatal `bad_record_mac`, as required by
+[RFC 8446 §5.2](https://www.rfc-editor.org/rfc/rfc8446#section-5.2).
 
 This contract follows [RFC 8446 §4.2.10](https://www.rfc-editor.org/rfc/rfc8446#section-4.2.10), which specifies trial decryption or skipping encrypted records when the server rejects early data, and [§4.6.1](https://www.rfc-editor.org/rfc/rfc8446#section-4.6.1), which recommends terminating with `unexpected_message` when the configured early-data limit is exceeded.
+
+## Ticket-key store
 
 ```lisp
 (defparameter *ticket-store*
@@ -198,20 +202,15 @@ scheduled by the driver; it installs a new key and retains prior decrypt keys
 for the configured ticket lifetime, up to seven days. The store keeps keys in
 memory, so replacing it after a restart invalidates tickets encrypted by its
 previous keys. It does not expose ticket keys or resumption PSKs through events.
-The application owns the store, including stores shared by multiple drivers.
-Call `(destroy-tls13-server-ticket-key-store store)` when the server stops to
-zero its current and previous keys and make the store unusable. Closing an
-individual driver only releases that driver's reference to the shared store.
+The application owns any store passed with `:ticket-key-store`, including
+stores shared by multiple drivers. Call
+`(destroy-tls13-server-ticket-key-store store)` when the server stops to zero
+its current and previous keys and make the store unusable. Closing a driver
+releases its reference to a caller-owned store but leaves the store usable.
 
 ## Listener resource limits
 
-CertificateVerify signing is expensive. The reported aarch64 measurements were
-about 215 ms for ECDSA P-256 and 265 ms for Ed25519 per signature; machine model
-and workload details were not recorded, so these are not capacity guarantees.
-A valid unauthenticated ClientHello can cause roughly 0.2 seconds of server CPU
-use when it reaches a full handshake. `cl-http-kit`'s HTTPS listener must apply
-FR-016's configurable maximum total concurrent connection and concurrent
-handshake limits, rejecting connections that exceed either cap. The driver
-does not choose numeric cap values. FR-016 does not define a handshake-rate
-limit. The listener should separately limit handshake frequency to reduce CPU
-exhaustion from repeated handshakes.
+A full handshake requires CertificateVerify signing, which consumes CPU. The
+listener must set finite limits for total connections and concurrent
+handshakes, and separately limit handshake frequency. The driver does not
+choose the limit values.
