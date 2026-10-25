@@ -204,8 +204,7 @@ store and does not put it back."
   (defvar *driver-transport-failure* nil)
   (defun %driver-fail (reason)
     (error 'tls13-client-driver-error :reason reason))
-  (defun %driver-close-transport (driver &optional sensitive-error-p)
-    (declare (ignore sensitive-error-p))
+  (defun %driver-close-transport (driver)
     (labels ((zero-octets (bytes)
                           (when (typep bytes '(vector (unsigned-byte 8)))
                             (fill bytes 0)))
@@ -1294,7 +1293,7 @@ Returns DRIVER; outgoing messages are delivered to ON-SEND."
         (%driver-handle-fatal-condition driver condition)
         (error condition))
       (error (condition)
-        (%driver-close-transport driver t)
+        (%driver-close-transport driver)
         (error condition)))))
 (defun tls13-client-driver-read-record (driver)
   (let ((*driver-transport-failure* nil))
@@ -1313,7 +1312,7 @@ Returns DRIVER; outgoing messages are delivered to ON-SEND."
         (%driver-handle-fatal-condition driver condition)
         (error condition))
       (error (condition)
-        (%driver-close-transport driver t)
+        (%driver-close-transport driver)
         (error condition)))))
 
 (defun tls13-client-driver-read-application-data (driver)
@@ -1348,7 +1347,7 @@ A transport reader must retain partial record bytes when returning :WOULD-BLOCK.
         (%driver-handle-fatal-condition driver condition)
         (error condition))
       (error (condition)
-        (%driver-close-transport driver t)
+        (%driver-close-transport driver)
         (error condition)))))
 
 (export '(tls13-client-driver tls13-client-driver-p
