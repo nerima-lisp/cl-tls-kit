@@ -1713,4 +1713,50 @@
              (tls13-client-driver-error (condition)
                (eq (tls13-client-driver-error-reason condition) :not-connected)))
            "client driver cannot be reused after a transport read error"))
-  t))))))
+  (progn
+    (let* ((dhe (make-array 32 :element-type '(unsigned-byte 8)
+                            :initial-element 17))
+           (driver
+             (cl-tls-kit::%make-tls13-client-driver
+              :provider provider
+              :hash :sha256
+              :early-secret (make-array 32 :element-type '(unsigned-byte 8))
+              :selected-group #x001d
+              :private-key #()
+              :key-exchange
+              (list :shared-secret
+                    (lambda (group private public)
+                      (declare (ignore group private public))
+                      dhe)))))
+      (cl-tls-kit::%driver-install-handshake-secret driver (cons #x001d #(1)))
+      (check (every #'zerop dhe)
+             "client driver clears the DHE secret after successful derivation"))
+    (let* ((dhe (make-array 32 :element-type '(unsigned-byte 8)
+                            :initial-element 23))
+           (bad-provider (cl-tls-kit::copy-tls13-crypto-provider provider))
+           (driver
+             (cl-tls-kit::%make-tls13-client-driver
+              :provider bad-provider
+              :hash :sha256
+              :early-secret (make-array 32 :element-type '(unsigned-byte 8))
+              :selected-group #x001d
+              :private-key #()
+              :key-exchange
+              (list :shared-secret
+                    (lambda (group private public)
+                      (declare (ignore group private public))
+                      dhe)))))
+      (setf (cl-tls-kit::tls13-crypto-provider-hkdf-extract bad-provider)
+            (lambda (&rest arguments)
+              (declare (ignore arguments))
+              (error "forced handshake-secret derivation failure")))
+      (check (handler-case
+                 (progn
+                   (cl-tls-kit::%driver-install-handshake-secret
+                    driver (cons #x001d #(1)))
+                   nil)
+               (simple-error () t))
+             "client driver propagates handshake-secret derivation failure")
+      (check (every #'zerop dhe)
+             "client driver clears the DHE secret after failed derivation"))
+    t)))))))

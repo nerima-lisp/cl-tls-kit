@@ -786,13 +786,22 @@ for unoffered groups, a retry of the initial group, and a second HelloRetryReque
 (defun %driver-install-handshake-secret (driver server-share)
   (let ((shared (getf (tls13-client-driver-key-exchange driver) :shared-secret)))
     (unless shared (%driver-fail :missing-key-exchange-function))
-    (let* ((dhe (funcall shared (tls13-client-driver-selected-group driver)
-                         (tls13-client-driver-private-key driver) (cdr server-share)))
-           (secret (tls13-handshake-secret
+    (let ((dhe nil))
+      (unwind-protect
+           (progn
+             (setf dhe
+                   (funcall shared
+                            (tls13-client-driver-selected-group driver)
+                            (tls13-client-driver-private-key driver)
+                            (cdr server-share)))
+             (setf (tls13-client-driver-handshake-secret driver)
+                   (tls13-handshake-secret
                     (tls13-client-driver-provider driver)
                     (tls13-client-driver-hash driver)
-                    (tls13-client-driver-early-secret driver) dhe)))
-      (setf (tls13-client-driver-handshake-secret driver) secret))))
+                    (tls13-client-driver-early-secret driver)
+                    dhe)))
+        (when (typep dhe '(vector (unsigned-byte 8)))
+          (fill dhe 0))))))
 
 (defun %driver-certificate-chain (message)
   (let ((entries (tls13-certificate-entries message)))
