@@ -16,6 +16,7 @@
                     run-client-resumption-tests
                     run-client-resumption-security-tests
                     run-server-driver-tests
+                    run-server-driver-close-tests
                     run-verification-tests
                     run-quic-boundary-tests
                     run-openssl-e2e-tests

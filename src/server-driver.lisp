@@ -1404,8 +1404,16 @@ CLOCK and the store RANDOM callback run under STORE's lock and must not re-enter
 (defun tls13-server-driver-note-application-data-received (driver)
   (unless (typep driver 'tls13-server-driver)
     (%tls13-server-fail :invalid-server-driver 80))
-  (setf (tls13-server-driver-consecutive-key-updates driver) 0)
+  (unless (eq (tls13-server-driver-state driver) :failed)
+    (setf (tls13-server-driver-consecutive-key-updates driver) 0))
   driver)
+(defun tls13-server-driver-close (driver)
+  "Clear per-connection secrets after a peer alert or transport failure.
+The record and transport owner must call this when the connection ends.
+This emits no alert, and subsequent driver steps return no events."
+  (unless (typep driver 'tls13-server-driver)
+    (%tls13-server-fail :invalid-server-driver 80))
+  (%tls13-server-clear-secrets driver))
 
 (defun tls13-server-driver-step (driver wire &key level)
   "Consume one complete handshake message. Return DRIVER and output events as two values.
