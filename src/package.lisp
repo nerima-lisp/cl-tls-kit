@@ -183,4 +183,4 @@
    #:x509-ec-public-key-curve #:x509-ec-public-key-point
    #:x509-ed25519-public-key-point #:x509-certificate-tbs-signature-algorithm
    #:parse-x509-certificate
-   #:parse-certificate #:parse-certificate-der #:x509-name-string))
+   #:parse-certificate #:parse-certificate-der #:x509-name-string #:x509-name-equal-p))

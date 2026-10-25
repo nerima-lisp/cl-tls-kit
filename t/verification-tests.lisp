@@ -168,22 +168,112 @@
                 (lambda (&rest arguments)
                   (declare (ignore arguments))
                   t))))
-        (let* ((leaf (certificate "leaf" "root"))
-               (self-issued (certificate "root" "root" :ca t))
-               (self-issued-root (certificate "root" "root" :ca t
-                                              :path-length 0 :self-signed t))
-               (normal-leaf (certificate "leaf" "intermediate"))
-               (normal-intermediate (certificate "intermediate" "root" :ca t))
-               (normal-root (certificate "root" "root" :ca t
-                                         :path-length 0 :self-signed t)))
+        (let* ((leaf (certificate '((("2.5.4.3" . "leaf"))) '((("2.5.4.3" . "root")))))
+               (self-issued (certificate '((("2.5.4.3" . "root"))) '((("2.5.4.3" . "root"))) :ca t))
+               (self-issued-root (certificate '((("2.5.4.3" . "root"))) '((("2.5.4.3" . "root"))) :ca t :path-length 0 :self-signed t))
+               (normal-leaf (certificate '((("2.5.4.3" . "leaf"))) '((("2.5.4.3" . "intermediate")))))
+               (normal-intermediate (certificate '((("2.5.4.3" . "intermediate"))) '((("2.5.4.3" . "root"))) :ca t))
+               (normal-root (certificate '((("2.5.4.3" . "root"))) '((("2.5.4.3" . "root"))) :ca t :path-length 0 :self-signed t)))
           (check (verify-chain (list leaf self-issued self-issued-root)
                                self-issued-root)
                  "pathLen zero excludes a self-issued subordinate CA")
-          (check (handler-case
-                     (progn
-                       (verify-chain (list normal-leaf normal-intermediate normal-root)
-                                     normal-root)
-                       nil)
-                   (path-length-exceeded () t))
-                 "pathLen zero rejects a non-self-issued subordinate CA")))
+          (progn
+            (check (handler-case
+                       (progn
+                         (verify-chain (list normal-leaf normal-intermediate normal-root)
+                                       normal-root)
+                         nil)
+                     (path-length-exceeded () t))
+                   "pathLen zero rejects a non-self-issued subordinate CA")
+            (let* ((single-rdn-name '((("2.5.4.3" . "untrusted,2.5.4.3=root"))))
+                   (two-rdn-name '((("2.5.4.3" . "untrusted"))
+                                   (("2.5.4.3" . "root"))))
+                   (leaf (certificate '((("2.5.4.3" . "leaf"))) single-rdn-name))
+                   (intermediate (certificate single-rdn-name two-rdn-name :ca t))
+                   (root (certificate two-rdn-name two-rdn-name :ca t
+                                      :path-length 0 :self-signed t)))
+              (check (string= (cl-tls-kit.x509:x509-name-string single-rdn-name)
+                              (cl-tls-kit.x509:x509-name-string two-rdn-name))
+                     "distinct DN structures can collide in display formatting")
+              (progn
+                (check (and (not (cl-tls-kit.x509:x509-name-equal-p single-rdn-name two-rdn-name)) (not (cl-tls-kit.x509:x509-name-equal-p "root" "root"))) "DN equality rejects bare strings and distinguishes RDN structure")
+                (check (cl-tls-kit.x509:x509-name-equal-p
+                        '((("2.5.4.3" . " Example   CA ")
+                           ("2.5.4.10" . " ACME ")))
+                        '((("2.5.4.10" . "acme")
+                           ("2.5.4.3" . "example ca"))))
+                       "DN equality treats AVAs as an unordered set"))
+              (progn
+  (check (handler-case
+             (progn
+               (verify-chain (list leaf intermediate root) root)
+               nil)
+           (path-length-exceeded () t))
+         "pathLen zero rejects a non-self-issued CA with a colliding DN display")
+  (labels ((join-octets (&rest pieces)
+             (apply #'concatenate '(vector (unsigned-byte 8)) pieces))
+           (tlv (tag content)
+             (join-octets (vector tag (length content)) content))
+           (name-der (rdns)
+             (nth-value
+              0
+              (cl-tls-kit.x509::%read-der
+               (tlv #x30
+                    (apply #'join-octets
+                           (mapcar (lambda (rdn)
+                                     (tlv #x31
+                                          (apply #'join-octets
+                                                 (mapcar
+                                                  (lambda (value)
+                                                    (tlv #x30
+                                                         (join-octets
+                                                          #(#x06 #x03 #x55 #x04 #x03)
+                                                          (tlv #x13
+                                                               (map '(vector (unsigned-byte 8))
+                                                                    #'char-code value)))))
+                                                  rdn))))
+                                   rdns))))))
+           (make-x509-certificate (subject issuer &key ca path-length)
+             (cl-tls-kit.x509::make-x509-certificate
+              :issuer (cl-tls-kit.x509::%name issuer)
+              :subject (cl-tls-kit.x509::%name subject)
+              :issuer-name-der issuer
+              :subject-name-der subject
+              :not-before 0
+              :not-after most-positive-fixnum
+              :signature-algorithm :rsa-pkcs1-sha256
+              :tbs-signature-algorithm :rsa-pkcs1-sha256
+              :tbs-certificate #(1)
+              :signature #(2)
+              :basic-constraints
+              (when ca
+                (append (list :ca t)
+                        (when path-length (list :path-length path-length))))))) (let* ((single-name (name-der '(("untrusted,2.5.4.3=root"))))
+           (two-name (name-der '(("untrusted") ("root"))))
+           (leaf-name (name-der '(("leaf"))))
+           (utf8-name
+             (nth-value
+              0
+              (cl-tls-kit.x509::%read-der
+               #(#x30 #x0d #x31 #x0b #x30 #x09 #x06 #x03 #x55 #x04 #x03
+                 #x0c #x02 #xc3 #xa9))))
+           (leaf (make-x509-certificate leaf-name single-name))
+           (intermediate (make-x509-certificate single-name two-name :ca t))
+           (root (make-x509-certificate two-name two-name :ca t :path-length 0)))
+      (check (not (cl-tls-kit.x509:x509-name-equal-p single-name two-name))
+             "DER DN comparison preserves RDN structure")
+      (check (cl-tls-kit.x509:x509-name-equal-p
+              utf8-name
+              (nth-value
+               0
+               (cl-tls-kit.x509::%read-der
+                #(#x30 #x0d #x31 #x0b #x30 #x09 #x06 #x03 #x55 #x04 #x03
+                  #x0c #x02 #xc3 #xa9))))
+             "identical non-ASCII DirectoryString DER values match")
+      (check (handler-case
+                 (progn
+                   (verify-chain (list leaf intermediate root) root)
+                   nil)
+               (path-length-exceeded () t))
+             "pathLen zero rejects a DER CA hidden by a colliding DN display"))))))))
       t))
