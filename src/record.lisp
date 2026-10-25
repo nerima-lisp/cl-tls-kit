@@ -299,10 +299,12 @@ number of zero octets added after the inner content type."
               (<= (aref bytes 4) 1)))))
 
 (defun tls-close-notify-p (plaintext)
-  "Recognize the exact warning-level close_notify alert."
+  "Recognize a TLS close_notify alert; TLS 1.3 ignores the legacy alert level."
   (and (typep plaintext 'tls-plaintext)
        (= (tls-plaintext-content-type plaintext) +tls-content-type-alert+)
-       (equalp (tls-plaintext-fragment plaintext) #(1 0))))
+       (let ((fragment (tls-plaintext-fragment plaintext)))
+         (and (= (length fragment) 2)
+              (= (aref fragment 1) +tls-alert-close-notify+)))))
 
 (export '(+tls-record-version+ +tls-plaintext-limit+ +tls-ciphertext-limit+
           +tls-content-type-alert+ +tls-content-type-handshake+

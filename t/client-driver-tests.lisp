@@ -791,9 +791,12 @@
              "local API misuse sends no alert and leaves the driver open"))
     (let* ((writes '())
            (close-count 0)
+           (secret (make-array 32 :element-type '(unsigned-byte 8)
+                               :initial-element 7))
            (read-driver
             (cl-tls-kit::%make-tls13-client-driver
              :state :connected
+             :early-secret secret
              :transport-read
              (lambda (ignored)
                (declare (ignore ignored))
@@ -815,10 +818,11 @@
                                       "transport read failed")))
              "driver preserves a transport receive failure")
       (check (and (null writes)
-                  (zerop close-count)
-                  (eq (cl-tls-kit::tls13-client-driver-state read-driver)
-                      :connected))
-             "transport receive failure sends no protocol alert"))
+                  (= close-count 1)
+                  (eq (cl-tls-kit::tls13-client-driver-state read-driver) :closed)
+                  (every #'zerop secret)
+                  (null (cl-tls-kit::tls13-client-driver-early-secret read-driver)))
+             "transport receive failure closes without a protocol alert and clears secrets"))
     (let* ((attempted-alerts 0)
            (close-count 0)
            (failed-driver
@@ -1075,7 +1079,7 @@
       (check
        (and
         (eq (cl-tls-kit::tls13-client-driver-state transport-record-driver) :connected)
-        (null writes)
+        (zerop (length writes))
         (zerop close-count)
         (handler-case
             (tls13-client-driver-read-record transport-record-driver)

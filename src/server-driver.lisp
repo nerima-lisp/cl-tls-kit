@@ -929,6 +929,47 @@ random octets. TICKET-LIFETIME is the maximum ticket lifetime in seconds."
     (:awaiting-client-finished :handshake)
     (:complete :application)
     (otherwise :initial)))
+(defun %tls13-server-clear-secrets (driver)
+  (dolist (secret
+           (list (tls13-server-driver-client-handshake-secret driver)
+                 (tls13-server-driver-server-handshake-secret driver)
+                 (tls13-server-driver-client-finished-key driver)
+                 (tls13-server-driver-master-secret driver)
+                 (tls13-server-driver-resumption-master-secret driver)
+                 (tls13-server-driver-client-application-secret driver)
+                 (tls13-server-driver-server-application-secret driver)))
+    (%tls13-server-zero-octets secret))
+  (%tls13-server-zero-octets (tls13-server-driver-transcript driver))
+  (%tls13-server-zero-octets (tls13-server-driver-server-flight-prefix driver))
+  (%tls13-server-zero-octets (tls13-server-driver-private-key-share driver))
+  (setf (tls13-server-driver-provider driver) nil
+        (tls13-server-driver-ticket-key-store driver) nil
+        (tls13-server-driver-sni-callback driver) nil
+        (tls13-server-driver-clock driver) nil
+        (tls13-server-driver-random driver) nil
+        (tls13-server-driver-key-exchange driver) nil
+        (tls13-server-driver-private-key driver) nil
+        (tls13-server-driver-client-handshake-secret driver) nil
+        (tls13-server-driver-server-handshake-secret driver) nil
+        (tls13-server-driver-client-finished-key driver) nil
+        (tls13-server-driver-master-secret driver) nil
+        (tls13-server-driver-resumption-master-secret driver) nil
+        (tls13-server-driver-client-application-secret driver) nil
+        (tls13-server-driver-server-application-secret driver) nil
+        (tls13-server-driver-transcript driver)
+        (make-array 0 :element-type (quote (unsigned-byte 8)))
+        (tls13-server-driver-server-flight-prefix driver) nil
+        (tls13-server-driver-private-key-share driver) nil
+        (tls13-server-driver-initial-client-hello driver) nil
+        (tls13-server-driver-cookie driver) nil
+        (tls13-server-driver-state driver) :failed)
+  driver)
+(defun %tls13-server-failure-events (driver alert)
+  (let ((events
+         (%tls13-server-alert-events alert
+                                     (%tls13-server-alert-level driver))))
+    (%tls13-server-clear-secrets driver)
+    events))
 
 (defun %tls13-server-handshake-transcript (prefix &rest messages)
   (apply #'%tls13-server-cat prefix messages))
@@ -1357,14 +1398,13 @@ after :HANDSHAKE-COMPLETE."
             (%tls13-server-process-key-update driver wire))
            (t (%tls13-server-fail :unexpected-handshake-message 10)))))
     (tls13-server-driver-error (condition)
-      (values driver (%tls13-server-alert-events
-                      (%tls13-server-driver-error-alert condition)
-                      (%tls13-server-alert-level driver))))
+      (values driver
+              (%tls13-server-failure-events
+               driver (%tls13-server-driver-error-alert condition))))
     (tls13-error (condition)
-      (values driver (%tls13-server-alert-events
-                      (%tls13-server-error-alert condition)
-                      (%tls13-server-alert-level driver))))
+      (values driver
+              (%tls13-server-failure-events
+               driver (%tls13-server-error-alert condition))))
     (error (condition)
       (declare (ignore condition))
-      (values driver (%tls13-server-alert-events
-                      80 (%tls13-server-alert-level driver))))))
+      (values driver (%tls13-server-failure-events driver 80)))))
