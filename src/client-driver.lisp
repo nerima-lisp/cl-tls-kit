@@ -1359,5 +1359,8 @@ A transport reader must retain partial record bytes when returning :WOULD-BLOCK.
   tls13-client-driver-negotiated-alpn tls13-client-driver-error
   tls13-client-driver-error-reason make-tls13-ticket-store
   tls13-ticket-store tls13-ticket-store-p tls13-client-driver-resumed-p))
-(defun tls13-client-driver-close-notify-received-p (driver)
-  (tls13-client-driver-close-notify-received driver))
+(progn
+  (defun tls13-client-driver-closed-p (driver)
+    (eq (tls13-client-driver-state driver) :closed))
+  (defun tls13-client-driver-close-notify-received-p (driver)
+    (tls13-client-driver-close-notify-received driver)))

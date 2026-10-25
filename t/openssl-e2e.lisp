@@ -1,6 +1,12 @@
 (in-package #:cl-tls-kit/test)
 
 (defparameter *openssl-e2e-port* 45100)
+(defun %openssl-e2e-call (name)
+  (let* ((package (find-package "CRYPTO-KIT"))
+         (symbol (and package (find-symbol name package))))
+    (unless (and symbol (fboundp symbol))
+      (error "CL-CRYPTO-KIT:~A is unavailable" name))
+    (symbol-function symbol)))
 
 (defun %openssl-e2e-run (program arguments)
   (multiple-value-bind (output error-output exit-code)

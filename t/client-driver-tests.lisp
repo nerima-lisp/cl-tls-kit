@@ -1759,4 +1759,11 @@
              "client driver propagates handshake-secret derivation failure")
       (check (every #'zerop dhe)
              "client driver clears the DHE secret after failed derivation"))
-    t)))))))
+    (progn
+    (let ((driver (make-tls13-client-driver :provider provider)))
+      (check (not (tls13-client-driver-closed-p driver))
+             "client driver closed predicate is false while open")
+      (tls13-client-driver-close driver)
+      (check (tls13-client-driver-closed-p driver)
+             "client driver closed predicate is true after close"))
+    t))))))))

@@ -117,6 +117,12 @@ and `transport-write` callbacks, or use
 `tls13-client-driver-key-update` write application data, close the connection,
 and update the write traffic secret.
 
+RSA-PSS certificate signatures with `rsaEncryption` (`RSAE`) public keys
+support SHA-256, SHA-384, and SHA-512. `RSASSA-PSS` subject public keys are not
+supported. MGF1 must use the same digest, the salt length must equal the digest
+length, and the trailer field must be 1. The signature AlgorithmIdentifiers in
+the certificate and its TBSCertificate must match, including their parameters.
+
 For client resumption, create a store with `make-tls13-ticket-store` and pass it
 as `:ticket-store` to client drivers. `clear-tls13-ticket-store` removes all
 currently stored tickets and zeroizes each stored ticket PSK.

@@ -20,7 +20,10 @@
                     run-verification-tests
                     run-quic-boundary-tests
                     run-openssl-e2e-tests
-                    run-server-openssl-e2e-tests))
+                    run-server-openssl-e2e-tests
+                    run-openssl-chain-tests
+                    run-pss-signature-tests
+                    run-pss-parameters-tests))
       (let ((result (funcall test)))
         (unless (member result (quote (t :skipped)))
           (error "cl-tls-kit test group failed: ~A" test))
