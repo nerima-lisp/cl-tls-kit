@@ -136,6 +136,8 @@
    #:tls13-client-driver-write #:tls13-client-driver-close
    #:tls13-client-driver-key-update #:make-tls13-client-driver-over-tcp
    #:tls13-client-driver-negotiated-alpn
+   #:tls13-client-driver-close-notify-received-p
+   #:tls13-client-driver-closed-p
    #:tls13-client-driver-error #:tls13-client-driver-error-reason
    #:quic-tls-boundary-error #:quic-tls-boundary-decode-error
    #:make-quic-tls-boundary #:quic-tls-boundary-p
@@ -157,12 +159,13 @@
    #:make-tls13-ticket-store #:tls13-ticket-store #:tls13-ticket-store-p
    #:tls13-client-driver-resumed-p
    #:tls13-server-driver #:tls13-server-driver-p
-   #:make-tls13-server-driver #:tls13-server-driver-step
+   #:make-tls13-server-driver #:tls13-server-driver-step #:tls13-server-driver-close
    #:tls13-server-driver-note-application-data-received
    #:tls13-server-driver-error #:tls13-server-driver-error-reason
    #:tls13-server-ticket-key-store #:tls13-server-ticket-key-store-p
    #:make-tls13-server-ticket-key-store
-   #:rotate-tls13-server-ticket-key-store #:tls13-client-driver-read-application-data))
+   #:rotate-tls13-server-ticket-key-store #:tls13-client-driver-read-application-data
+   #:destroy-tls13-server-ticket-key-store))
 
 (defpackage #:cl-tls-kit.x509
   (:use #:cl #:cl-tls-kit)
@@ -171,7 +174,7 @@
    #:x509-certificate-version #:x509-certificate-serial-number
    #:x509-certificate-subject #:x509-certificate-issuer
    #:x509-certificate-not-before #:x509-certificate-not-after
-   #:x509-certificate-public-key #:x509-certificate-signature-algorithm
+   #:x509-certificate-public-key #:x509-certificate-signature-algorithm #:x509-certificate-signature-parameters
    #:x509-certificate-extensions #:x509-certificate-basic-constraints
    #:x509-certificate-key-usage #:x509-certificate-extended-key-usage
    #:x509-certificate-subject-alternative-name #:x509-certificate-name-constraints
@@ -179,6 +182,6 @@
    #:x509-public-key-parameters #:x509-public-key-data
    #:x509-rsa-public-key-modulus #:x509-rsa-public-key-exponent
    #:x509-ec-public-key-curve #:x509-ec-public-key-point
-   #:x509-ed25519-public-key-point #:x509-certificate-tbs-signature-algorithm
+   #:x509-ed25519-public-key-point #:x509-certificate-tbs-signature-algorithm #:x509-certificate-tbs-signature-parameters
    #:parse-x509-certificate
-   #:parse-certificate #:parse-certificate-der #:x509-name-string))
+   #:parse-certificate #:parse-certificate-der #:x509-name-string #:x509-name-equal-p))

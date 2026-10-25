@@ -86,6 +86,16 @@ events. A QUIC adapter passes handshake bytes and traffic secrets through its
 TLS integration without TLS record framing. Treat secret event values as key
 material and do not write them to logs.
 
+## Terminate a connection
+
+The driver does not read TLS records. When the record or transport layer reports
+a read failure or receives a peer alert, call
+`(tls13-server-driver-close driver)`. This clears per-connection secret
+buffers, releases the driver's callbacks and ticket-store reference, and marks
+the driver failed. It emits no alert, and later calls to
+`tls13-server-driver-step` return no events. The adapter may also call it when
+the connection ends normally.
+
 ## Limit KeyUpdate messages
 
 The driver counts accepted KeyUpdate messages since the last successfully
@@ -188,6 +198,10 @@ scheduled by the driver; it installs a new key and retains prior decrypt keys
 for the configured ticket lifetime, up to seven days. The store keeps keys in
 memory, so replacing it after a restart invalidates tickets encrypted by its
 previous keys. It does not expose ticket keys or resumption PSKs through events.
+The application owns the store, including stores shared by multiple drivers.
+Call `(destroy-tls13-server-ticket-key-store store)` when the server stops to
+zero its current and previous keys and make the store unusable. Closing an
+individual driver only releases that driver's reference to the shared store.
 
 ## Listener resource limits
 

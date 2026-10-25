@@ -36,7 +36,7 @@
         system: pkgs: {
           default = pkgs.stdenvNoCC.mkDerivation {
             pname = "cl-tls-kit";
-            version = "0.4.0";
+            version = "0.4.1";
             src = self;
             dontBuild = true;
             installPhase = ''
@@ -69,7 +69,7 @@
         system: pkgs: {
           default = pkgs.stdenvNoCC.mkDerivation {
             pname = "cl-tls-kit-tests";
-            version = "0.4.0";
+            version = "0.4.1";
             src = self;
             nativeBuildInputs = [
               pkgs.sbcl
@@ -94,6 +94,7 @@
                 --load t/crypto-provider-check.lisp
               ${pkgs.sbcl}/bin/sbcl --noinform --non-interactive \
                 --eval '(require :asdf)' \
+                --eval '(asdf:load-system "cl-crypto-kit")' \
                 --eval '(asdf:test-system "cl-tls-kit")'
               runHook postCheck
             '';
@@ -121,7 +122,7 @@
             text = ''
               export OPENSSL="${pkgs.openssl}/bin/openssl"
               export CL_SOURCE_REGISTRY="$PWD//:${cl-crypto-kit.outPath}/:${pkgs.sbclPackages.alexandria}/:${pkgs.sbclPackages.global-vars}/:${pkgs.sbclPackages.trivial-features}/:${pkgs.sbclPackages.trivial-garbage}/:${pkgs.sbclPackages.bordeaux-threads}/"
-              sbcl --noinform --non-interactive --eval '(require :asdf)' --eval '(asdf:test-system "cl-tls-kit")'
+              sbcl --noinform --non-interactive --eval '(require :asdf)' --eval '(asdf:load-system "cl-crypto-kit")' --eval '(asdf:test-system "cl-tls-kit")'
             '';
           };
         in

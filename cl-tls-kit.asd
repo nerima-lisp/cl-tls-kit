@@ -4,7 +4,7 @@
   :description "Small, strict DER and PEM building blocks for TLS certificate tooling."
   :author "nerima-lisp"
   :license "MIT"
-  :version "0.4.0"
+  :version "0.4.1"
   ;; Cryptographic operations are intentionally not part of this foundation.
   ;; A future certificate/crypto layer may add ironclad and cl-base64 here.
   :depends-on ("bordeaux-threads")
@@ -12,7 +12,8 @@
   :pathname "src"
   :serial t
   :components ((:file "package") (:file "asn1") (:file "pem")
-               (:file "hostname") (:file "x509") (:file "trust-store")
+               (:file "hostname") (:file "x509-stringprep-data")
+               (:file "x509-stringprep") (:file "x509") (:file "trust-store")
                (:file "verify") (:file "key-schedule") (:file "record")
                (:file "handshake") (:file "verification")
                (:file "quic-boundary") (:file "rfc8448") (:file "client")
@@ -30,10 +31,11 @@
                (:file "handshake-tests") (:file "client-tests")
                (:file "client-driver-tests") (:file "client-resumption-tests")
                (:file "server-driver-tests")
-               (:file "verification-tests") (:file "quic-boundary-tests")
-               (:file "rfc8448-tests") (:file "rfc8448-server-tests")
-               (:file "openssl-e2e") (:file "server-openssl-e2e")
-               (:file "runner"))
+               (:file "verification-tests") (:file "pss-parameters-tests")
+               (:file "quic-boundary-tests") (:file "rfc8448-tests")
+               (:file "rfc8448-server-tests") (:file "openssl-e2e")
+               (:file "pss-signature-tests") (:file "openssl-chain-tests")
+               (:file "server-openssl-e2e") (:file "runner"))
   :perform (asdf:test-op (op c)
              (declare (ignore op c))
              (uiop:symbol-call "CL-TLS-KIT/TEST" "RUN-TESTS")))

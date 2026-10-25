@@ -97,4 +97,221 @@
                           nil)
                  (cl-tls-kit::tls13-bad-signature () t))
                "real cl-crypto-kit provider rejects a tampered ECDSA signature")))
-    t))
+    (let* ((pss-parameters
+             (cl-tls-kit.x509::make-der
+              :tag #x30
+              :content #( #xa0 #x0d #x30 #x0b #x06 #x09 #x60 #x86 #x48 #x01 #x65
+                          #x03 #x04 #x02 #x02
+                          #xa1 #x1a #x30 #x18 #x06 #x09 #x2a #x86 #x48 #x86 #xf7
+                          #x0d #x01 #x01 #x08
+                          #x30 #x0b #x06 #x09 #x60 #x86 #x48 #x01 #x65 #x03 #x04
+                          #x02 #x02
+                          #xa2 #x03 #x02 #x01 #x30
+                          #xa3 #x03 #x02 #x01 #x01)
+              :raw nil))
+           (parsed (cl-tls-kit.x509::%pss-parameters pss-parameters)))
+      (check (equal parsed
+                    '(:hash :sha384 :mgf-hash :sha384 :salt-length 48
+                      :trailer-field 1))
+             "X.509 parses matching RSA-PSS hash and MGF parameters"))
+    (let* ((algorithm "1.2.840.113549.1.1.10")
+           (parameters '(:hash :sha384 :mgf-hash :sha384
+                         :salt-length 48 :trailer-field 1))
+           (certificate
+             (cl-tls-kit.x509::make-x509-certificate
+              :signature-algorithm algorithm
+              :signature-parameters parameters
+              :tbs-signature-algorithm algorithm
+              :tbs-signature-parameters parameters)))
+      (check (eq (cl-tls-kit::%signature-scheme certificate)
+                 :rsa-pss-rsae-sha384)
+             "RSA-PSS certificate verification selects the parsed digest scheme")
+      (check (cl-tls-kit::%same-signature-algorithm-p certificate)
+             "matching outer and TBSCertificate RSA-PSS parameters are accepted")
+      (setf (cl-tls-kit.x509::x509-certificate-tbs-signature-parameters certificate)
+            '(:hash :sha256 :mgf-hash :sha256 :salt-length 32 :trailer-field 1))
+      (check (not (cl-tls-kit::%same-signature-algorithm-p certificate))
+             "different outer and TBSCertificate RSA-PSS parameters are rejected"))
+    (check (handler-case
+               (progn
+                 (cl-tls-kit::%signature-scheme
+                  '(:signature-algorithm "1.2.840.113549.1.1.10"
+                    :signature-parameters
+                    (:hash :sha256 :mgf-hash :sha256 :salt-length 20
+                     :trailer-field 1)))
+                 nil)
+             (bad-signature () t))
+           "RSA-PSS rejects a salt length that differs from the digest length")
+    (check (cl-tls-kit::%constraint-match-p
+            (list :ip #(192 0 2 0 255 255 255 0))
+            (list :ip #(192 0 2 17)))
+           "IP name constraints accept an address followed by its mask")
+    (check (not (cl-tls-kit::%constraint-match-p
+                 (list :ip #(192 0 2 0))
+                 (list :ip #(192 0 2 17))))
+           "IP name constraints reject a mask with no address half")
+    (flet ((certificate (subject issuer &key ca path-length self-signed)
+               (append
+                (list :subject subject :issuer issuer
+                      :signature-algorithm :rsa-pkcs1-sha256
+                      :tbs-certificate #() :signature #())
+                (when ca
+                  (list :basic-constraints
+                        (append (list :ca t)
+                                (when path-length
+                                  (list :path-length path-length)))))
+                (when self-signed (list :self-signed t))))
+             (verify-chain (chain root)
+               (cl-tls-kit::%verify-ordered-certificate-chain
+                chain :trust-anchors (list root)
+                :verify-signature
+                (lambda (&rest arguments)
+                  (declare (ignore arguments))
+                  t))))
+        (let* ((leaf (certificate '((("2.5.4.3" . "leaf"))) '((("2.5.4.3" . "root")))))
+               (self-issued (certificate '((("2.5.4.3" . "root"))) '((("2.5.4.3" . "root"))) :ca t))
+               (self-issued-root (certificate '((("2.5.4.3" . "root"))) '((("2.5.4.3" . "root"))) :ca t :path-length 0 :self-signed t))
+               (normal-leaf (certificate '((("2.5.4.3" . "leaf"))) '((("2.5.4.3" . "intermediate")))))
+               (normal-intermediate (certificate '((("2.5.4.3" . "intermediate"))) '((("2.5.4.3" . "root"))) :ca t))
+               (normal-root (certificate '((("2.5.4.3" . "root"))) '((("2.5.4.3" . "root"))) :ca t :path-length 0 :self-signed t)))
+          (check (verify-chain (list leaf self-issued self-issued-root)
+                               self-issued-root)
+                 "pathLen zero excludes a self-issued subordinate CA")
+          (progn
+            (check (handler-case
+                       (progn
+                         (verify-chain (list normal-leaf normal-intermediate normal-root)
+                                       normal-root)
+                         nil)
+                     (path-length-exceeded () t))
+                   "pathLen zero rejects a non-self-issued subordinate CA")
+            (let* ((single-rdn-name '((("2.5.4.3" . "untrusted,2.5.4.3=root"))))
+                   (two-rdn-name '((("2.5.4.3" . "untrusted"))
+                                   (("2.5.4.3" . "root"))))
+                   (leaf (certificate '((("2.5.4.3" . "leaf"))) single-rdn-name))
+                   (intermediate (certificate single-rdn-name two-rdn-name :ca t))
+                   (root (certificate two-rdn-name two-rdn-name :ca t
+                                      :path-length 0 :self-signed t)))
+              (check (string= (cl-tls-kit.x509:x509-name-string single-rdn-name)
+                              (cl-tls-kit.x509:x509-name-string two-rdn-name))
+                     "distinct DN structures can collide in display formatting")
+              (progn
+                (check (and (not (cl-tls-kit.x509:x509-name-equal-p single-rdn-name two-rdn-name)) (not (cl-tls-kit.x509:x509-name-equal-p "root" "root"))) "DN equality rejects bare strings and distinguishes RDN structure")
+                (check (cl-tls-kit.x509:x509-name-equal-p
+                        '((("2.5.4.3" . " Example   CA ")
+                           ("2.5.4.10" . " ACME ")))
+                        '((("2.5.4.10" . "acme")
+                           ("2.5.4.3" . "example ca"))))
+                       "DN equality treats AVAs as an unordered set"))
+              (progn
+  (check (handler-case
+             (progn
+               (verify-chain (list leaf intermediate root) root)
+               nil)
+           (path-length-exceeded () t))
+         "pathLen zero rejects a non-self-issued CA with a colliding DN display")
+  (labels ((join-octets (&rest pieces)
+             (apply #'concatenate '(vector (unsigned-byte 8)) pieces))
+           (tlv (tag content)
+             (join-octets (vector tag (length content)) content))
+           (name-der (rdns)
+             (nth-value
+              0
+              (cl-tls-kit.x509::%read-der
+               (tlv #x30
+                    (apply #'join-octets
+                           (mapcar (lambda (rdn)
+                                     (tlv #x31
+                                          (apply #'join-octets
+                                                 (mapcar
+                                                  (lambda (value)
+                                                    (tlv #x30
+                                                         (join-octets
+                                                          #(#x06 #x03 #x55 #x04 #x03)
+                                                          (tlv #x13
+                                                               (map '(vector (unsigned-byte 8))
+                                                                    #'char-code value)))))
+                                                  rdn))))
+                                   rdns))))))
+           (make-x509-certificate (subject issuer &key ca path-length)
+             (cl-tls-kit.x509::make-x509-certificate
+              :issuer (cl-tls-kit.x509::%name issuer)
+              :subject (cl-tls-kit.x509::%name subject)
+              :issuer-name-der issuer
+              :subject-name-der subject
+              :not-before 0
+              :not-after most-positive-fixnum
+              :signature-algorithm :rsa-pkcs1-sha256
+              :tbs-signature-algorithm :rsa-pkcs1-sha256
+              :tbs-certificate #(1)
+              :signature #(2)
+              :basic-constraints
+              (when ca
+                (append (list :ca t)
+                        (when path-length (list :path-length path-length))))))) (let* ((single-name (name-der '(("untrusted,2.5.4.3=root"))))
+           (two-name (name-der '(("untrusted") ("root"))))
+           (leaf-name (name-der '(("leaf"))))
+           (utf8-name
+             (nth-value
+              0
+              (cl-tls-kit.x509::%read-der
+               #(#x30 #x0d #x31 #x0b #x30 #x09 #x06 #x03 #x55 #x04 #x03
+                 #x0c #x02 #xc3 #xa9))))
+           (leaf (make-x509-certificate leaf-name single-name))
+           (intermediate (make-x509-certificate single-name two-name :ca t))
+           (root (make-x509-certificate two-name two-name :ca t :path-length 0)))
+      (check (not (cl-tls-kit.x509:x509-name-equal-p single-name two-name))
+             "DER DN comparison preserves RDN structure")
+      (progn
+  (check (cl-tls-kit.x509:x509-name-equal-p
+          utf8-name
+          (nth-value
+           0
+           (cl-tls-kit.x509::%read-der
+            #(#x30 #x0d #x31 #x0b #x30 #x09 #x06 #x03 #x55 #x04 #x03
+              #x0c #x02 #xc3 #xa9))))
+         "identical non-ASCII DirectoryString DER values match")
+  (labels ((typed-name (tag octets)
+             (nth-value
+              0
+              (cl-tls-kit.x509::%read-der
+               (tlv #x30
+                    (tlv #x31
+                         (tlv #x30
+                              (join-octets #(#x06 #x03 #x55 #x04 #x03)
+                                           (tlv tag octets)))))))))
+    (check (cl-tls-kit.x509:x509-name-equal-p
+            (typed-name #x0c #(#xc3 #xa9))
+            (typed-name #x0c #(#x65 #xcc #x81)))
+           "DirectoryString comparison composes canonically equivalent Unicode")
+    (check (cl-tls-kit.x509:x509-name-equal-p
+            (typed-name #x0c #(#xc3 #x89))
+            (typed-name #x0c #(#xc3 #xa9)))
+           "DirectoryString comparison uses Unicode case folding")
+    (check (cl-tls-kit.x509:x509-name-equal-p
+            (typed-name #x0c #(#xef #xbc #xa1 #xef #xbc #xa2 #xef #xbc #xa3))
+            (typed-name #x13 #(#x61 #x62 #x63)))
+           "DirectoryString comparison applies compatibility normalization")
+    (check (cl-tls-kit.x509:x509-name-equal-p
+            (typed-name #x0c #(#x41 #xc2 #xa0 #x42))
+            (typed-name #x13 #(#x41 #x20 #x42)))
+           "DirectoryString comparison maps non-ASCII spaces")
+    (check (not (cl-tls-kit.x509:x509-name-equal-p
+                 (typed-name #x0c #(#xcd #xb8))
+                 (typed-name #x0c #(#xcd #xb8))))
+           "DirectoryString comparison rejects Unicode 3.2 unassigned values")
+    (check (not (cl-tls-kit.x509:x509-name-equal-p
+                 (typed-name #x0c #(#xef #xbf #xbd))
+                 (typed-name #x0c #(#xef #xbf #xbd))))
+           "DirectoryString comparison rejects prohibited replacement characters")
+    (check (not (cl-tls-kit.x509:x509-name-equal-p
+                 (typed-name #x0c #(#xc0 #xaf))
+                 (typed-name #x0c #(#xc0 #xaf))))
+           "DirectoryString comparison rejects malformed UTF-8")))
+      (check (handler-case
+                 (progn
+                   (verify-chain (list leaf intermediate root) root)
+                   nil)
+               (path-length-exceeded () t))
+             "pathLen zero rejects a DER CA hidden by a colliding DN display"))))))))
+      t))

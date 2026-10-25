@@ -138,7 +138,7 @@
                (self-signed-certificate () t)
                (condition () nil))
              "self-signed condition"))
-    (let ((anchor (list :subject "anchor" :not-before 0
+    (let ((anchor (list :subject '((("2.5.4.3" . "anchor"))) :not-before 0
                         :not-after (1+ (get-universal-time))
                         :self-signed t
                         :basic-constraints '(:ca nil)
@@ -147,14 +147,14 @@
               (list anchor) :trust-anchors (list anchor))
              "explicit trust anchors are accepted without revalidating CA constraints"))
     (let ((now (get-universal-time)))
-      (let* ((leaf (list :issuer "intermediate" :subject "leaf"
+      (let* ((leaf (list :issuer '((("2.5.4.3" . "intermediate"))) :subject '((("2.5.4.3" . "leaf")))
                        :not-before 0 :not-after (1+ now)
                        :signature-algorithm :rsa-pkcs1-sha256))
-           (intermediate (list :issuer "root" :subject "intermediate"
+           (intermediate (list :issuer '((("2.5.4.3" . "root"))) :subject '((("2.5.4.3" . "intermediate")))
                                :not-before 0 :not-after (1+ now)
                                :signature-algorithm :rsa-pkcs1-sha256
                                :basic-constraints '(:ca t)))
-           (root (list :subject "root" :not-before 0 :not-after (1+ now)
+           (root (list :subject '((("2.5.4.3" . "root"))) :not-before 0 :not-after (1+ now)
                        :self-signed t
                        :basic-constraints '(:ca t :path-length 0)))
              (chain (list leaf intermediate root)))
@@ -174,11 +174,11 @@
                 :verify-signature (lambda (&rest arguments)
                                     (declare (ignore arguments)) t))
                "pathLen permits the configured subordinate CA depth")))
-    (let* ((leaf (list :issuer "root" :subject "leaf"
+    (let* ((leaf (list :issuer '((("2.5.4.3" . "root"))) :subject '((("2.5.4.3" . "leaf")))
                        :not-before 0 :not-after (1+ (get-universal-time))
                        :signature-algorithm :rsa-pkcs1-sha256
                        :subject-alternative-names '((:dns "outside.example"))))
-           (root (list :subject "root" :self-signed t
+           (root (list :subject '((("2.5.4.3" . "root"))) :self-signed t
                        :not-before 0 :not-after (1+ (get-universal-time))
                        :basic-constraints '(:ca t)
                        :name-constraints
@@ -201,10 +201,10 @@
               :verify-signature (lambda (&rest arguments)
                                   (declare (ignore arguments)) t))
              "ancestor name constraints permit a valid leaf"))
-    (let* ((leaf (list :issuer "root" :subject "leaf"
+    (let* ((leaf (list :issuer '((("2.5.4.3" . "root"))) :subject '((("2.5.4.3" . "leaf")))
                        :not-before 0 :not-after (1+ (get-universal-time))
                        :subject-alternative-names '((:uri "https://outside.example"))))
-           (root (list :subject "root" :self-signed t
+           (root (list :subject '((("2.5.4.3" . "root"))) :self-signed t
                        :not-before 0 :not-after (1+ (get-universal-time))
                        :basic-constraints '(:ca t)
                        :name-constraints '(:critical t
@@ -242,12 +242,12 @@
              "Name Constraints reject empty, duplicate, and malformed IP subtrees"))
     (let* ((now (get-universal-time))
            (leaf (cl-tls-kit.x509::make-x509-certificate
-                  :issuer "root" :subject "leaf"
+                  :issuer '((("2.5.4.3" . "root"))) :subject '((("2.5.4.3" . "leaf")))
                   :not-before 0 :not-after (1+ now)
                   :signature-algorithm :rsa-pkcs1-sha256
                   :tbs-signature-algorithm :ecdsa-p256-sha256
                   :tbs-certificate #(1) :signature #(2)))
-           (root (list :subject "root" :self-signed t
+           (root (list :subject '((("2.5.4.3" . "root"))) :self-signed t
                        :not-before 0 :not-after (1+ now)
                        :basic-constraints '(:ca t))))
       (check (handler-case
@@ -259,12 +259,12 @@
                    nil)
                (bad-signature () t))
              "TBSCertificate signature algorithm must match outer algorithm"))
-    (let* ((leaf (list :issuer "root" :subject "leaf"
+    (let* ((leaf (list :issuer '((("2.5.4.3" . "root"))) :subject '((("2.5.4.3" . "leaf")))
                        :not-before 0 :not-after (1+ (get-universal-time))
                        :signature-algorithm :rsa-pkcs1-sha256
                        :key-usage '(:key-encipherment)
                        :subject-alternative-names '((:dns "example.test"))))
-           (root (list :subject "root" :self-signed t
+           (root (list :subject '((("2.5.4.3" . "root"))) :self-signed t
                        :not-before 0 :not-after (1+ (get-universal-time))
                        :basic-constraints '(:ca t)))
            (chain (list leaf root)))
@@ -278,10 +278,10 @@
                (invalid-key-usage () t)
                (condition () nil))
              "leaf key usage requires digitalSignature for TLS server authentication"))
-    (let* ((leaf (list :issuer "root" :subject "leaf"
+    (let* ((leaf (list :issuer '((("2.5.4.3" . "root"))) :subject '((("2.5.4.3" . "leaf")))
                        :not-before 0 :not-after (1+ (get-universal-time))
                        :signature-algorithm :rsa-pkcs1-sha256))
-           (root (list :subject "root" :self-signed t
+           (root (list :subject '((("2.5.4.3" . "root"))) :self-signed t
                        :not-before 0 :not-after (1+ (get-universal-time))
                        :basic-constraints '(:ca t))))
       (check (handler-case

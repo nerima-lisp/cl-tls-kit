@@ -204,29 +204,85 @@ store and does not put it back."
   (defvar *driver-transport-failure* nil)
   (defun %driver-fail (reason)
     (error 'tls13-client-driver-error :reason reason))
-  (defun %driver-close-transport (driver &optional sensitive-error-p)
-    (let ((ticket (tls13-client-driver-offered-ticket driver))
-          (state (tls13-client-driver-state driver)))
-      (when (or (not sensitive-error-p)
-                (and ticket
-                     (some #'plusp (%tls13-session-ticket-psk ticket)))
-                (member state '(:awaiting-server-hello
-                                :awaiting-encrypted-extensions
-                                :awaiting-certificate
-                                :awaiting-certificate-verify
-                                :awaiting-finished)))
-        (%driver-clear-offered-ticket-secret driver)
-        (unless (eq state :closed)
-          (setf (tls13-client-driver-state driver) :closed)
-          (when (tls13-client-driver-resumption-master-secret driver)
-            (fill (tls13-client-driver-resumption-master-secret driver) 0)
-            (setf (tls13-client-driver-resumption-master-secret driver) nil))
-          (when (tls13-client-driver-transport-close driver)
+  (defun %driver-close-transport (driver)
+    (labels ((zero-octets (bytes)
+                          (when (typep bytes '(vector (unsigned-byte 8)))
+                            (fill bytes 0)))
+             (clear-traffic-state (state)
+  (when state
+    (dolist (bytes (list (tls13-traffic-state-secret state)
+                         (tls13-traffic-state-key state)
+                         (tls13-traffic-state-iv state)))
+      (zero-octets bytes))
+    (setf (tls13-traffic-state-provider state) nil
+          (tls13-traffic-state-hash state) nil
+          (tls13-traffic-state-algorithm state) nil
+          (tls13-traffic-state-secret state) nil
+          (tls13-traffic-state-key state) nil
+          (tls13-traffic-state-iv state) nil)))
+             (release-secrets ()
+                              (dolist (bytes (list (tls13-client-driver-early-secret driver)
+                                                   (tls13-client-driver-handshake-secret driver)
+                                                   (tls13-client-driver-master-secret driver)
+                                                   (tls13-client-driver-handshake-traffic-secret driver)
+                                                   (tls13-client-driver-resumption-master-secret driver)
+                                                   (tls13-client-driver-client-finished-key driver)
+                                                   (tls13-client-driver-server-finished-key driver)
+                                                   (tls13-client-driver-private-key driver)
+                                                   (tls13-client-driver-transcript driver)
+                                                   (tls13-client-driver-pending-handshake driver)))
+                                (zero-octets bytes))
+                              (when (tls13-client-driver-offered-ticket driver)
+                                (zero-octets
+                                 (%tls13-session-ticket-psk
+                                  (tls13-client-driver-offered-ticket driver))))
+                              (dolist (state
+                                       (list (tls13-client-driver-handshake-read-state driver)
+                                             (tls13-client-driver-handshake-write-state driver)
+                                             (tls13-client-driver-application-read-state driver)
+                                             (tls13-client-driver-application-write-state driver)))
+                                (clear-traffic-state state))
+                              (setf (tls13-client-driver-provider driver) nil
+                                    (tls13-client-driver-key-exchange driver) nil
+                                    (tls13-client-driver-on-send driver) nil
+                                    (tls13-client-driver-verify-certificate-verify driver) nil
+                                    (tls13-client-driver-verify-signature driver) nil
+                                    (tls13-client-driver-transport-read driver) nil
+                                    (tls13-client-driver-transport-write driver) nil
+                                    (tls13-client-driver-transport-close driver) nil
+                                    (tls13-client-driver-client-hello driver) nil
+                                    (tls13-client-driver-private-key driver) nil
+                                    (tls13-client-driver-offered-ticket driver) nil
+                                    (tls13-client-driver-early-secret driver) nil
+                                    (tls13-client-driver-handshake-secret driver) nil
+                                    (tls13-client-driver-master-secret driver) nil
+                                    (tls13-client-driver-handshake-traffic-secret driver) nil
+                                    (tls13-client-driver-resumption-master-secret driver) nil
+                                    (tls13-client-driver-client-finished-key driver) nil
+                                    (tls13-client-driver-server-finished-key driver) nil
+                                    (tls13-client-driver-handshake-read-state driver) nil
+                                    (tls13-client-driver-handshake-write-state driver) nil
+                                    (tls13-client-driver-application-read-state driver) nil
+                                    (tls13-client-driver-application-write-state driver) nil
+                                    (tls13-client-driver-compatibility-ccs-flight driver) nil
+                                    (tls13-client-driver-transcript driver)
+                                    (make-array 0 :element-type '(unsigned-byte 8))
+                                    (tls13-client-driver-pending-handshake driver)
+                                    (make-array 0 :element-type '(unsigned-byte 8)))))
+      (let ((already-closed-p
+             (eq (tls13-client-driver-state driver) :closed))
+            (close-callback (tls13-client-driver-transport-close driver))
+            (close-failure nil))
+        (unless already-closed-p
+          (setf (tls13-client-driver-state driver) :closed))
+        (release-secrets)
+        (unless already-closed-p
+          (when close-callback
             (handler-case
-                (progn
-                  (funcall (tls13-client-driver-transport-close driver) driver)
-                  nil)
-              (error (condition) condition))))))))
+                (funcall close-callback driver)
+              (error (condition)
+                     (setf close-failure condition)))))
+        close-failure))))
 
 (defun %driver-add-transcript (driver wire)
   (setf (tls13-client-driver-transcript driver)
@@ -276,9 +332,9 @@ store and does not put it back."
          (peer-alert (eq reason-key :peer-alert))
          (no-alert-failure
           (or
-            (typep condition (quote tls-sequence-overflow))
-            (eq (type-of condition) (quote tls-record-error))
-            (member reason-key (quote (:eof :close-notify-during-handshake)))))
+           (typep condition (quote tls-sequence-overflow))
+           (eq (type-of condition) (quote tls-record-error))
+           (member reason-key (quote (:eof :close-notify-during-handshake)))))
          (description
           (typecase condition
             (tls13-client-driver-error
@@ -287,10 +343,10 @@ store and does not put it back."
                (:missing-server-key-share 109)
                (:unsupported-extension 110)
                ((:unrequested-key-share-group :hrr-unsupported-group
-  :hrr-repeated-group
-  :hrr-cipher-suite-mismatch :unoffered-cipher-suite :downgrade-sentinel
-  :invalid-key-share :unexpected-psk-identity :invalid-psk-identity
-  :psk-hash-mismatch :resumed-alpn-mismatch) 47)
+                                              :hrr-repeated-group
+                                              :hrr-cipher-suite-mismatch :unoffered-cipher-suite :downgrade-sentinel
+                                              :invalid-key-share :unexpected-psk-identity :invalid-psk-identity
+                                              :psk-hash-mismatch :resumed-alpn-mismatch) 47)
                (:unexpected-alpn 120)
                ((:invalid-server-certificate :missing-server-certificate
                                              :certificate-verification-failed) 42)
@@ -729,13 +785,22 @@ for unoffered groups, a retry of the initial group, and a second HelloRetryReque
 (defun %driver-install-handshake-secret (driver server-share)
   (let ((shared (getf (tls13-client-driver-key-exchange driver) :shared-secret)))
     (unless shared (%driver-fail :missing-key-exchange-function))
-    (let* ((dhe (funcall shared (tls13-client-driver-selected-group driver)
-                         (tls13-client-driver-private-key driver) (cdr server-share)))
-           (secret (tls13-handshake-secret
+    (let ((dhe nil))
+      (unwind-protect
+           (progn
+             (setf dhe
+                   (funcall shared
+                            (tls13-client-driver-selected-group driver)
+                            (tls13-client-driver-private-key driver)
+                            (cdr server-share)))
+             (setf (tls13-client-driver-handshake-secret driver)
+                   (tls13-handshake-secret
                     (tls13-client-driver-provider driver)
                     (tls13-client-driver-hash driver)
-                    (tls13-client-driver-early-secret driver) dhe)))
-      (setf (tls13-client-driver-handshake-secret driver) secret))))
+                    (tls13-client-driver-early-secret driver)
+                    dhe)))
+        (when (typep dhe '(vector (unsigned-byte 8)))
+          (fill dhe 0))))))
 
 (defun %driver-certificate-chain (message)
   (let ((entries (tls13-certificate-entries message)))
@@ -786,7 +851,26 @@ for unoffered groups, a retry of the initial group, and a second HelloRetryReque
   "Consume one complete TLS handshake message and advance DRIVER.
 Returns DRIVER; outgoing messages are delivered to ON-SEND."
   (let* ((bytes (coerce wire '(vector (unsigned-byte 8))))
-         (message (decode-handshake bytes))
+         (message
+          (progn
+            (when (and (>= (length bytes) 4)
+                       (= (+ (ash (aref bytes 1) 16)
+                             (ash (aref bytes 2) 8)
+                             (aref bytes 3))
+                          (- (length bytes) 4)))
+              (unless
+                  (member
+                   (aref bytes 0)
+                   (case (tls13-client-driver-state driver)
+                     (:awaiting-server-hello '(2))
+                     (:awaiting-encrypted-extensions '(8))
+                     (:awaiting-certificate '(11))
+                     (:awaiting-certificate-verify '(15))
+                     (:awaiting-finished '(20))
+                     (:connected '(4 24))
+                     (otherwise nil)))
+                (%driver-fail :unexpected-message)))
+            (decode-handshake bytes)))
          (type (aref bytes 0))
          (prior-transcript (tls13-client-driver-transcript driver)))
     (when (and (eq (tls13-client-driver-state driver) :connected)
@@ -867,11 +951,6 @@ Returns DRIVER; outgoing messages are delivered to ON-SEND."
       (setf (tls13-client-driver-last-sent-key-share-group driver) group
             (tls13-client-driver-hello-retry-request-received driver) t)
       (return-from %driver-client-step driver))))
-    (unless (member (tls13-client-driver-state driver)
-                    '(:awaiting-server-hello :awaiting-encrypted-extensions
-                                             :awaiting-certificate :awaiting-certificate-verify
-                                             :awaiting-finished))
-      (%driver-fail :unexpected-message))
     (%driver-add-transcript driver bytes)
     (typecase message
       (tls13-server-hello
@@ -1214,7 +1293,7 @@ Returns DRIVER; outgoing messages are delivered to ON-SEND."
         (%driver-handle-fatal-condition driver condition)
         (error condition))
       (error (condition)
-        (%driver-close-transport driver t)
+        (%driver-close-transport driver)
         (error condition)))))
 (defun tls13-client-driver-read-record (driver)
   (let ((*driver-transport-failure* nil))
@@ -1233,7 +1312,7 @@ Returns DRIVER; outgoing messages are delivered to ON-SEND."
         (%driver-handle-fatal-condition driver condition)
         (error condition))
       (error (condition)
-        (%driver-close-transport driver t)
+        (%driver-close-transport driver)
         (error condition)))))
 
 (defun tls13-client-driver-read-application-data (driver)
@@ -1268,7 +1347,7 @@ A transport reader must retain partial record bytes when returning :WOULD-BLOCK.
         (%driver-handle-fatal-condition driver condition)
         (error condition))
       (error (condition)
-        (%driver-close-transport driver t)
+        (%driver-close-transport driver)
         (error condition)))))
 
 (export '(tls13-client-driver tls13-client-driver-p
@@ -1280,3 +1359,8 @@ A transport reader must retain partial record bytes when returning :WOULD-BLOCK.
   tls13-client-driver-negotiated-alpn tls13-client-driver-error
   tls13-client-driver-error-reason make-tls13-ticket-store
   tls13-ticket-store tls13-ticket-store-p tls13-client-driver-resumed-p))
+(progn
+  (defun tls13-client-driver-closed-p (driver)
+    (eq (tls13-client-driver-state driver) :closed))
+  (defun tls13-client-driver-close-notify-received-p (driver)
+    (tls13-client-driver-close-notify-received driver)))

@@ -9,7 +9,7 @@
 
 (defstruct (tls13-server-ticket-key-store
             (:constructor %make-tls13-server-ticket-key-store))
-  current previous random ticket-lifetime lock)
+  current previous random ticket-lifetime lock destroyed-p)
 
 (defmethod print-object ((store tls13-server-ticket-key-store) stream)
   (print-unreadable-object (store stream :type t)
@@ -247,13 +247,19 @@
 
 (defun %tls13-server-new-ticket-key (store)
   (let ((existing
-          (mapcar #'%tls13-server-ticket-key-id (remove nil (cons (tls13-server-ticket-key-store-current store) (tls13-server-ticket-key-store-previous store))))))
+          (mapcar #'%tls13-server-ticket-key-id
+                  (remove nil
+                          (cons (tls13-server-ticket-key-store-current store)
+                                (tls13-server-ticket-key-store-previous store))))))
     (loop repeat 8
           for material = (%tls13-server-store-random store 36)
-          for id = (subseq material 0 4)
-          unless (member id existing :test #'equalp)
-            return (%make-tls13-server-ticket-key
-                    :id id :secret (subseq material 4) :decrypt-until nil)
+          do (unwind-protect
+                 (let ((id (subseq material 0 4)))
+                   (unless (member id existing :test #'equalp)
+                     (return-from %tls13-server-new-ticket-key
+                       (%make-tls13-server-ticket-key
+                        :id id :secret (subseq material 4) :decrypt-until nil))))
+               (%tls13-server-zero-octets material))
           finally (%tls13-server-fail :ticket-key-id-collision 80))))
 
 (defun make-tls13-server-ticket-key-store
@@ -276,36 +282,80 @@ random octets. TICKET-LIFETIME is the maximum ticket lifetime in seconds."
     store))
 
 (defun %tls13-server-store-expire-previous (store now)
-  (setf (tls13-server-ticket-key-store-previous store)
-        (remove-if (lambda (key)
-                     (and (%tls13-server-ticket-key-decrypt-until key)
-                          (> now (%tls13-server-ticket-key-decrypt-until key))))
-                   (tls13-server-ticket-key-store-previous store))))
+  (let ((retained nil))
+    (dolist (key (tls13-server-ticket-key-store-previous store))
+      (if (and (%tls13-server-ticket-key-decrypt-until key)
+               (> now (%tls13-server-ticket-key-decrypt-until key)))
+          (progn
+            (%tls13-server-zero-octets (%tls13-server-ticket-key-id key))
+            (%tls13-server-zero-octets (%tls13-server-ticket-key-secret key)))
+          (push key retained)))
+    (setf (tls13-server-ticket-key-store-previous store)
+          (nreverse retained))))
+
+(defun %tls13-server-ensure-ticket-key-store-live (store)
+  (when (tls13-server-ticket-key-store-destroyed-p store)
+    (%tls13-server-fail :ticket-key-store-destroyed 80))
+  store)
+
+(defun %tls13-server-validate-ticket-key-store (store)
+  (unless (typep store (quote tls13-server-ticket-key-store))
+    (%tls13-server-fail :invalid-server-driver-configuration 80))
+  (%tls13-server-with-lock
+   (tls13-server-ticket-key-store-lock store)
+   (lambda ()
+     (%tls13-server-ensure-ticket-key-store-live store)))
+  store)
+
+(defun destroy-tls13-server-ticket-key-store (store)
+  "Destroy STORE, wipe its key bytes, and release its random source.
+STORE is permanently unusable after this idempotent operation. Callers must
+stop concurrent users before destroying a shared store."
+  (unless (typep store (quote tls13-server-ticket-key-store))
+    (%tls13-server-fail :invalid-ticket-key-store 80))
+  (%tls13-server-with-lock
+   (tls13-server-ticket-key-store-lock store)
+   (lambda ()
+     (unless (tls13-server-ticket-key-store-destroyed-p store)
+       (dolist (key
+                (remove nil
+                        (cons (tls13-server-ticket-key-store-current store)
+                              (tls13-server-ticket-key-store-previous store))))
+         (%tls13-server-zero-octets (%tls13-server-ticket-key-id key))
+         (%tls13-server-zero-octets (%tls13-server-ticket-key-secret key)))
+       (setf (tls13-server-ticket-key-store-current store) nil
+             (tls13-server-ticket-key-store-previous store) nil
+             (tls13-server-ticket-key-store-random store) nil
+             (tls13-server-ticket-key-store-destroyed-p store) t))))
+  store)
 
 (defun rotate-tls13-server-ticket-key-store
-    (store &key (clock #'get-universal-time))
-  "Rotate STORE's encryption key and retain old decrypt keys for ticket lifetime."
-  (unless (and (typep store 'tls13-server-ticket-key-store)
+    (store &key (clock (function get-universal-time)))
+  "Rotate STORE encryption key and retain old decrypt keys for ticket lifetime.
+CLOCK and the store RANDOM callback run under STORE's lock and must not re-enter STORE."
+  (unless (and (typep store (quote tls13-server-ticket-key-store))
                (functionp clock))
     (%tls13-server-fail :invalid-ticket-key-store 80))
   (%tls13-server-with-lock
    (tls13-server-ticket-key-store-lock store)
    (lambda ()
+     (%tls13-server-ensure-ticket-key-store-live store)
      (let* ((now (- (funcall clock) +tls13-server-unix-time-offset+))
             (old (tls13-server-ticket-key-store-current store)))
        (%tls13-server-store-expire-previous store now)
-       (setf (%tls13-server-ticket-key-decrypt-until old)
-             (+ now (tls13-server-ticket-key-store-ticket-lifetime store))
-             (tls13-server-ticket-key-store-previous store)
-             (cons old (tls13-server-ticket-key-store-previous store))
-             (tls13-server-ticket-key-store-current store)
-             (%tls13-server-new-ticket-key store)))))
+       (let ((new (%tls13-server-new-ticket-key store)))
+         (setf (%tls13-server-ticket-key-decrypt-until old)
+               (+ now (tls13-server-ticket-key-store-ticket-lifetime store))
+               (tls13-server-ticket-key-store-previous store)
+               (cons old (tls13-server-ticket-key-store-previous store))
+               (tls13-server-ticket-key-store-current store) new)))))
   store)
 
 (defun %tls13-server-current-ticket-key (store)
   (%tls13-server-with-lock
    (tls13-server-ticket-key-store-lock store)
    (lambda ()
+     (%tls13-server-ensure-ticket-key-store-live store)
      (let ((key (tls13-server-ticket-key-store-current store)))
        (values (copy-seq (%tls13-server-ticket-key-id key))
                (copy-seq (%tls13-server-ticket-key-secret key)))))))
@@ -314,10 +364,12 @@ random octets. TICKET-LIFETIME is the maximum ticket lifetime in seconds."
   (%tls13-server-with-lock
    (tls13-server-ticket-key-store-lock store)
    (lambda ()
+     (%tls13-server-ensure-ticket-key-store-live store)
+     (%tls13-server-store-expire-previous store now)
      (let ((key (or (and (equalp id
-                               (%tls13-server-ticket-key-id
-                                (tls13-server-ticket-key-store-current store)))
-                         (tls13-server-ticket-key-store-current store))
+                                (%tls13-server-ticket-key-id
+                                 (tls13-server-ticket-key-store-current store)))
+                          (tls13-server-ticket-key-store-current store))
                     (find-if (lambda (candidate)
                                (and (equalp id (%tls13-server-ticket-key-id candidate))
                                     (or (null (%tls13-server-ticket-key-decrypt-until candidate))
@@ -427,8 +479,7 @@ random octets. TICKET-LIFETIME is the maximum ticket lifetime in seconds."
   (let* ((chain (%tls13-server-validate-credential certificate-chain private-key))
          (store (or ticket-key-store (make-tls13-server-ticket-key-store)))
          (exchange (%tls13-server-key-exchange-default random)))
-    (unless (typep store (quote tls13-server-ticket-key-store))
-      (%tls13-server-fail :invalid-server-driver-configuration 80))
+    (%tls13-server-validate-ticket-key-store store)
     (%make-tls13-server-driver
      :provider provider :certificate-chain chain :private-key private-key
      :alpn-protocols (%tls13-server-valid-alpn-list alpn-protocols)
@@ -929,43 +980,83 @@ random octets. TICKET-LIFETIME is the maximum ticket lifetime in seconds."
     (:awaiting-client-finished :handshake)
     (:complete :application)
     (otherwise :initial)))
+(defun %tls13-server-clear-secrets (driver)
+  (dolist (secret
+           (list (tls13-server-driver-client-handshake-secret driver)
+                 (tls13-server-driver-server-handshake-secret driver)
+                 (tls13-server-driver-client-finished-key driver)
+                 (tls13-server-driver-master-secret driver)
+                 (tls13-server-driver-resumption-master-secret driver)
+                 (tls13-server-driver-client-application-secret driver)
+                 (tls13-server-driver-server-application-secret driver)))
+    (%tls13-server-zero-octets secret))
+  (%tls13-server-zero-octets (tls13-server-driver-transcript driver))
+  (%tls13-server-zero-octets (tls13-server-driver-server-flight-prefix driver))
+  (%tls13-server-zero-octets (tls13-server-driver-private-key-share driver))
+  (setf (tls13-server-driver-provider driver) nil
+        (tls13-server-driver-ticket-key-store driver) nil
+        (tls13-server-driver-sni-callback driver) nil
+        (tls13-server-driver-clock driver) nil
+        (tls13-server-driver-random driver) nil
+        (tls13-server-driver-key-exchange driver) nil
+        (tls13-server-driver-private-key driver) nil
+        (tls13-server-driver-client-handshake-secret driver) nil
+        (tls13-server-driver-server-handshake-secret driver) nil
+        (tls13-server-driver-client-finished-key driver) nil
+        (tls13-server-driver-master-secret driver) nil
+        (tls13-server-driver-resumption-master-secret driver) nil
+        (tls13-server-driver-client-application-secret driver) nil
+        (tls13-server-driver-server-application-secret driver) nil
+        (tls13-server-driver-transcript driver)
+        (make-array 0 :element-type (quote (unsigned-byte 8)))
+        (tls13-server-driver-server-flight-prefix driver) nil
+        (tls13-server-driver-private-key-share driver) nil
+        (tls13-server-driver-initial-client-hello driver) nil
+        (tls13-server-driver-cookie driver) nil
+        (tls13-server-driver-state driver) :failed)
+  driver)
+(defun %tls13-server-failure-events (driver alert)
+  (let ((events
+         (%tls13-server-alert-events alert
+                                     (%tls13-server-alert-level driver))))
+    (%tls13-server-clear-secrets driver)
+    events))
 
 (defun %tls13-server-handshake-transcript (prefix &rest messages)
   (apply #'%tls13-server-cat prefix messages))
-(progn
-  (defun %tls13-server-finish-flight (driver transcript-before-finished)
-    (let* ((provider (tls13-server-driver-provider driver))
-           (hash (tls13-server-driver-hash driver))
-           (server-finished-key
-             (tls13-finished-key
-              provider hash (tls13-server-driver-server-handshake-secret driver))))
-       (unwind-protect
-            (let* ((server-finished-data
-                     (tls13-compute-finished-verify-data
-                      provider hash server-finished-key
-                      (%tls13-server-digest-hash driver hash transcript-before-finished)))
-                   (server-finished-wire
-                     (encode-handshake 20 (make-tls13-finished server-finished-data)))
-                   (transcript-through-finished
-                     (%tls13-server-handshake-transcript transcript-before-finished
-                                                         server-finished-wire))
-                   (application-transcript-hash
-                     (%tls13-server-digest-hash driver hash transcript-through-finished))
-                   (client-application-secret
-                     (tls13-traffic-secret
-                      provider hash (tls13-server-driver-master-secret driver) :client
-                      application-transcript-hash :phase :application))
-                   (server-application-secret
-                     (tls13-traffic-secret
-                      provider hash (tls13-server-driver-master-secret driver) :server
-                      application-transcript-hash :phase :application)))
-              (setf (tls13-server-driver-transcript driver) transcript-through-finished
-                    (tls13-server-driver-client-application-secret driver)
-                    client-application-secret
-                    (tls13-server-driver-server-application-secret driver)
-                    server-application-secret)
-              server-finished-wire)
-         (%tls13-server-zero-octets server-finished-key)))))
+(defun %tls13-server-finish-flight (driver transcript-before-finished)
+  (let* ((provider (tls13-server-driver-provider driver))
+         (hash (tls13-server-driver-hash driver))
+         (server-finished-key
+          (tls13-finished-key
+           provider hash (tls13-server-driver-server-handshake-secret driver))))
+    (unwind-protect
+        (let* ((server-finished-data
+                (tls13-compute-finished-verify-data
+                 provider hash server-finished-key
+                 (%tls13-server-digest-hash driver hash transcript-before-finished)))
+               (server-finished-wire
+                (encode-handshake 20 (make-tls13-finished server-finished-data)))
+               (transcript-through-finished
+                (%tls13-server-handshake-transcript transcript-before-finished
+                                                    server-finished-wire))
+               (application-transcript-hash
+                (%tls13-server-digest-hash driver hash transcript-through-finished))
+               (client-application-secret
+                (tls13-traffic-secret
+                 provider hash (tls13-server-driver-master-secret driver) :client
+                 application-transcript-hash :phase :application))
+               (server-application-secret
+                (tls13-traffic-secret
+                 provider hash (tls13-server-driver-master-secret driver) :server
+                 application-transcript-hash :phase :application)))
+          (setf (tls13-server-driver-transcript driver) transcript-through-finished
+                (tls13-server-driver-client-application-secret driver)
+                client-application-secret
+                (tls13-server-driver-server-application-secret driver)
+                server-application-secret)
+          server-finished-wire)
+      (%tls13-server-zero-octets server-finished-key))))
 
 (defun %tls13-server-build-flight (driver hello hello-fields hello-wire transcript-prefix
                                    suite group share alpn credential-chain credential-key
@@ -1229,37 +1320,44 @@ random octets. TICKET-LIFETIME is the maximum ticket lifetime in seconds."
       (unless (tls13-provider-constant-time-equal-p
                provider expected (tls13-finished-verify-data finished))
         (%tls13-server-fail :client-finished-mismatch 51))
-      (let* ((transcript (%tls13-server-cat (tls13-server-driver-transcript driver) wire))
-             (resumption-master
-               (tls13-resumption-secret
-                provider hash (tls13-server-driver-master-secret driver)
-                (%tls13-server-digest driver transcript))))
-        (multiple-value-bind (ticket-wire metadata)
-            (%tls13-server-issue-ticket driver resumption-master)
-          (let ((events
-                  (append
-                   (list (%tls13-server-secret-event
-                          :read :application
-                          (tls13-server-driver-client-application-secret driver))
-                         (%tls13-server-secret-event
-                          :write :application
-                          (tls13-server-driver-server-application-secret driver))
-                         (%tls13-server-send-event :application ticket-wire)
-                         metadata
-                         (list :type :handshake-complete
-                               :resumed-p
-                               (not (null (tls13-server-driver-resumed-p driver))))))))
-            (%tls13-server-zero-octets resumption-master)
-            (dolist (secret
-                     (list (tls13-server-driver-client-finished-key driver)
-                           (tls13-server-driver-master-secret driver)))
-              (%tls13-server-zero-octets secret))
-            (setf (tls13-server-driver-transcript driver) transcript
-                  (tls13-server-driver-client-finished-key driver) nil
-                  (tls13-server-driver-master-secret driver) nil
-                  (tls13-server-driver-resumption-master-secret driver) nil
-                  (tls13-server-driver-state driver) :complete)
-            events))))))
+      (let ((transcript (%tls13-server-cat (tls13-server-driver-transcript driver) wire))
+            (resumption-master nil))
+        (unwind-protect
+             (progn
+               (setf resumption-master
+                     (tls13-resumption-secret
+                      provider hash (tls13-server-driver-master-secret driver)
+                      (%tls13-server-digest driver transcript)))
+               (multiple-value-bind (ticket-wire metadata)
+                   (%tls13-server-issue-ticket driver resumption-master)
+                 (let ((events
+                         (append
+                          (list (%tls13-server-secret-event
+                                 :read :application
+                                 (tls13-server-driver-client-application-secret driver))
+                                (%tls13-server-secret-event
+                                 :write :application
+                                 (tls13-server-driver-server-application-secret driver))
+                                (%tls13-server-send-event :application ticket-wire)
+                                metadata
+                                (list :type :handshake-complete
+                                      :resumed-p
+                                      (not (null
+                                            (tls13-server-driver-resumed-p driver))))))))
+                   (dolist (secret
+                            (list (tls13-server-driver-client-finished-key driver)
+                                  (tls13-server-driver-master-secret driver)))
+                     (%tls13-server-zero-octets secret))
+                   (%tls13-server-zero-octets
+                    (tls13-server-driver-transcript driver))
+                   (setf (tls13-server-driver-transcript driver) (copy-seq transcript)
+                         (tls13-server-driver-client-finished-key driver) nil
+                         (tls13-server-driver-master-secret driver) nil
+                         (tls13-server-driver-resumption-master-secret driver) nil
+                         (tls13-server-driver-state driver) :complete)
+                   events)))
+          (%tls13-server-zero-octets resumption-master)
+          (%tls13-server-zero-octets transcript))))))
 
 (defun %tls13-server-update-traffic-secret (driver secret)
   (tls13-hkdf-expand-label
@@ -1306,8 +1404,16 @@ random octets. TICKET-LIFETIME is the maximum ticket lifetime in seconds."
 (defun tls13-server-driver-note-application-data-received (driver)
   (unless (typep driver 'tls13-server-driver)
     (%tls13-server-fail :invalid-server-driver 80))
-  (setf (tls13-server-driver-consecutive-key-updates driver) 0)
+  (unless (eq (tls13-server-driver-state driver) :failed)
+    (setf (tls13-server-driver-consecutive-key-updates driver) 0))
   driver)
+(defun tls13-server-driver-close (driver)
+  "Clear per-connection secrets after a peer alert or transport failure.
+The record and transport owner must call this when the connection ends.
+This emits no alert, and subsequent driver steps return no events."
+  (unless (typep driver 'tls13-server-driver)
+    (%tls13-server-fail :invalid-server-driver 80))
+  (%tls13-server-clear-secrets driver))
 
 (defun tls13-server-driver-step (driver wire &key level)
   "Consume one complete handshake message. Return DRIVER and output events as two values.
@@ -1322,6 +1428,8 @@ Finished. Its value is provisional and unauthenticated until
 after :HANDSHAKE-COMPLETE."
   (unless (typep driver 'tls13-server-driver)
     (%tls13-server-fail :invalid-server-driver 80))
+  (when (eq (tls13-server-driver-state driver) :failed)
+    (return-from tls13-server-driver-step (values driver nil)))
   (handler-case
       (values
        driver
@@ -1329,6 +1437,18 @@ after :HANDSHAKE-COMPLETE."
          (unless (and (vectorp wire)
                       (<= (length wire) +tls13-server-max-handshake-size+))
            (%tls13-server-fail :handshake-message-too-large 50))
+         (let ((expected-type
+                 (case (tls13-server-driver-state driver)
+                   ((:awaiting-client-hello :awaiting-second-client-hello) 1)
+                   (:awaiting-client-finished 20)
+                   (:complete 24))))
+           (when expected-type
+             (unless (and (%tls13-server-octets-p wire)
+                          (<= 4 (length wire))
+                          (= (%tls13-server-read-u24 wire 1) (- (length wire) 4)))
+               (%tls13-server-fail :malformed-handshake-message 50))
+             (unless (= (aref wire 0) expected-type)
+               (%tls13-server-fail :unexpected-handshake-message 10))))
          (cond
            ((member (tls13-server-driver-state driver)
                     '(:awaiting-client-hello :awaiting-second-client-hello))
@@ -1338,8 +1458,6 @@ after :HANDSHAKE-COMPLETE."
            ((eq (tls13-server-driver-state driver) :awaiting-client-finished)
             (unless (eq level :handshake)
               (%tls13-server-fail :unexpected-encryption-level 10))
-            (when (and (plusp (length wire)) (= (aref wire 0) 24))
-              (%tls13-server-fail :unexpected-key-update 10))
             (%tls13-server-process-finished driver wire))
            ((eq (tls13-server-driver-state driver) :complete)
             (unless (eq level :application)
@@ -1347,14 +1465,13 @@ after :HANDSHAKE-COMPLETE."
             (%tls13-server-process-key-update driver wire))
            (t (%tls13-server-fail :unexpected-handshake-message 10)))))
     (tls13-server-driver-error (condition)
-      (values driver (%tls13-server-alert-events
-                      (%tls13-server-driver-error-alert condition)
-                      (%tls13-server-alert-level driver))))
+      (values driver
+              (%tls13-server-failure-events
+               driver (%tls13-server-driver-error-alert condition))))
     (tls13-error (condition)
-      (values driver (%tls13-server-alert-events
-                      (%tls13-server-error-alert condition)
-                      (%tls13-server-alert-level driver))))
+      (values driver
+              (%tls13-server-failure-events
+               driver (%tls13-server-error-alert condition))))
     (error (condition)
       (declare (ignore condition))
-      (values driver (%tls13-server-alert-events
-                      80 (%tls13-server-alert-level driver))))))
+      (values driver (%tls13-server-failure-events driver 80)))))

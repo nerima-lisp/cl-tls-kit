@@ -151,19 +151,25 @@
            (funcall function (lambda () calls)))
       (setf (symbol-function symbol) original))))
 
-(defun %server-driver-test-assert-client-hello-rejected
-    (name driver wire expected-alert check-case)
-  (let ((before (%server-driver-test-state-snapshot driver)))
-    (multiple-value-bind (returned events)
-        (tls13-server-driver-step driver wire :level :initial)
-      (funcall check-case (eq returned driver)
-               (format nil "~A returns the same server driver" name))
-      (funcall check-case (%server-driver-test-alert-p events expected-alert)
-               (format nil "~A emits fatal alert ~D (got ~S)" name expected-alert
-                       (getf (%server-driver-test-event events :alert) :description)))
-      (funcall check-case (equalp before (%server-driver-test-state-snapshot driver))
-               (format nil "~A leaves server handshake state unchanged" name))
-      events)))
+(defun %server-driver-test-assert-client-hello-rejected (name driver wire expected-alert check-case)
+  (multiple-value-bind (returned events)
+      (tls13-server-driver-step driver wire :level :initial)
+    (funcall check-case (eq returned driver)
+             (format nil "~A returns the same server driver" name))
+    (funcall check-case (%server-driver-test-alert-p events expected-alert)
+             (format nil "~A emits fatal alert ~D (got ~S)" name expected-alert
+                     (getf (%server-driver-test-event events :alert) :description)))
+    (funcall check-case
+             (eq (getf (%server-driver-test-event events :send) :level) :initial)
+             (format nil "~A sends its fatal alert at the initial level" name))
+    (funcall check-case
+             (and (eq (cl-tls-kit::tls13-server-driver-state driver) :failed)
+                  (zerop (length (cl-tls-kit::tls13-server-driver-transcript driver)))
+                  (null (cl-tls-kit::tls13-server-driver-provider driver))
+                  (null (cl-tls-kit::tls13-server-driver-key-exchange driver))
+                  (null (cl-tls-kit::tls13-server-driver-private-key-share driver)))
+             (format nil "~A fails closed and releases handshake state" name))
+    events))
 
 (defun %server-driver-test-memory-handshake
     (provider chain key anchor ticket-key-store now &key (groups '(#x001d #x0017))
@@ -663,6 +669,219 @@
                    (apply original arguments)))
            (funcall function (lambda () calls)))
       (setf (symbol-function symbol) original))))
+(defun run-server-driver-close-tests ()
+  (let* ((driver (cl-tls-kit::%make-tls13-server-driver))
+         (secrets
+           (loop repeat 7
+                 collect (make-array 32 :element-type '(unsigned-byte 8)
+                                     :initial-element 165)))
+         (transcript (make-array 3 :element-type '(unsigned-byte 8)
+                                 :initial-contents '(1 2 3)))
+         (flight-prefix (make-array 3 :element-type '(unsigned-byte 8)
+                                    :initial-contents '(4 5 6)))
+         (private-key-share (make-array 3 :element-type '(unsigned-byte 8)
+                                        :initial-contents '(7 8 9)))
+         (assertions 0))
+    (flet ((check-case (condition description)
+             (incf assertions)
+             (unless condition
+               (error "Server driver close test failed: ~A" description))))
+      (setf (cl-tls-kit::tls13-server-driver-provider driver) :provider
+            (cl-tls-kit::tls13-server-driver-ticket-key-store driver) :ticket-key-store
+            (cl-tls-kit::tls13-server-driver-sni-callback driver) (lambda () nil)
+            (cl-tls-kit::tls13-server-driver-clock driver) (lambda () 0)
+            (cl-tls-kit::tls13-server-driver-random driver) (lambda (length) (declare (ignore length)))
+            (cl-tls-kit::tls13-server-driver-key-exchange driver) (lambda () nil)
+            (cl-tls-kit::tls13-server-driver-private-key driver) :private-key
+            (cl-tls-kit::tls13-server-driver-client-handshake-secret driver) (nth 0 secrets)
+            (cl-tls-kit::tls13-server-driver-server-handshake-secret driver) (nth 1 secrets)
+            (cl-tls-kit::tls13-server-driver-client-finished-key driver) (nth 2 secrets)
+            (cl-tls-kit::tls13-server-driver-master-secret driver) (nth 3 secrets)
+            (cl-tls-kit::tls13-server-driver-resumption-master-secret driver) (nth 4 secrets)
+            (cl-tls-kit::tls13-server-driver-client-application-secret driver) (nth 5 secrets)
+            (cl-tls-kit::tls13-server-driver-server-application-secret driver) (nth 6 secrets)
+            (cl-tls-kit::tls13-server-driver-transcript driver) transcript
+            (cl-tls-kit::tls13-server-driver-server-flight-prefix driver) flight-prefix
+            (cl-tls-kit::tls13-server-driver-private-key-share driver) private-key-share
+            (cl-tls-kit::tls13-server-driver-consecutive-key-updates driver) 4)
+      (check-case (= (length (remove-duplicates (copy-list secrets) :test #'eq)) 7)
+                  "connection secrets occupy independent arrays")
+      (check-case (eq (tls13-server-driver-close driver) driver)
+                  "server driver close returns the driver")
+      (check-case (and (eq (cl-tls-kit::tls13-server-driver-state driver) :failed)
+                       (every (lambda (secret) (every #'zerop secret)) secrets)
+                       (every #'zerop transcript)
+                       (every #'zerop flight-prefix)
+                       (every #'zerop private-key-share)
+                       (zerop (length (cl-tls-kit::tls13-server-driver-transcript driver)))
+                       (null (cl-tls-kit::tls13-server-driver-server-flight-prefix driver))
+                       (null (cl-tls-kit::tls13-server-driver-private-key-share driver)))
+                  "close zeroes retained buffers and clears driver references")
+      (check-case (every #'null
+                         (list (cl-tls-kit::tls13-server-driver-provider driver)
+                               (cl-tls-kit::tls13-server-driver-ticket-key-store driver)
+                               (cl-tls-kit::tls13-server-driver-sni-callback driver)
+                               (cl-tls-kit::tls13-server-driver-clock driver)
+                               (cl-tls-kit::tls13-server-driver-random driver)
+                               (cl-tls-kit::tls13-server-driver-key-exchange driver)
+                               (cl-tls-kit::tls13-server-driver-private-key driver)))
+                  "close releases the provider, store, callbacks, and key reference")
+      (multiple-value-bind (returned events)
+          (tls13-server-driver-step driver #(1 0 0 0) :level :initial)
+        (check-case (and (eq returned driver) (null events)
+                         (eq (cl-tls-kit::tls13-server-driver-state driver) :failed))
+                    "driver steps after close emit no send or alert"))
+      (check-case (eq (tls13-server-driver-close driver) driver)
+                  "server driver close is idempotent")
+      (setf (cl-tls-kit::tls13-server-driver-consecutive-key-updates driver) 4)
+      (check-case (and (eq (tls13-server-driver-note-application-data-received driver) driver)
+                       (= (cl-tls-kit::tls13-server-driver-consecutive-key-updates driver) 4))
+                  "application-data notifications leave a failed driver terminal"))
+    (format t "TLS 1.3 server driver close: assertions: ~D~%" assertions)
+    t))
+
+(defun %server-driver-test-ticket-key-store-lifecycle
+    (provider chain private-key now check-case)
+  (labels ((destroyed-error-p (function)
+             (handler-case
+                 (progn (funcall function) nil)
+               (tls13-server-driver-error (condition)
+                 (eq (tls13-server-driver-error-reason condition)
+                     :ticket-key-store-destroyed))))
+           (random-failure-p (function)
+             (handler-case
+                 (progn (funcall function) nil)
+               (tls13-server-driver-error (condition)
+                 (eq (tls13-server-driver-error-reason condition)
+                     :ticket-key-random-failed))))
+           (nonzero-octets-p (bytes)
+             (and (cl-tls-kit::%tls13-server-octets-p bytes)
+                  (some (function plusp) bytes))))
+    (let* ((store
+             (make-tls13-server-ticket-key-store
+              :random (%server-driver-test-random)
+              :ticket-lifetime 1))
+           (old-key (cl-tls-kit::tls13-server-ticket-key-store-current store))
+           (old-id (cl-tls-kit::%tls13-server-ticket-key-id old-key))
+           (lookup-id (copy-seq old-id))
+           (old-secret (cl-tls-kit::%tls13-server-ticket-key-secret old-key)))
+      (funcall check-case
+               (and (nonzero-octets-p old-id)
+                    (nonzero-octets-p lookup-id)
+                    (nonzero-octets-p old-secret))
+               "expiry test retains independent nonzero key ID and secret vectors")
+      (rotate-tls13-server-ticket-key-store store :clock (lambda () now))
+      (let ((decrypt-until
+              (cl-tls-kit::%tls13-server-ticket-key-decrypt-until old-key)))
+        (rotate-tls13-server-ticket-key-store
+         store
+         :clock (lambda ()
+                  (+ decrypt-until
+                     cl-tls-kit::+tls13-server-unix-time-offset+ 1)))
+        (funcall check-case
+                 (and (every (function plusp) lookup-id)
+                      (null (cl-tls-kit::%tls13-server-find-ticket-key
+                             store lookup-id (1+ decrypt-until))))
+                 "second rotation prunes the expired key and rejects its independent ID")
+        (funcall check-case
+                 (and (every (function zerop) old-id)
+                      (every (function zerop) old-secret)
+                      (not (member old-key
+                                   (cl-tls-kit::tls13-server-ticket-key-store-previous
+                                    store)
+                                   :test #'eq)))
+                 "second rotation zeroes expired key vectors before removing the key")))
+    (let* ((fail-p nil)
+           (random (%server-driver-test-random))
+           (store
+             (make-tls13-server-ticket-key-store
+              :random (lambda (length)
+                        (if fail-p
+                            (make-array 0 :element-type '(unsigned-byte 8))
+                            (funcall random length)))))
+           (current-key (cl-tls-kit::tls13-server-ticket-key-store-current store))
+           (current-id (cl-tls-kit::%tls13-server-ticket-key-id current-key))
+           (current-id-copy (copy-seq current-id))
+           (current-secret
+             (cl-tls-kit::%tls13-server-ticket-key-secret current-key))
+           (current-secret-copy (copy-seq current-secret)))
+      (setf fail-p t)
+      (funcall check-case
+               (random-failure-p
+                (lambda ()
+                  (rotate-tls13-server-ticket-key-store store
+                                                        :clock (lambda () now))))
+               "rotation rejects ticket-key random source failure")
+      (funcall check-case
+               (and (eq current-key
+                        (cl-tls-kit::tls13-server-ticket-key-store-current store))
+                    (equalp current-id current-id-copy)
+                    (equalp current-secret current-secret-copy)
+                    (not (member current-key
+                                 (cl-tls-kit::tls13-server-ticket-key-store-previous
+                                  store)
+                                 :test #'eq)))
+               "failed rotation preserves the current key without duplicating it"))
+    (let* ((store
+             (make-tls13-server-ticket-key-store
+              :random (%server-driver-test-random)))
+           (previous-key (cl-tls-kit::tls13-server-ticket-key-store-current store))
+           (previous-id (cl-tls-kit::%tls13-server-ticket-key-id previous-key))
+           (previous-secret (cl-tls-kit::%tls13-server-ticket-key-secret previous-key)))
+      (rotate-tls13-server-ticket-key-store store :clock (lambda () now))
+      (let* ((current-key
+               (cl-tls-kit::tls13-server-ticket-key-store-current store))
+             (current-id (cl-tls-kit::%tls13-server-ticket-key-id current-key))
+             (current-secret (cl-tls-kit::%tls13-server-ticket-key-secret current-key)))
+        (funcall check-case
+                 (and (nonzero-octets-p previous-id)
+                      (nonzero-octets-p previous-secret)
+                      (nonzero-octets-p current-id)
+                      (nonzero-octets-p current-secret))
+                 "destroy test retains nonzero current and previous key vectors")
+        (funcall check-case
+                 (eq store (destroy-tls13-server-ticket-key-store store))
+                 "ticket-key store destroy returns the store")
+        (funcall check-case
+                 (and (every (function zerop) previous-id)
+                      (every (function zerop) previous-secret)
+                      (every (function zerop) current-id)
+                      (every (function zerop) current-secret)
+                      (null (cl-tls-kit::tls13-server-ticket-key-store-current store))
+                      (null (cl-tls-kit::tls13-server-ticket-key-store-previous store))
+                      (null (cl-tls-kit::tls13-server-ticket-key-store-random store))
+                      (cl-tls-kit::tls13-server-ticket-key-store-destroyed-p store))
+                 "destroy wipes current and previous keys and clears store references")
+        (funcall check-case
+                 (eq store (destroy-tls13-server-ticket-key-store store))
+                 "ticket-key store destroy is idempotent")
+        (funcall check-case
+                 (destroyed-error-p
+                  (lambda ()
+                    (rotate-tls13-server-ticket-key-store
+                     store :clock (lambda () now))))
+                 "destroyed ticket-key store rejects rotation")
+        (funcall check-case
+                 (destroyed-error-p
+                  (lambda () (cl-tls-kit::%tls13-server-current-ticket-key store)))
+                 "destroyed ticket-key store rejects current-key access")
+        (funcall check-case
+                 (destroyed-error-p
+                  (lambda ()
+                    (cl-tls-kit::%tls13-server-find-ticket-key
+                     store previous-id now)))
+                 "destroyed ticket-key store rejects key lookup")
+        (funcall check-case
+                 (destroyed-error-p
+                  (lambda ()
+                    (%server-driver-test-server
+                     provider chain private-key store (lambda () now))))
+                 "server driver rejects a destroyed ticket-key store")))
+    (multiple-value-bind (symbol status)
+        (find-symbol "DESTROY-TLS13-SERVER-TICKET-KEY-STORE" :cl-tls-kit)
+      (funcall check-case
+               (and symbol (eq status :external) (fboundp symbol))
+               "ticket-key store destroy is exported"))))
 
 (defun run-server-driver-tests ()
   (unless (find-package "CRYPTO-KIT")
@@ -750,7 +969,9 @@
                            (tls13-server-driver-step server wire :level :application)
                          (check-case
                           (and (eq returned server)
-                               (%server-driver-test-alert-p events 10))
+                               (%server-driver-test-alert-p events 10)
+                               (eq (getf (%server-driver-test-event events :send) :level)
+                                   :application))
                           "zero KeyUpdate limit rejects the first update with unexpected_message")
                          (check-case
                           (and (zerop (funcall derivation-calls))
@@ -770,17 +991,6 @@
                                   1)
                                (= (funcall derivation-calls) 1))
                           "KeyUpdate exactly at the configured limit is accepted"))
-                       (incf selected)
-                       (let ((calls-before (funcall derivation-calls)))
-                         (multiple-value-bind (returned events)
-                             (tls13-server-driver-step server wire :level :application)
-                           (check-case
-                            (and (eq returned server)
-                                 (%server-driver-test-alert-p events 10))
-                            "limit plus one KeyUpdate emits fatal unexpected_message")
-                           (check-case
-                            (= (funcall derivation-calls) calls-before)
-                            "limit plus one KeyUpdate is rejected before key derivation")))
                        (tls13-server-driver-note-application-data-received server)
                        (check-case
                         (zerop (cl-tls-kit::tls13-server-driver-consecutive-key-updates
@@ -795,7 +1005,30 @@
                                (= (cl-tls-kit::tls13-server-driver-consecutive-key-updates
                                    server)
                                   1))
-                          "KeyUpdate is accepted again after application-data notification"))))))
+                          "KeyUpdate is accepted again after application-data notification"))
+                       (let ((over-limit-server (complete-server 1)))
+                         (incf selected)
+                         (multiple-value-bind (returned events)
+                             (tls13-server-driver-step over-limit-server wire :level :application)
+                           (check-case
+                            (and (eq returned over-limit-server)
+                                 (null (%server-driver-test-event events :alert))
+                                 (= (cl-tls-kit::tls13-server-driver-consecutive-key-updates
+                                     over-limit-server)
+                                    1))
+                            "first KeyUpdate reaches the configured limit"))
+                         (let ((calls-before (funcall derivation-calls)))
+                           (multiple-value-bind (returned events)
+                               (tls13-server-driver-step over-limit-server wire :level :application)
+                             (check-case
+                              (and (eq returned over-limit-server)
+                                   (%server-driver-test-alert-p events 10)
+                                   (eq (getf (%server-driver-test-event events :send) :level)
+                                       :application))
+                              "limit plus one KeyUpdate emits fatal unexpected_message")
+                             (check-case
+                              (= (funcall derivation-calls) calls-before)
+                              "limit plus one KeyUpdate is rejected before key derivation"))))))))
                 (%server-driver-test-with-key-update-derivation-counter
                  (lambda (derivation-calls)
                    (let* ((server (complete-server 0))
@@ -806,7 +1039,9 @@
                          (tls13-server-driver-step server wire :level :application)
                        (check-case
                         (and (eq returned server)
-                             (%server-driver-test-alert-p events 10))
+                             (%server-driver-test-alert-p events 10)
+                             (eq (getf (%server-driver-test-event events :send) :level)
+                                 :application))
                         "over-limit KeyUpdate request=1 emits unexpected_message")
                        (check-case
                         (notany
@@ -1015,8 +1250,106 @@
                       (encode-handshake 1
                                         (%server-driver-test-rewrite-client-hello client-hello 13 :remove))
                       109 #'check-case)
-                     (check-case (zerop (funcall signature-calls))
-                                 "doomed ClientHellos invoke no signing operation"))))
+                     (let ((finished-wire
+                             (encode-handshake
+                              20 (make-tls13-finished
+                                  (make-array 32 :element-type '(unsigned-byte 8)
+                                              :initial-element 0))))
+                           (client-hello-wire (encode-handshake 1 client-hello))
+                           (malformed-wire
+                             (make-array 3 :element-type '(unsigned-byte 8)
+                                         :initial-contents '(20 0 0))))
+                       (flet ((assert-state-failure (name server wire level alert)
+                                (let* ((state (cl-tls-kit::tls13-server-driver-state server))
+                                       (transcript
+                                         (make-array 2 :element-type '(unsigned-byte 8)
+                                                     :initial-contents '(8 9)))
+                                       (secret
+                                         (make-array 32 :element-type '(unsigned-byte 8)
+                                                     :initial-element 7)))
+                                  (setf (cl-tls-kit::tls13-server-driver-transcript server) transcript)
+                                  (case state
+                                    (:awaiting-client-hello
+                                     (setf (cl-tls-kit::tls13-server-driver-private-key-share
+                                            server)
+                                           secret))
+                                    (:awaiting-second-client-hello
+                                     (setf (cl-tls-kit::tls13-server-driver-private-key-share
+                                            server)
+                                           secret
+                                           (cl-tls-kit::tls13-server-driver-cookie server)
+                                           #(1)))
+                                    (:awaiting-client-finished
+                                     (setf (cl-tls-kit::tls13-server-driver-hash server)
+                                           :sha256
+                                           (cl-tls-kit::tls13-server-driver-client-finished-key
+                                            server)
+                                           secret))
+                                    (:complete
+                                     (setf (cl-tls-kit::tls13-server-driver-client-application-secret
+                                            server)
+                                           secret)))
+                                  (multiple-value-bind (returned events)
+                                      (tls13-server-driver-step server wire :level level)
+                                    (check-case
+                                     (and (eq returned server)
+                                          (%server-driver-test-alert-p events alert))
+                                     (format nil "~A emits fatal alert ~D" name alert))
+                                    (check-case
+                                     (eq (getf (%server-driver-test-event events :send) :level)
+                                         level)
+                                     (format nil "~A sends its alert at ~S level" name level))
+                                    (check-case
+                                     (and (eq (cl-tls-kit::tls13-server-driver-state server) :failed)
+                                          (zerop (length (cl-tls-kit::tls13-server-driver-transcript server)))
+                                          (every #'zerop transcript)
+                                          (every #'zerop secret)
+                                          (null (cl-tls-kit::tls13-server-driver-provider server))
+                                          (null
+                                           (case state
+                                             ((:awaiting-client-hello
+                                               :awaiting-second-client-hello)
+                                              (cl-tls-kit::tls13-server-driver-private-key-share
+                                               server))
+                                             (:awaiting-client-finished
+                                              (cl-tls-kit::tls13-server-driver-client-finished-key
+                                               server))
+                                             (:complete
+                                              (cl-tls-kit::tls13-server-driver-client-application-secret
+                                               server))))
+                                          (null
+                                           (cl-tls-kit::tls13-server-driver-initial-client-hello server))
+                                          (null (cl-tls-kit::tls13-server-driver-cookie server)))
+                                     (format nil "~A terminalizes the driver and clears secrets"
+                                             name)))))) (incf selected) (assert-state-failure
+                          "initial state rejects Finished" (new-server)
+                          finished-wire :initial 10) (incf selected) (let ((server (new-server)))
+                           (setf (cl-tls-kit::tls13-server-driver-state server)
+                                 :awaiting-second-client-hello)
+                           (assert-state-failure
+                            "second ClientHello state rejects Finished" server
+                            finished-wire :initial 10)) (incf selected) (progn
+                           (let ((server (new-server)))
+                             (setf (cl-tls-kit::tls13-server-driver-state server)
+                                   :awaiting-client-finished)
+                             (assert-state-failure
+                              "Finished state rejects ClientHello" server
+                              client-hello-wire :handshake 10))
+                           (incf selected)
+                           (let ((server (new-server)))
+                             (setf (cl-tls-kit::tls13-server-driver-state server)
+                                   :awaiting-client-finished)
+                             (assert-state-failure
+                              "Finished state rejects KeyUpdate" server
+                              (encode-handshake 24 (make-tls13-key-update 0))
+                              :handshake 10))) (incf selected) (let ((server (new-server)))
+                           (setf (cl-tls-kit::tls13-server-driver-state server) :complete)
+                           (assert-state-failure
+                            "complete state rejects ClientHello" server
+                            client-hello-wire :application 10)) (incf selected) (assert-state-failure
+                          "short handshake frame is a decode_error" (new-server)
+                          malformed-wire :initial 50)) (check-case (zerop (funcall signature-calls))
+                                 "doomed ClientHellos invoke no signing operation")))))
                 (let ((values (make-array 32767)))
                   (dotimes (index (1- (length values)))
                     (setf (aref values index) index))
@@ -1539,7 +1872,11 @@
                        (check-quic-case
                         (and (eq returned server)
                              (%server-driver-test-alert-p events 80)
-                             (equalp before (%server-driver-test-state-snapshot server)))
+                             (eq (getf (%server-driver-test-event events :send) :level)
+                                 :initial)
+                             (and (not (equalp before (%server-driver-test-state-snapshot server)))
+                                  (eq (cl-tls-kit::tls13-server-driver-state server) :failed)
+                                  (zerop (length (cl-tls-kit::tls13-server-driver-transcript server)))))
                         "u16-sized QUIC payload with oversized EncryptedExtensions fails closed")
                        (check-quic-case
                         (not (search marker-text (write-to-string events)))
@@ -1554,7 +1891,189 @@
                     "QUIC transport-parameter test group ran nonzero assertions"))
       (format t "TLS 1.3 server driver QUIC transport parameters: assertions: ~D~%"
               quic-assertions)))
-  (check-case (plusp assertions) "server driver executed nonzero assertions"))
+  (incf selected)
+  (let* ((server (new-server))
+       (client-handshake-secret
+         (make-array 32 :element-type '(unsigned-byte 8) :initial-element 7))
+       (server-handshake-secret
+         (make-array 32 :element-type '(unsigned-byte 8) :initial-element 7))
+       (client-finished-key
+         (make-array 32 :element-type '(unsigned-byte 8) :initial-element 7))
+       (master-secret
+         (make-array 32 :element-type '(unsigned-byte 8) :initial-element 7))
+       (resumption-master-secret
+         (make-array 32 :element-type '(unsigned-byte 8) :initial-element 7))
+       (client-application-secret
+         (make-array 32 :element-type '(unsigned-byte 8) :initial-element 7))
+       (server-application-secret
+         (make-array 32 :element-type '(unsigned-byte 8) :initial-element 7))
+       (transcript
+         (make-array 2 :element-type '(unsigned-byte 8)
+                     :initial-contents #(8 9)))
+       (flight-prefix
+         (make-array 2 :element-type '(unsigned-byte 8)
+                     :initial-contents #(10 11)))
+       (key-share (make-array 32 :element-type '(unsigned-byte 8)
+                              :initial-element 12))
+       (identity-private-key
+         (cl-tls-kit::tls13-server-driver-private-key server))
+       (identity-private-key-bytes
+         (and (cl-tls-kit::%tls13-server-octets-p identity-private-key)
+              (copy-seq identity-private-key)))
+       (finished
+         (encode-handshake
+          20 (make-tls13-finished
+              (make-array 32 :element-type '(unsigned-byte 8)
+                          :initial-element 0)))))
+  (check-case
+   (= (length (remove-duplicates
+               (list client-handshake-secret server-handshake-secret
+                     client-finished-key master-secret resumption-master-secret
+                     client-application-secret server-application-secret)
+               :test #'eq))
+      7)
+   "server cleanup test uses independent secret vectors")
+  (setf (cl-tls-kit::tls13-server-driver-state server) :awaiting-client-finished
+        (cl-tls-kit::tls13-server-driver-hash server) :sha256
+        (cl-tls-kit::tls13-server-driver-client-handshake-secret server)
+        client-handshake-secret
+        (cl-tls-kit::tls13-server-driver-server-handshake-secret server)
+        server-handshake-secret
+        (cl-tls-kit::tls13-server-driver-client-finished-key server)
+        client-finished-key
+        (cl-tls-kit::tls13-server-driver-master-secret server) master-secret
+        (cl-tls-kit::tls13-server-driver-resumption-master-secret server)
+        resumption-master-secret
+        (cl-tls-kit::tls13-server-driver-client-application-secret server)
+        client-application-secret
+        (cl-tls-kit::tls13-server-driver-server-application-secret server)
+        server-application-secret
+        (cl-tls-kit::tls13-server-driver-transcript server) transcript
+        (cl-tls-kit::tls13-server-driver-server-flight-prefix server) flight-prefix
+        (cl-tls-kit::tls13-server-driver-private-key-share server) key-share
+        (cl-tls-kit::tls13-server-driver-initial-client-hello server)
+        :client-hello
+        (cl-tls-kit::tls13-server-driver-cookie server) :cookie
+        (cl-tls-kit::tls13-server-driver-sni-callback server)
+        (lambda (hostname) (declare (ignore hostname)))
+        (cl-tls-kit::tls13-server-driver-clock server)
+        (lambda () now))
+  (check-case (and identity-private-key (eq identity-private-key private-key))
+              "server driver starts with the shared identity private key")
+  (multiple-value-bind (returned events)
+      (tls13-server-driver-step server finished :level :handshake)
+    (check-case
+     (and (eq returned server)
+          (%server-driver-test-alert-p events 51)
+          (eq (getf (%server-driver-test-event events :send) :level) :handshake)
+          (eq (cl-tls-kit::tls13-server-driver-state server) :failed)
+          (every #'zerop client-handshake-secret)
+          (every #'zerop server-handshake-secret)
+          (every #'zerop client-finished-key)
+          (every #'zerop master-secret)
+          (every #'zerop resumption-master-secret)
+          (every #'zerop client-application-secret)
+          (every #'zerop server-application-secret)
+          (every #'zerop transcript)
+          (every #'zerop flight-prefix)
+          (every #'zerop key-share)
+          (every #'null
+                 (list
+                   (cl-tls-kit::tls13-server-driver-client-handshake-secret server)
+                   (cl-tls-kit::tls13-server-driver-server-handshake-secret server)
+                   (cl-tls-kit::tls13-server-driver-client-finished-key server)
+                   (cl-tls-kit::tls13-server-driver-master-secret server)
+                   (cl-tls-kit::tls13-server-driver-resumption-master-secret server)
+                   (cl-tls-kit::tls13-server-driver-client-application-secret server)
+                   (cl-tls-kit::tls13-server-driver-server-application-secret server)
+                   (cl-tls-kit::tls13-server-driver-server-flight-prefix server)
+                   (cl-tls-kit::tls13-server-driver-private-key-share server)
+                   (cl-tls-kit::tls13-server-driver-provider server)
+                   (cl-tls-kit::tls13-server-driver-sni-callback server)
+                   (cl-tls-kit::tls13-server-driver-clock server)
+                   (cl-tls-kit::tls13-server-driver-random server)
+                   (cl-tls-kit::tls13-server-driver-key-exchange server)
+                   (cl-tls-kit::tls13-server-driver-private-key server)
+                   (cl-tls-kit::tls13-server-driver-initial-client-hello server)
+                   (cl-tls-kit::tls13-server-driver-cookie server)
+                   (cl-tls-kit::tls13-server-driver-ticket-key-store server)))
+          (eq identity-private-key private-key)
+          (or (null identity-private-key-bytes)
+              (equalp identity-private-key-bytes identity-private-key)))
+     "invalid Client Finished terminalizes the server, clears secrets and drops callback and key references"))
+  (multiple-value-bind (returned events)
+      (tls13-server-driver-step server finished :level :handshake)
+    (check-case
+     (and (eq returned server)
+          (null events)
+          (eq (cl-tls-kit::tls13-server-driver-state server) :failed)
+          (null (cl-tls-kit::tls13-server-driver-client-finished-key server)))
+     "server driver returns no events after fatal Finished failure")))
+  (incf selected)
+  (let* ((server (new-server))
+         (transcript
+           (make-array 2 :element-type '(unsigned-byte 8)
+                       :initial-contents '(8 9)))
+         (client-finished-key
+           (make-array 32 :element-type '(unsigned-byte 8) :initial-element 17))
+         (master-secret
+           (make-array 32 :element-type '(unsigned-byte 8) :initial-element 19))
+         (digest-symbol (find-symbol "%TLS13-SERVER-DIGEST" :cl-tls-kit))
+         (digest-original (symbol-function digest-symbol))
+         (issue-symbol (find-symbol "%TLS13-SERVER-ISSUE-TICKET" :cl-tls-kit))
+         (issue-original (symbol-function issue-symbol))
+         (local-transcript nil)
+         (resumption-master nil)
+         (finished nil))
+    (setf (cl-tls-kit::tls13-server-driver-state server) :awaiting-client-finished
+          (cl-tls-kit::tls13-server-driver-hash server) :sha256
+          (cl-tls-kit::tls13-server-driver-transcript server) transcript
+          (cl-tls-kit::tls13-server-driver-client-finished-key server)
+          client-finished-key
+          (cl-tls-kit::tls13-server-driver-master-secret server) master-secret
+          finished
+          (encode-handshake
+           20 (make-tls13-finished
+               (cl-tls-kit:tls13-compute-finished-verify-data
+                provider :sha256 client-finished-key
+                (funcall (cl-tls-kit::tls13-crypto-provider-digest provider)
+                         :sha256 transcript)))))
+    (unwind-protect
+         (progn
+           (setf (symbol-function digest-symbol)
+                 (lambda (driver bytes)
+                   (when (> (length bytes) (length transcript))
+                     (setf local-transcript bytes))
+                   (funcall digest-original driver bytes))
+                 (symbol-function issue-symbol)
+                 (lambda (driver secret)
+                   (declare (ignore driver))
+                   (setf resumption-master secret)
+                   (error "Injected ticket issuance failure")))
+           (multiple-value-bind (returned events)
+               (tls13-server-driver-step server finished :level :handshake)
+             (check-case
+              (and (eq returned server)
+                   (%server-driver-test-alert-p events 80)
+                   (eq (getf (%server-driver-test-event events :send) :level)
+                       :handshake)
+                   (eq (cl-tls-kit::tls13-server-driver-state server) :failed)
+                   resumption-master
+                   (every #'zerop resumption-master)
+                   local-transcript
+                   (every #'zerop local-transcript)
+                   (zerop
+                    (length (cl-tls-kit::tls13-server-driver-transcript server))))
+              "ticket issuance failure clears local Finished secrets")))
+      (setf (symbol-function digest-symbol) digest-original
+            (symbol-function issue-symbol) issue-original)))
+  (progn
+                  (incf selected)
+                  (%server-driver-test-ticket-key-store-lifecycle
+                   provider chain private-key now (function check-case))
+                  (check-case
+                   (plusp assertions)
+                   "server driver executed nonzero assertions")))
                 (format t "TLS 1.3 server driver: selected test count: ~D; assertions: ~D~%"
                         selected assertions)
                 t)))))

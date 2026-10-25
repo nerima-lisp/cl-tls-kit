@@ -791,9 +791,12 @@
              "local API misuse sends no alert and leaves the driver open"))
     (let* ((writes '())
            (close-count 0)
+           (secret (make-array 32 :element-type '(unsigned-byte 8)
+                               :initial-element 7))
            (read-driver
             (cl-tls-kit::%make-tls13-client-driver
              :state :connected
+             :early-secret secret
              :transport-read
              (lambda (ignored)
                (declare (ignore ignored))
@@ -815,10 +818,11 @@
                                       "transport read failed")))
              "driver preserves a transport receive failure")
       (check (and (null writes)
-                  (zerop close-count)
-                  (eq (cl-tls-kit::tls13-client-driver-state read-driver)
-                      :connected))
-             "transport receive failure sends no protocol alert"))
+                  (= close-count 1)
+                  (eq (cl-tls-kit::tls13-client-driver-state read-driver) :closed)
+                  (every #'zerop secret)
+                  (null (cl-tls-kit::tls13-client-driver-early-secret read-driver)))
+             "transport receive failure closes without a protocol alert and clears secrets"))
     (let* ((attempted-alerts 0)
            (close-count 0)
            (failed-driver
@@ -1075,7 +1079,7 @@
       (check
        (and
         (eq (cl-tls-kit::tls13-client-driver-state transport-record-driver) :connected)
-        (null writes)
+        (zerop (length writes))
         (zerop close-count)
         (handler-case
             (tls13-client-driver-read-record transport-record-driver)
@@ -1494,4 +1498,272 @@
             (assert (= api-assertions 4))
             (format t "TLS 1.3 client application-data read API: assertions: ~D~%"
                     api-assertions))))))
-  t))))
+  (progn
+  (dolist (state-and-type '((:awaiting-server-hello 8)
+                            (:awaiting-encrypted-extensions 11)
+                            (:awaiting-certificate 8)
+                            (:awaiting-certificate-verify 8)
+                            (:awaiting-finished 8)))
+    (let* ((state (first state-and-type))
+           (type (second state-and-type))
+           (message (if (= type 8)
+                        (make-tls13-encrypted-extensions '())
+                        (make-tls13-certificate #() '())))
+           (driver (cl-tls-kit::%make-tls13-client-driver :state state)))
+      (check (handler-case
+                 (progn
+                   (cl-tls-kit::%driver-client-step
+                    driver (encode-handshake type message))
+                   nil)
+               (tls13-client-driver-error (condition)
+                 (eq (tls13-client-driver-error-reason condition)
+                     :unexpected-message)))
+             (format nil "driver rejects message type ~D in state ~S" type state))))
+  (labels ((octets (length value)
+           (make-array length :element-type '(unsigned-byte 8)
+                       :initial-element value))
+         (make-traffic-state (secret key iv)
+           (let ((state
+                   (cl-tls-kit::make-tls13-traffic-state
+                    provider :sha256 :aes-128-gcm secret 16 12)))
+             (setf (cl-tls-kit::tls13-traffic-state-key state) key
+                   (cl-tls-kit::tls13-traffic-state-iv state) iv)
+             state))
+         (octets-cleared-p (bytes)
+           (every (function zerop) bytes))
+         (traffic-state-cleared-p (state)
+           (and (null (cl-tls-kit::tls13-traffic-state-provider state))
+                (null (cl-tls-kit::tls13-traffic-state-hash state))
+                (null (cl-tls-kit::tls13-traffic-state-algorithm state))
+                (null (cl-tls-kit::tls13-traffic-state-secret state))
+                (null (cl-tls-kit::tls13-traffic-state-key state))
+                (null (cl-tls-kit::tls13-traffic-state-iv state))))
+         (driver-cleared-p (driver states bytes)
+           (and (eq (cl-tls-kit::tls13-client-driver-state driver) :closed)
+                (every (function null)
+                       (list (cl-tls-kit::tls13-client-driver-provider driver)
+                             (cl-tls-kit::tls13-client-driver-key-exchange driver)
+                             (cl-tls-kit::tls13-client-driver-on-send driver)
+                             (cl-tls-kit::tls13-client-driver-verify-certificate-verify driver)
+                             (cl-tls-kit::tls13-client-driver-verify-signature driver)
+                             (cl-tls-kit::tls13-client-driver-transport-read driver)
+                             (cl-tls-kit::tls13-client-driver-transport-write driver)
+                             (cl-tls-kit::tls13-client-driver-transport-close driver)
+                             (cl-tls-kit::tls13-client-driver-client-hello driver)
+                             (cl-tls-kit::tls13-client-driver-private-key driver)
+                             (cl-tls-kit::tls13-client-driver-offered-ticket driver)
+                             (cl-tls-kit::tls13-client-driver-early-secret driver)
+                             (cl-tls-kit::tls13-client-driver-handshake-secret driver)
+                             (cl-tls-kit::tls13-client-driver-master-secret driver)
+                             (cl-tls-kit::tls13-client-driver-handshake-traffic-secret driver)
+                             (cl-tls-kit::tls13-client-driver-resumption-master-secret driver)
+                             (cl-tls-kit::tls13-client-driver-client-finished-key driver)
+                             (cl-tls-kit::tls13-client-driver-server-finished-key driver)
+                             (cl-tls-kit::tls13-client-driver-handshake-read-state driver)
+                             (cl-tls-kit::tls13-client-driver-handshake-write-state driver)
+                             (cl-tls-kit::tls13-client-driver-application-read-state driver)
+                             (cl-tls-kit::tls13-client-driver-application-write-state driver)))
+                (zerop (length (cl-tls-kit::tls13-client-driver-transcript driver)))
+                (zerop (length (cl-tls-kit::tls13-client-driver-pending-handshake driver)))
+                (every (function octets-cleared-p) bytes)
+                (every (function traffic-state-cleared-p) states))))
+  (let* ((early (octets 32 1))
+         (handshake (octets 32 2))
+         (master (octets 32 3))
+         (handshake-traffic (octets 32 4))
+         (resumption (octets 32 5))
+         (client-finished (octets 32 6))
+         (server-finished (octets 32 7))
+         (ticket-psk (octets 32 8))
+         (private-key (octets 32 9))
+         (transcript (octets 6 10))
+         (pending (octets 4 11))
+         (traffic-secrets (loop for value from 12 below 16
+                                collect (octets 32 value)))
+         (traffic-keys (loop for value from 16 below 20
+                             collect (octets 16 value)))
+         (traffic-ivs (loop for value from 20 below 24
+                            collect (octets 12 value)))
+         (traffic-states
+           (loop for secret in traffic-secrets
+                 for key in traffic-keys
+                 for iv in traffic-ivs
+                 collect (make-traffic-state secret key iv)))
+         (all-bytes
+           (append (list early handshake master handshake-traffic resumption
+                         client-finished server-finished ticket-psk private-key
+                         transcript pending)
+                   traffic-secrets traffic-keys traffic-ivs))
+         (ticket
+           (cl-tls-kit::%make-tls13-session-ticket
+            "example.test" nil #(1) ticket-psk :sha256 60 0 0 1))
+         (peer-secret (octets 32 24))
+         (peer-key (octets 16 25))
+         (peer-iv (octets 12 26))
+         (peer-write-state (make-traffic-state peer-secret peer-key peer-iv))
+         (peer-wire
+           (cl-tls-kit::encrypt-tls13-traffic-record
+            (make-tls-plaintext cl-tls-kit::+tls-content-type-alert+ #(2 40))
+            peer-write-state))
+         (driver nil)
+         (close-count 0)
+         (callback-saw-cleared-p nil))
+    (setf driver
+          (cl-tls-kit::%make-tls13-client-driver
+           :state :connected
+           :provider provider
+           :key-exchange key-exchange
+           :on-send (lambda (&rest ignored) (declare (ignore ignored)))
+           :verify-certificate-verify (lambda (&rest ignored) (declare (ignore ignored)))
+           :verify-signature (lambda (&rest ignored) (declare (ignore ignored)))
+           :transport-read (lambda (ignored) (declare (ignore ignored)) peer-wire)
+           :transport-close
+           (lambda (current)
+             (incf close-count)
+             (setf callback-saw-cleared-p
+                   (driver-cleared-p current traffic-states all-bytes))
+             (check callback-saw-cleared-p
+                    "peer alert transport callback observes cleared secrets and traffic states"))
+           :client-hello :sent-hello
+           :private-key private-key
+           :offered-ticket ticket
+           :early-secret early
+           :handshake-secret handshake
+           :master-secret master
+           :handshake-traffic-secret handshake-traffic
+           :resumption-master-secret resumption
+           :client-finished-key client-finished
+           :server-finished-key server-finished
+           :handshake-read-state (first traffic-states)
+           :handshake-write-state (second traffic-states)
+           :application-read-state (third traffic-states)
+           :application-write-state (fourth traffic-states)
+           :transcript transcript
+           :pending-handshake pending))
+    (check (handler-case
+               (progn (tls13-client-driver-read-record driver) nil)
+             (tls13-client-driver-error (condition)
+               (let ((reason (tls13-client-driver-error-reason condition)))
+                 (and (consp reason) (eq (first reason) :peer-alert)))))
+           "peer alert remains the original client-driver error")
+    (check (and (= close-count 1) callback-saw-cleared-p
+                (driver-cleared-p driver traffic-states all-bytes))
+           "peer alert closes once and clears every client-driver secret")
+    (check (handler-case
+               (progn
+                 (tls13-client-driver-read-application-data driver)
+                 nil)
+             (tls13-client-driver-error (condition)
+               (eq (tls13-client-driver-error-reason condition) :not-connected)))
+           "client driver cannot be reused after a peer alert"))
+  (let* ((early (octets 32 31))
+         (handshake (octets 32 32))
+         (transcript (octets 4 33))
+         (pending (octets 4 34))
+         (read-secret (octets 32 35))
+         (read-key (octets 16 36))
+         (read-iv (octets 12 37))
+         (write-secret (octets 32 38))
+         (write-key (octets 16 39))
+         (write-iv (octets 12 40))
+         (read-state (make-traffic-state read-secret read-key read-iv))
+         (write-state (make-traffic-state write-secret write-key write-iv))
+         (states (list read-state write-state))
+         (all-bytes (list early handshake transcript pending read-secret read-key
+                          read-iv write-secret write-key write-iv))
+         (read-error
+           (make-condition 'simple-error
+                           :format-control "original transport read failure"
+                           :format-arguments nil))
+         (driver nil)
+         (close-count 0)
+         (callback-saw-cleared-p nil))
+    (setf driver
+          (cl-tls-kit::%make-tls13-client-driver
+           :state :connected
+           :provider provider
+           :transport-read (lambda (ignored)
+                             (declare (ignore ignored))
+                             (error read-error))
+           :transport-close
+           (lambda (current)
+             (incf close-count)
+             (setf callback-saw-cleared-p
+                   (driver-cleared-p current states all-bytes))
+             (check callback-saw-cleared-p
+                    "read-error transport callback observes cleared secrets")
+             (error "secondary transport close failure"))
+           :early-secret early
+           :handshake-secret handshake
+           :application-read-state read-state
+           :application-write-state write-state
+           :transcript transcript
+           :pending-handshake pending))
+    (check (handler-case
+               (progn (tls13-client-driver-read-record driver) nil)
+             (simple-error (condition) (eq condition read-error)))
+           "transport read error survives a failing close callback")
+    (check (and (= close-count 1) callback-saw-cleared-p
+                (driver-cleared-p driver states all-bytes))
+           "read error closes once after zeroing and releasing driver secrets")
+    (check (handler-case
+               (progn
+                 (tls13-client-driver-read-application-data driver)
+                 nil)
+             (tls13-client-driver-error (condition)
+               (eq (tls13-client-driver-error-reason condition) :not-connected)))
+           "client driver cannot be reused after a transport read error"))
+  (progn
+    (let* ((dhe (make-array 32 :element-type '(unsigned-byte 8)
+                            :initial-element 17))
+           (driver
+             (cl-tls-kit::%make-tls13-client-driver
+              :provider provider
+              :hash :sha256
+              :early-secret (make-array 32 :element-type '(unsigned-byte 8))
+              :selected-group #x001d
+              :private-key #()
+              :key-exchange
+              (list :shared-secret
+                    (lambda (group private public)
+                      (declare (ignore group private public))
+                      dhe)))))
+      (cl-tls-kit::%driver-install-handshake-secret driver (cons #x001d #(1)))
+      (check (every #'zerop dhe)
+             "client driver clears the DHE secret after successful derivation"))
+    (let* ((dhe (make-array 32 :element-type '(unsigned-byte 8)
+                            :initial-element 23))
+           (bad-provider (cl-tls-kit::copy-tls13-crypto-provider provider))
+           (driver
+             (cl-tls-kit::%make-tls13-client-driver
+              :provider bad-provider
+              :hash :sha256
+              :early-secret (make-array 32 :element-type '(unsigned-byte 8))
+              :selected-group #x001d
+              :private-key #()
+              :key-exchange
+              (list :shared-secret
+                    (lambda (group private public)
+                      (declare (ignore group private public))
+                      dhe)))))
+      (setf (cl-tls-kit::tls13-crypto-provider-hkdf-extract bad-provider)
+            (lambda (&rest arguments)
+              (declare (ignore arguments))
+              (error "forced handshake-secret derivation failure")))
+      (check (handler-case
+                 (progn
+                   (cl-tls-kit::%driver-install-handshake-secret
+                    driver (cons #x001d #(1)))
+                   nil)
+               (simple-error () t))
+             "client driver propagates handshake-secret derivation failure")
+      (check (every #'zerop dhe)
+             "client driver clears the DHE secret after failed derivation"))
+    (progn
+    (let ((driver (make-tls13-client-driver :provider provider)))
+      (check (not (tls13-client-driver-closed-p driver))
+             "client driver closed predicate is false while open")
+      (tls13-client-driver-close driver)
+      (check (tls13-client-driver-closed-p driver)
+             "client driver closed predicate is true after close"))
+    t))))))))

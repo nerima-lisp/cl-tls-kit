@@ -85,15 +85,16 @@
     (record-test-check (tls-key-update-p
                         (make-tls-plaintext 22 #(24 0 0 1 0)))
                        "KeyUpdate format")
-    (record-test-check (tls-close-notify-p
-                        (make-tls-plaintext 21 #(1 0)))
-                       "close_notify format")
-    (record-test-check (not (tls-close-notify-p
-                             (make-tls-plaintext 21 #(2 0))))
-                       "reject fatal close_notify shape")
-    (record-test-check (not (tls-close-notify-p
-                             (make-tls-plaintext 21 #(1 0 0))))
-                       "reject padded close_notify shape")
+    (record-test-check (tls-close-notify-p (make-tls-plaintext 21 #(0 0)))
+                     "close_notify ignores legacy level zero")
+  (record-test-check (tls-close-notify-p (make-tls-plaintext 21 #(1 0)))
+                     "close_notify ignores legacy level one")
+  (record-test-check (tls-close-notify-p (make-tls-plaintext 21 #(2 0)))
+                     "close_notify ignores legacy fatal level")
+  (record-test-check (not (tls-close-notify-p (make-tls-plaintext 21 #(2 40))))
+                     "non-close_notify alerts remain alerts")
+  (record-test-check (not (tls-close-notify-p (make-tls-plaintext 21 #(1 0 0))))
+                     "padded close_notify is rejected")
     (let ((provider (%record-provider)))
       (when provider
         (dolist (algorithm '(:aes-128-gcm :chacha20-poly1305))

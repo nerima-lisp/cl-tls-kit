@@ -7,16 +7,7 @@
                             t)))
     (flet ((certificate (issuer subject serial &optional ca self-signed
                                   subject-alternative-names name-constraints)
-             (list :issuer issuer :subject subject
-                   :not-before 0 :not-after (1+ now)
-                   :signature-algorithm :rsa-pkcs1-sha256
-                   :tbs-certificate (vector serial)
-                   :signature (vector (logand serial #xff))
-                   :public-key (vector serial)
-                   :basic-constraints (when ca '(:ca t))
-                   :subject-alternative-names subject-alternative-names
-                   :name-constraints name-constraints
-                   :self-signed self-signed)))
+             (list :issuer (when issuer (list (list (cons "2.5.4.3" issuer)))) :subject (list (list (cons "2.5.4.3" subject))) :not-before 0 :not-after (1+ now) :signature-algorithm :rsa-pkcs1-sha256 :tbs-certificate (vector serial) :signature (vector (logand serial #xff)) :public-key (vector serial) :basic-constraints (when ca '(:ca t)) :subject-alternative-names subject-alternative-names :name-constraints name-constraints :self-signed self-signed)))
       (let* ((leaf (certificate "intermediate-a" "leaf" 1))
              (intermediate-a (certificate "intermediate-b" "intermediate-a" 2 t))
              (intermediate-b (certificate "root" "intermediate-b" 3 t))
