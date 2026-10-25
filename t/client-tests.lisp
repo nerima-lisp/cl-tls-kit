@@ -57,8 +57,20 @@
          "IPv4 parser rejects a leading-zero octet")
   (check (not (hostname-match-p "010.0.0.1" '((:ip #(10 0 0 1)))))
          "noncanonical IPv4 does not match an IP SAN")
-  (check (not (hostname-match-p "010.0.0.1" '((:dns "010.0.0.1"))))
-         "noncanonical IPv4 does not fall back to a DNS SAN")
+  (progn
+    (check (not (hostname-match-p "010.0.0.1" (list (list :dns "010.0.0.1"))))
+           "noncanonical IPv4 does not fall back to a DNS SAN")
+    (check (not (hostname-match-p " 127.1" (list (list :dns "127.1"))))
+           "leading whitespace cannot route a numeric host to DNS matching")
+    (check (not (hostname-match-p "127.1 " (list (list :dns "127.1"))))
+           "trailing whitespace cannot route a numeric host to DNS matching")
+    (check (not (hostname-match-p "127.1." (list (list :dns "127.1"))))
+           "a trailing dot cannot route a numeric host to DNS matching")
+    (check (not (hostname-match-p "0X7F000001" (list (list :dns "0x7f000001"))))
+           "case normalization cannot route a numeric host to DNS matching")
+    (check (not (hostname-match-p "127.1.." (list (list :dns "127.1"))))
+           "repeated normalization cannot route a malformed numeric host to DNS matching"))
+
   (check (handler-case
              (progn (tls-kit::%make-tls-client-tcp-transport "010.0.0.1" 443) nil)
            (tls-kit:hostname-mismatch () t))
@@ -77,25 +89,25 @@
          (original-lookup (symbol-function lookup-symbol))
          (lookup-calls 0))
     (unwind-protect
-         (progn
-           (setf (symbol-function make-symbol)
-                 (lambda (&rest arguments)
-                   (declare (ignore arguments))
-                   :test-socket)
-                 (symbol-function lookup-symbol)
-                 (lambda (&rest arguments)
-                   (declare (ignore arguments))
-                   (incf lookup-calls)
-                   (error "Unexpected resolver access in test")))
-           (dolist (hostname '("127.1" "2130706433" "0x7f000001" "0177.0.0.1"))
-             (check (handler-case
-                        (progn (tls-kit::%make-tls-client-tcp-transport hostname 443) nil)
-                      (tls-kit:hostname-mismatch () t)
-                      (error () nil))
-                    (format nil "TCP transport rejects numeric form ~A before lookup"
-                            hostname)))
-           (check (zerop lookup-calls)
-                  "ambiguous numeric hostnames never reach the resolver"))
+        (progn
+          (setf (symbol-function make-symbol)
+                (lambda (&rest arguments)
+                  (declare (ignore arguments))
+                  :test-socket)
+                (symbol-function lookup-symbol)
+                (lambda (&rest arguments)
+                  (declare (ignore arguments))
+                  (incf lookup-calls)
+                  (error "Unexpected resolver access in test")))
+          (dolist (hostname '("127.1" "2130706433" "0x7f000001" "0177.0.0.1"))
+            (check (handler-case
+                       (progn (tls-kit::%make-tls-client-tcp-transport hostname 443) nil)
+                     (tls-kit:hostname-mismatch () t)
+                     (error () nil))
+                   (format nil "TCP transport rejects numeric form ~A before lookup"
+                           hostname)))
+          (check (zerop lookup-calls)
+                 "ambiguous numeric hostnames never reach the resolver"))
       (setf (symbol-function make-symbol) original-make
             (symbol-function lookup-symbol) original-lookup)))
   (check (equalp (tls-kit::%parse-ipv4 "127.0.0.1") #(127 0 0 1))

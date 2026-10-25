@@ -30,20 +30,19 @@ Unicode (which would make the result dependent on implementation details)."
               (string-downcase (funcall symbol name))
               (error 'hostname-mismatch :hostname name :names nil))))))
 
-(defun %dns-name-match-p (pattern hostname)
-  (let ((pattern (normalize-hostname pattern))
-        (hostname (normalize-hostname hostname)))
+(defun %dns-name-match-normalized-p (pattern hostname)
+  (let ((pattern (normalize-hostname pattern)))
     (if (and (>= (length pattern) 3)
              (string= "*." (subseq pattern 0 2)))
-        ;; RFC 6125 permits the wildcard only in the complete left-most label.
         (and (not (find #\* (subseq pattern 2)))
              (let ((suffix (subseq pattern 1)))
                (and (> (length hostname) (length suffix))
                     (string= suffix (subseq hostname (- (length hostname)
                                                         (length suffix))))
                     (not (find #\. (subseq hostname 0 (- (length hostname)
-                                                          (length suffix))))))))
-        (and (not (find #\* pattern)) (string= pattern hostname)))))
+                                                         (length suffix))))))))
+      (and (not (find #\* pattern)) (string= pattern hostname)))))
+
 (defun %ipv4-numeric-dotted-quad-p (name)
   (and (stringp name)
        (let ((parts (uiop:split-string name :separator ".")))
@@ -146,8 +145,11 @@ Unicode (which would make the result dependent on implementation details)."
   "Match HOSTNAME against SAN entries.  SAN entries are (:DNS NAME) or
 (:IP ADDRESS), and bare strings are treated as DNS names for convenience.
 There is deliberately no CN fallback."
-  (let ((hostname-ip (%ip-octets hostname)))
-    (unless (and (%ipv4-numeric-notation-p hostname)
+  (let* ((normalized-hostname (if (stringp hostname)
+                                  (normalize-hostname hostname)
+                                hostname))
+         (hostname-ip (%ip-octets normalized-hostname)))
+    (unless (and (%ipv4-numeric-notation-p normalized-hostname)
                  (null hostname-ip))
       (some (lambda (entry)
               (let ((kind (and (consp entry) (car entry)))
@@ -155,5 +157,6 @@ There is deliberately no CN fallback."
                 (cond ((and hostname-ip (eq kind :ip))
                        (equalp hostname-ip (%ip-octets value)))
                       ((and (not hostname-ip) (or (null kind) (eq kind :dns)))
-                       (%dns-name-match-p value hostname)))))
+                       (%dns-name-match-normalized-p value normalized-hostname)))))
             subject-alternative-names))))
+
