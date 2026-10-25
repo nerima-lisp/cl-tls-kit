@@ -1935,10 +1935,10 @@
       (tls13-server-driver-step server finished :level :handshake)
     (check-case
      (and (eq returned server)
-          (%server-driver-test-alert-p events 10)
+          (null events)
           (eq (cl-tls-kit::tls13-server-driver-state server) :failed)
           (null (cl-tls-kit::tls13-server-driver-client-finished-key server)))
-     "server driver rejects input after fatal Finished failure")))
+     "server driver returns no events after fatal Finished failure")))
   (incf selected)
   (let* ((server (new-server))
          (transcript

@@ -1420,6 +1420,8 @@ Finished. Its value is provisional and unauthenticated until
 after :HANDSHAKE-COMPLETE."
   (unless (typep driver 'tls13-server-driver)
     (%tls13-server-fail :invalid-server-driver 80))
+  (when (eq (tls13-server-driver-state driver) :failed)
+    (return-from tls13-server-driver-step (values driver nil)))
   (handler-case
       (values
        driver
