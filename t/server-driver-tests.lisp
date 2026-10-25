@@ -670,6 +670,149 @@
            (funcall function (lambda () calls)))
       (setf (symbol-function symbol) original))))
 
+(defun %server-driver-test-ticket-key-store-lifecycle
+    (provider chain private-key now check-case)
+  (labels ((destroyed-error-p (function)
+             (handler-case
+                 (progn (funcall function) nil)
+               (tls13-server-driver-error (condition)
+                 (eq (tls13-server-driver-error-reason condition)
+                     :ticket-key-store-destroyed))))
+           (random-failure-p (function)
+             (handler-case
+                 (progn (funcall function) nil)
+               (tls13-server-driver-error (condition)
+                 (eq (tls13-server-driver-error-reason condition)
+                     :ticket-key-random-failed))))
+           (nonzero-octets-p (bytes)
+             (and (cl-tls-kit::%tls13-server-octets-p bytes)
+                  (some (function plusp) bytes))))
+    (let* ((store
+             (make-tls13-server-ticket-key-store
+              :random (%server-driver-test-random)
+              :ticket-lifetime 1))
+           (old-key (cl-tls-kit::tls13-server-ticket-key-store-current store))
+           (old-id (cl-tls-kit::%tls13-server-ticket-key-id old-key))
+           (lookup-id (copy-seq old-id))
+           (old-secret (cl-tls-kit::%tls13-server-ticket-key-secret old-key)))
+      (funcall check-case
+               (and (nonzero-octets-p old-id)
+                    (nonzero-octets-p lookup-id)
+                    (nonzero-octets-p old-secret))
+               "expiry test retains independent nonzero key ID and secret vectors")
+      (rotate-tls13-server-ticket-key-store store :clock (lambda () now))
+      (let ((decrypt-until
+              (cl-tls-kit::%tls13-server-ticket-key-decrypt-until old-key)))
+        (rotate-tls13-server-ticket-key-store
+         store
+         :clock (lambda ()
+                  (+ decrypt-until
+                     cl-tls-kit::+tls13-server-unix-time-offset+ 1)))
+        (funcall check-case
+                 (and (every (function plusp) lookup-id)
+                      (null (cl-tls-kit::%tls13-server-find-ticket-key
+                             store lookup-id (1+ decrypt-until))))
+                 "second rotation prunes the expired key and rejects its independent ID")
+        (funcall check-case
+                 (and (every (function zerop) old-id)
+                      (every (function zerop) old-secret)
+                      (not (member old-key
+                                   (cl-tls-kit::tls13-server-ticket-key-store-previous
+                                    store)
+                                   :test #'eq)))
+                 "second rotation zeroes expired key vectors before removing the key")))
+    (let* ((fail-p nil)
+           (random (%server-driver-test-random))
+           (store
+             (make-tls13-server-ticket-key-store
+              :random (lambda (length)
+                        (if fail-p
+                            (make-array 0 :element-type '(unsigned-byte 8))
+                            (funcall random length)))))
+           (current-key (cl-tls-kit::tls13-server-ticket-key-store-current store))
+           (current-id (cl-tls-kit::%tls13-server-ticket-key-id current-key))
+           (current-id-copy (copy-seq current-id))
+           (current-secret
+             (cl-tls-kit::%tls13-server-ticket-key-secret current-key))
+           (current-secret-copy (copy-seq current-secret)))
+      (setf fail-p t)
+      (funcall check-case
+               (random-failure-p
+                (lambda ()
+                  (rotate-tls13-server-ticket-key-store store
+                                                        :clock (lambda () now))))
+               "rotation rejects ticket-key random source failure")
+      (funcall check-case
+               (and (eq current-key
+                        (cl-tls-kit::tls13-server-ticket-key-store-current store))
+                    (equalp current-id current-id-copy)
+                    (equalp current-secret current-secret-copy)
+                    (not (member current-key
+                                 (cl-tls-kit::tls13-server-ticket-key-store-previous
+                                  store)
+                                 :test #'eq)))
+               "failed rotation preserves the current key without duplicating it"))
+    (let* ((store
+             (make-tls13-server-ticket-key-store
+              :random (%server-driver-test-random)))
+           (previous-key (cl-tls-kit::tls13-server-ticket-key-store-current store))
+           (previous-id (cl-tls-kit::%tls13-server-ticket-key-id previous-key))
+           (previous-secret (cl-tls-kit::%tls13-server-ticket-key-secret previous-key)))
+      (rotate-tls13-server-ticket-key-store store :clock (lambda () now))
+      (let* ((current-key
+               (cl-tls-kit::tls13-server-ticket-key-store-current store))
+             (current-id (cl-tls-kit::%tls13-server-ticket-key-id current-key))
+             (current-secret (cl-tls-kit::%tls13-server-ticket-key-secret current-key)))
+        (funcall check-case
+                 (and (nonzero-octets-p previous-id)
+                      (nonzero-octets-p previous-secret)
+                      (nonzero-octets-p current-id)
+                      (nonzero-octets-p current-secret))
+                 "destroy test retains nonzero current and previous key vectors")
+        (funcall check-case
+                 (eq store (destroy-tls13-server-ticket-key-store store))
+                 "ticket-key store destroy returns the store")
+        (funcall check-case
+                 (and (every (function zerop) previous-id)
+                      (every (function zerop) previous-secret)
+                      (every (function zerop) current-id)
+                      (every (function zerop) current-secret)
+                      (null (cl-tls-kit::tls13-server-ticket-key-store-current store))
+                      (null (cl-tls-kit::tls13-server-ticket-key-store-previous store))
+                      (null (cl-tls-kit::tls13-server-ticket-key-store-random store))
+                      (cl-tls-kit::tls13-server-ticket-key-store-destroyed-p store))
+                 "destroy wipes current and previous keys and clears store references")
+        (funcall check-case
+                 (eq store (destroy-tls13-server-ticket-key-store store))
+                 "ticket-key store destroy is idempotent")
+        (funcall check-case
+                 (destroyed-error-p
+                  (lambda ()
+                    (rotate-tls13-server-ticket-key-store
+                     store :clock (lambda () now))))
+                 "destroyed ticket-key store rejects rotation")
+        (funcall check-case
+                 (destroyed-error-p
+                  (lambda () (cl-tls-kit::%tls13-server-current-ticket-key store)))
+                 "destroyed ticket-key store rejects current-key access")
+        (funcall check-case
+                 (destroyed-error-p
+                  (lambda ()
+                    (cl-tls-kit::%tls13-server-find-ticket-key
+                     store previous-id now)))
+                 "destroyed ticket-key store rejects key lookup")
+        (funcall check-case
+                 (destroyed-error-p
+                  (lambda ()
+                    (%server-driver-test-server
+                     provider chain private-key store (lambda () now))))
+                 "server driver rejects a destroyed ticket-key store")))
+    (multiple-value-bind (symbol status)
+        (find-symbol "DESTROY-TLS13-SERVER-TICKET-KEY-STORE" :cl-tls-kit)
+      (funcall check-case
+               (and symbol (eq status :external) (fboundp symbol))
+               "ticket-key store destroy is exported"))))
+
 (defun run-server-driver-tests ()
   (unless (find-package "CRYPTO-KIT")
     (format t "TLS 1.3 server driver: SKIPPED (cl-crypto-kit unavailable)~%")
@@ -1764,7 +1907,13 @@
           (eq (cl-tls-kit::tls13-server-driver-state server) :failed)
           (null (cl-tls-kit::tls13-server-driver-client-finished-key server)))
      "server driver rejects input after fatal Finished failure")))
-  (check-case (plusp assertions) "server driver executed nonzero assertions"))
+  (progn
+                  (incf selected)
+                  (%server-driver-test-ticket-key-store-lifecycle
+                   provider chain private-key now (function check-case))
+                  (check-case
+                   (plusp assertions)
+                   "server driver executed nonzero assertions")))
                 (format t "TLS 1.3 server driver: selected test count: ~D; assertions: ~D~%"
                         selected assertions)
                 t)))))
