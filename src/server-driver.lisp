@@ -1329,6 +1329,18 @@ after :HANDSHAKE-COMPLETE."
          (unless (and (vectorp wire)
                       (<= (length wire) +tls13-server-max-handshake-size+))
            (%tls13-server-fail :handshake-message-too-large 50))
+         (let ((expected-type
+                 (case (tls13-server-driver-state driver)
+                   ((:awaiting-client-hello :awaiting-second-client-hello) 1)
+                   (:awaiting-client-finished 20)
+                   (:complete 24))))
+           (when expected-type
+             (unless (and (%tls13-server-octets-p wire)
+                          (<= 4 (length wire))
+                          (= (%tls13-server-read-u24 wire 1) (- (length wire) 4)))
+               (%tls13-server-fail :malformed-handshake-message 50))
+             (unless (= (aref wire 0) expected-type)
+               (%tls13-server-fail :unexpected-handshake-message 10))))
          (cond
            ((member (tls13-server-driver-state driver)
                     '(:awaiting-client-hello :awaiting-second-client-hello))
@@ -1338,8 +1350,6 @@ after :HANDSHAKE-COMPLETE."
            ((eq (tls13-server-driver-state driver) :awaiting-client-finished)
             (unless (eq level :handshake)
               (%tls13-server-fail :unexpected-encryption-level 10))
-            (when (and (plusp (length wire)) (= (aref wire 0) 24))
-              (%tls13-server-fail :unexpected-key-update 10))
             (%tls13-server-process-finished driver wire))
            ((eq (tls13-server-driver-state driver) :complete)
             (unless (eq level :application)

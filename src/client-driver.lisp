@@ -786,7 +786,26 @@ for unoffered groups, a retry of the initial group, and a second HelloRetryReque
   "Consume one complete TLS handshake message and advance DRIVER.
 Returns DRIVER; outgoing messages are delivered to ON-SEND."
   (let* ((bytes (coerce wire '(vector (unsigned-byte 8))))
-         (message (decode-handshake bytes))
+         (message
+          (progn
+            (when (and (>= (length bytes) 4)
+                       (= (+ (ash (aref bytes 1) 16)
+                             (ash (aref bytes 2) 8)
+                             (aref bytes 3))
+                          (- (length bytes) 4)))
+              (unless
+                  (member
+                   (aref bytes 0)
+                   (case (tls13-client-driver-state driver)
+                     (:awaiting-server-hello '(2))
+                     (:awaiting-encrypted-extensions '(8))
+                     (:awaiting-certificate '(11))
+                     (:awaiting-certificate-verify '(15))
+                     (:awaiting-finished '(20))
+                     (:connected '(4 24))
+                     (otherwise nil)))
+                (%driver-fail :unexpected-message)))
+            (decode-handshake bytes)))
          (type (aref bytes 0))
          (prior-transcript (tls13-client-driver-transcript driver)))
     (when (and (eq (tls13-client-driver-state driver) :connected)
@@ -867,11 +886,6 @@ Returns DRIVER; outgoing messages are delivered to ON-SEND."
       (setf (tls13-client-driver-last-sent-key-share-group driver) group
             (tls13-client-driver-hello-retry-request-received driver) t)
       (return-from %driver-client-step driver))))
-    (unless (member (tls13-client-driver-state driver)
-                    '(:awaiting-server-hello :awaiting-encrypted-extensions
-                                             :awaiting-certificate :awaiting-certificate-verify
-                                             :awaiting-finished))
-      (%driver-fail :unexpected-message))
     (%driver-add-transcript driver bytes)
     (typecase message
       (tls13-server-hello

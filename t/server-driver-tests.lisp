@@ -1015,8 +1015,106 @@
                       (encode-handshake 1
                                         (%server-driver-test-rewrite-client-hello client-hello 13 :remove))
                       109 #'check-case)
-                     (check-case (zerop (funcall signature-calls))
-                                 "doomed ClientHellos invoke no signing operation"))))
+                     (let ((finished-wire
+                             (encode-handshake
+                              20 (make-tls13-finished
+                                  (make-array 32 :element-type '(unsigned-byte 8)
+                                              :initial-element 0))))
+                           (client-hello-wire (encode-handshake 1 client-hello))
+                           (malformed-wire
+                             (make-array 3 :element-type '(unsigned-byte 8)
+                                         :initial-contents '(20 0 0))))
+                       (flet ((assert-state-failure (name server wire level alert)
+                                (let* ((state (cl-tls-kit::tls13-server-driver-state server))
+                                       (transcript
+                                         (make-array 2 :element-type '(unsigned-byte 8)
+                                                     :initial-contents '(8 9)))
+                                       (secret
+                                         (make-array 32 :element-type '(unsigned-byte 8)
+                                                     :initial-element 7)))
+                                  (setf (cl-tls-kit::tls13-server-driver-transcript server) transcript)
+                                  (case state
+                                    (:awaiting-client-hello
+                                     (setf (cl-tls-kit::tls13-server-driver-private-key-share
+                                            server)
+                                           secret))
+                                    (:awaiting-second-client-hello
+                                     (setf (cl-tls-kit::tls13-server-driver-private-key-share
+                                            server)
+                                           secret
+                                           (cl-tls-kit::tls13-server-driver-cookie server)
+                                           #(1)))
+                                    (:awaiting-client-finished
+                                     (setf (cl-tls-kit::tls13-server-driver-hash server)
+                                           :sha256
+                                           (cl-tls-kit::tls13-server-driver-client-finished-key
+                                            server)
+                                           secret))
+                                    (:complete
+                                     (setf (cl-tls-kit::tls13-server-driver-client-application-secret
+                                            server)
+                                           secret)))
+                                  (multiple-value-bind (returned events)
+                                      (tls13-server-driver-step server wire :level level)
+                                    (check-case
+                                     (and (eq returned server)
+                                          (%server-driver-test-alert-p events alert))
+                                     (format nil "~A emits fatal alert ~D" name alert))
+                                    (check-case
+                                     (eq (getf (%server-driver-test-event events :send) :level)
+                                         level)
+                                     (format nil "~A sends its alert at ~S level" name level))
+                                    (check-case
+                                     (and (eq (cl-tls-kit::tls13-server-driver-state server) :failed)
+                                          (zerop (length (cl-tls-kit::tls13-server-driver-transcript server)))
+                                          (every #'zerop transcript)
+                                          (every #'zerop secret)
+                                          (null (cl-tls-kit::tls13-server-driver-provider server))
+                                          (null
+                                           (case state
+                                             ((:awaiting-client-hello
+                                               :awaiting-second-client-hello)
+                                              (cl-tls-kit::tls13-server-driver-private-key-share
+                                               server))
+                                             (:awaiting-client-finished
+                                              (cl-tls-kit::tls13-server-driver-client-finished-key
+                                               server))
+                                             (:complete
+                                              (cl-tls-kit::tls13-server-driver-client-application-secret
+                                               server))))
+                                          (null
+                                           (cl-tls-kit::tls13-server-driver-initial-client-hello server))
+                                          (null (cl-tls-kit::tls13-server-driver-cookie server)))
+                                     (format nil "~A terminalizes the driver and clears secrets"
+                                             name)))))) (incf selected) (assert-state-failure
+                          "initial state rejects Finished" (new-server)
+                          finished-wire :initial 10) (incf selected) (let ((server (new-server)))
+                           (setf (cl-tls-kit::tls13-server-driver-state server)
+                                 :awaiting-second-client-hello)
+                           (assert-state-failure
+                            "second ClientHello state rejects Finished" server
+                            finished-wire :initial 10)) (incf selected) (progn
+                           (let ((server (new-server)))
+                             (setf (cl-tls-kit::tls13-server-driver-state server)
+                                   :awaiting-client-finished)
+                             (assert-state-failure
+                              "Finished state rejects ClientHello" server
+                              client-hello-wire :handshake 10))
+                           (incf selected)
+                           (let ((server (new-server)))
+                             (setf (cl-tls-kit::tls13-server-driver-state server)
+                                   :awaiting-client-finished)
+                             (assert-state-failure
+                              "Finished state rejects KeyUpdate" server
+                              (encode-handshake 24 (make-tls13-key-update 0))
+                              :handshake 10))) (incf selected) (let ((server (new-server)))
+                           (setf (cl-tls-kit::tls13-server-driver-state server) :complete)
+                           (assert-state-failure
+                            "complete state rejects ClientHello" server
+                            client-hello-wire :application 10)) (incf selected) (assert-state-failure
+                          "short handshake frame is a decode_error" (new-server)
+                          malformed-wire :initial 50)) (check-case (zerop (funcall signature-calls))
+                                 "doomed ClientHellos invoke no signing operation")))))
                 (let ((values (make-array 32767)))
                   (dotimes (index (1- (length values)))
                     (setf (aref values index) index))
