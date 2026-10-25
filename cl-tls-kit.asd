@@ -4,7 +4,7 @@
   :description "Small, strict DER and PEM building blocks for TLS certificate tooling."
   :author "nerima-lisp"
   :license "MIT"
-  :version "0.4.1"
+  :version "0.5.0"
   ;; Cryptographic operations are intentionally not part of this foundation.
   ;; A future certificate/crypto layer may add ironclad and cl-base64 here.
   :depends-on ("bordeaux-threads")
