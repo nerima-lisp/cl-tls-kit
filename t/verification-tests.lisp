@@ -262,14 +262,52 @@
            (root (make-x509-certificate two-name two-name :ca t :path-length 0)))
       (check (not (cl-tls-kit.x509:x509-name-equal-p single-name two-name))
              "DER DN comparison preserves RDN structure")
-      (check (cl-tls-kit.x509:x509-name-equal-p
-              utf8-name
-              (nth-value
-               0
-               (cl-tls-kit.x509::%read-der
-                #(#x30 #x0d #x31 #x0b #x30 #x09 #x06 #x03 #x55 #x04 #x03
-                  #x0c #x02 #xc3 #xa9))))
-             "identical non-ASCII DirectoryString DER values match")
+      (progn
+  (check (cl-tls-kit.x509:x509-name-equal-p
+          utf8-name
+          (nth-value
+           0
+           (cl-tls-kit.x509::%read-der
+            #(#x30 #x0d #x31 #x0b #x30 #x09 #x06 #x03 #x55 #x04 #x03
+              #x0c #x02 #xc3 #xa9))))
+         "identical non-ASCII DirectoryString DER values match")
+  (labels ((typed-name (tag octets)
+             (nth-value
+              0
+              (cl-tls-kit.x509::%read-der
+               (tlv #x30
+                    (tlv #x31
+                         (tlv #x30
+                              (join-octets #(#x06 #x03 #x55 #x04 #x03)
+                                           (tlv tag octets)))))))))
+    (check (cl-tls-kit.x509:x509-name-equal-p
+            (typed-name #x0c #(#xc3 #xa9))
+            (typed-name #x0c #(#x65 #xcc #x81)))
+           "DirectoryString comparison composes canonically equivalent Unicode")
+    (check (cl-tls-kit.x509:x509-name-equal-p
+            (typed-name #x0c #(#xc3 #x89))
+            (typed-name #x0c #(#xc3 #xa9)))
+           "DirectoryString comparison uses Unicode case folding")
+    (check (cl-tls-kit.x509:x509-name-equal-p
+            (typed-name #x0c #(#xef #xbc #xa1 #xef #xbc #xa2 #xef #xbc #xa3))
+            (typed-name #x13 #(#x61 #x62 #x63)))
+           "DirectoryString comparison applies compatibility normalization")
+    (check (cl-tls-kit.x509:x509-name-equal-p
+            (typed-name #x0c #(#x41 #xc2 #xa0 #x42))
+            (typed-name #x13 #(#x41 #x20 #x42)))
+           "DirectoryString comparison maps non-ASCII spaces")
+    (check (not (cl-tls-kit.x509:x509-name-equal-p
+                 (typed-name #x0c #(#xcd #xb8))
+                 (typed-name #x0c #(#xcd #xb8))))
+           "DirectoryString comparison rejects Unicode 3.2 unassigned values")
+    (check (not (cl-tls-kit.x509:x509-name-equal-p
+                 (typed-name #x0c #(#xef #xbf #xbd))
+                 (typed-name #x0c #(#xef #xbf #xbd))))
+           "DirectoryString comparison rejects prohibited replacement characters")
+    (check (not (cl-tls-kit.x509:x509-name-equal-p
+                 (typed-name #x0c #(#xc0 #xaf))
+                 (typed-name #x0c #(#xc0 #xaf))))
+           "DirectoryString comparison rejects malformed UTF-8")))
       (check (handler-case
                  (progn
                    (verify-chain (list leaf intermediate root) root)

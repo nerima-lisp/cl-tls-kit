@@ -12,7 +12,8 @@
   :pathname "src"
   :serial t
   :components ((:file "package") (:file "asn1") (:file "pem")
-               (:file "hostname") (:file "x509") (:file "trust-store")
+               (:file "hostname") (:file "x509-stringprep-data")
+               (:file "x509-stringprep") (:file "x509") (:file "trust-store")
                (:file "verify") (:file "key-schedule") (:file "record")
                (:file "handshake") (:file "verification")
                (:file "quic-boundary") (:file "rfc8448") (:file "client")
