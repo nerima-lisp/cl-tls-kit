@@ -1939,6 +1939,64 @@
           (eq (cl-tls-kit::tls13-server-driver-state server) :failed)
           (null (cl-tls-kit::tls13-server-driver-client-finished-key server)))
      "server driver rejects input after fatal Finished failure")))
+  (incf selected)
+  (let* ((server (new-server))
+         (transcript
+           (make-array 2 :element-type '(unsigned-byte 8)
+                       :initial-contents '(8 9)))
+         (client-finished-key
+           (make-array 32 :element-type '(unsigned-byte 8) :initial-element 17))
+         (master-secret
+           (make-array 32 :element-type '(unsigned-byte 8) :initial-element 19))
+         (digest-symbol (find-symbol "%TLS13-SERVER-DIGEST" :cl-tls-kit))
+         (digest-original (symbol-function digest-symbol))
+         (issue-symbol (find-symbol "%TLS13-SERVER-ISSUE-TICKET" :cl-tls-kit))
+         (issue-original (symbol-function issue-symbol))
+         (local-transcript nil)
+         (resumption-master nil)
+         (finished nil))
+    (setf (cl-tls-kit::tls13-server-driver-state server) :awaiting-client-finished
+          (cl-tls-kit::tls13-server-driver-hash server) :sha256
+          (cl-tls-kit::tls13-server-driver-transcript server) transcript
+          (cl-tls-kit::tls13-server-driver-client-finished-key server)
+          client-finished-key
+          (cl-tls-kit::tls13-server-driver-master-secret server) master-secret
+          finished
+          (encode-handshake
+           20 (make-tls13-finished
+               (cl-tls-kit:tls13-compute-finished-verify-data
+                provider :sha256 client-finished-key
+                (funcall (cl-tls-kit::tls13-crypto-provider-digest provider)
+                         :sha256 transcript)))))
+    (unwind-protect
+         (progn
+           (setf (symbol-function digest-symbol)
+                 (lambda (driver bytes)
+                   (when (> (length bytes) (length transcript))
+                     (setf local-transcript bytes))
+                   (funcall digest-original driver bytes))
+                 (symbol-function issue-symbol)
+                 (lambda (driver secret)
+                   (declare (ignore driver))
+                   (setf resumption-master secret)
+                   (error "Injected ticket issuance failure")))
+           (multiple-value-bind (returned events)
+               (tls13-server-driver-step server finished :level :handshake)
+             (check-case
+              (and (eq returned server)
+                   (%server-driver-test-alert-p events 80)
+                   (eq (getf (%server-driver-test-event events :send) :level)
+                       :handshake)
+                   (eq (cl-tls-kit::tls13-server-driver-state server) :failed)
+                   resumption-master
+                   (every #'zerop resumption-master)
+                   local-transcript
+                   (every #'zerop local-transcript)
+                   (zerop
+                    (length (cl-tls-kit::tls13-server-driver-transcript server))))
+              "ticket issuance failure clears local Finished secrets")))
+      (setf (symbol-function digest-symbol) digest-original
+            (symbol-function issue-symbol) issue-original)))
   (progn
                   (incf selected)
                   (%server-driver-test-ticket-key-store-lifecycle

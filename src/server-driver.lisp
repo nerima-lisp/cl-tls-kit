@@ -1320,37 +1320,44 @@ CLOCK and the store RANDOM callback run under STORE's lock and must not re-enter
       (unless (tls13-provider-constant-time-equal-p
                provider expected (tls13-finished-verify-data finished))
         (%tls13-server-fail :client-finished-mismatch 51))
-      (let* ((transcript (%tls13-server-cat (tls13-server-driver-transcript driver) wire))
-             (resumption-master
-               (tls13-resumption-secret
-                provider hash (tls13-server-driver-master-secret driver)
-                (%tls13-server-digest driver transcript))))
-        (multiple-value-bind (ticket-wire metadata)
-            (%tls13-server-issue-ticket driver resumption-master)
-          (let ((events
-                  (append
-                   (list (%tls13-server-secret-event
-                          :read :application
-                          (tls13-server-driver-client-application-secret driver))
-                         (%tls13-server-secret-event
-                          :write :application
-                          (tls13-server-driver-server-application-secret driver))
-                         (%tls13-server-send-event :application ticket-wire)
-                         metadata
-                         (list :type :handshake-complete
-                               :resumed-p
-                               (not (null (tls13-server-driver-resumed-p driver))))))))
-            (%tls13-server-zero-octets resumption-master)
-            (dolist (secret
-                     (list (tls13-server-driver-client-finished-key driver)
-                           (tls13-server-driver-master-secret driver)))
-              (%tls13-server-zero-octets secret))
-            (setf (tls13-server-driver-transcript driver) transcript
-                  (tls13-server-driver-client-finished-key driver) nil
-                  (tls13-server-driver-master-secret driver) nil
-                  (tls13-server-driver-resumption-master-secret driver) nil
-                  (tls13-server-driver-state driver) :complete)
-            events))))))
+      (let ((transcript (%tls13-server-cat (tls13-server-driver-transcript driver) wire))
+            (resumption-master nil))
+        (unwind-protect
+             (progn
+               (setf resumption-master
+                     (tls13-resumption-secret
+                      provider hash (tls13-server-driver-master-secret driver)
+                      (%tls13-server-digest driver transcript)))
+               (multiple-value-bind (ticket-wire metadata)
+                   (%tls13-server-issue-ticket driver resumption-master)
+                 (let ((events
+                         (append
+                          (list (%tls13-server-secret-event
+                                 :read :application
+                                 (tls13-server-driver-client-application-secret driver))
+                                (%tls13-server-secret-event
+                                 :write :application
+                                 (tls13-server-driver-server-application-secret driver))
+                                (%tls13-server-send-event :application ticket-wire)
+                                metadata
+                                (list :type :handshake-complete
+                                      :resumed-p
+                                      (not (null
+                                            (tls13-server-driver-resumed-p driver))))))))
+                   (dolist (secret
+                            (list (tls13-server-driver-client-finished-key driver)
+                                  (tls13-server-driver-master-secret driver)))
+                     (%tls13-server-zero-octets secret))
+                   (%tls13-server-zero-octets
+                    (tls13-server-driver-transcript driver))
+                   (setf (tls13-server-driver-transcript driver) (copy-seq transcript)
+                         (tls13-server-driver-client-finished-key driver) nil
+                         (tls13-server-driver-master-secret driver) nil
+                         (tls13-server-driver-resumption-master-secret driver) nil
+                         (tls13-server-driver-state driver) :complete)
+                   events)))
+          (%tls13-server-zero-octets resumption-master)
+          (%tls13-server-zero-octets transcript))))))
 
 (defun %tls13-server-update-traffic-secret (driver secret)
   (tls13-hkdf-expand-label
