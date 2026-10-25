@@ -448,7 +448,7 @@ The KEY-SHARE value is supplied by the crypto/provider integration."
         (concatenate '(vector (unsigned-byte 8)) header body)))))
 
 (defun %make-tls-client-tcp-transport (host port)
-  (when (and (%ipv4-numeric-dotted-quad-p host)
+  (when (and (%ipv4-numeric-notation-p host)
              (null (%parse-ipv4 host)))
     (error 'hostname-mismatch :hostname host :names nil))
   (unless (find-package '#:sb-bsd-sockets)
