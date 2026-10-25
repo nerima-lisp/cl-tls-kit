@@ -1823,8 +1823,20 @@
               quic-assertions)))
   (incf selected)
   (let* ((server (new-server))
-       (secret (make-array 32 :element-type '(unsigned-byte 8)
-                           :initial-element 7))
+       (client-handshake-secret
+         (make-array 32 :element-type '(unsigned-byte 8) :initial-element 7))
+       (server-handshake-secret
+         (make-array 32 :element-type '(unsigned-byte 8) :initial-element 7))
+       (client-finished-key
+         (make-array 32 :element-type '(unsigned-byte 8) :initial-element 7))
+       (master-secret
+         (make-array 32 :element-type '(unsigned-byte 8) :initial-element 7))
+       (resumption-master-secret
+         (make-array 32 :element-type '(unsigned-byte 8) :initial-element 7))
+       (client-application-secret
+         (make-array 32 :element-type '(unsigned-byte 8) :initial-element 7))
+       (server-application-secret
+         (make-array 32 :element-type '(unsigned-byte 8) :initial-element 7))
        (transcript
          (make-array 2 :element-type '(unsigned-byte 8)
                      :initial-contents #(8 9)))
@@ -1843,15 +1855,29 @@
           20 (make-tls13-finished
               (make-array 32 :element-type '(unsigned-byte 8)
                           :initial-element 0)))))
+  (check-case
+   (= (length (remove-duplicates
+               (list client-handshake-secret server-handshake-secret
+                     client-finished-key master-secret resumption-master-secret
+                     client-application-secret server-application-secret)
+               :test #'eq))
+      7)
+   "server cleanup test uses independent secret vectors")
   (setf (cl-tls-kit::tls13-server-driver-state server) :awaiting-client-finished
         (cl-tls-kit::tls13-server-driver-hash server) :sha256
-        (cl-tls-kit::tls13-server-driver-client-handshake-secret server) secret
-        (cl-tls-kit::tls13-server-driver-server-handshake-secret server) secret
-        (cl-tls-kit::tls13-server-driver-client-finished-key server) secret
-        (cl-tls-kit::tls13-server-driver-master-secret server) secret
-        (cl-tls-kit::tls13-server-driver-resumption-master-secret server) secret
-        (cl-tls-kit::tls13-server-driver-client-application-secret server) secret
-        (cl-tls-kit::tls13-server-driver-server-application-secret server) secret
+        (cl-tls-kit::tls13-server-driver-client-handshake-secret server)
+        client-handshake-secret
+        (cl-tls-kit::tls13-server-driver-server-handshake-secret server)
+        server-handshake-secret
+        (cl-tls-kit::tls13-server-driver-client-finished-key server)
+        client-finished-key
+        (cl-tls-kit::tls13-server-driver-master-secret server) master-secret
+        (cl-tls-kit::tls13-server-driver-resumption-master-secret server)
+        resumption-master-secret
+        (cl-tls-kit::tls13-server-driver-client-application-secret server)
+        client-application-secret
+        (cl-tls-kit::tls13-server-driver-server-application-secret server)
+        server-application-secret
         (cl-tls-kit::tls13-server-driver-transcript server) transcript
         (cl-tls-kit::tls13-server-driver-server-flight-prefix server) flight-prefix
         (cl-tls-kit::tls13-server-driver-private-key-share server) key-share
@@ -1871,7 +1897,13 @@
           (%server-driver-test-alert-p events 51)
           (eq (getf (%server-driver-test-event events :send) :level) :handshake)
           (eq (cl-tls-kit::tls13-server-driver-state server) :failed)
-          (every #'zerop secret)
+          (every #'zerop client-handshake-secret)
+          (every #'zerop server-handshake-secret)
+          (every #'zerop client-finished-key)
+          (every #'zerop master-secret)
+          (every #'zerop resumption-master-secret)
+          (every #'zerop client-application-secret)
+          (every #'zerop server-application-secret)
           (every #'zerop transcript)
           (every #'zerop flight-prefix)
           (every #'zerop key-share)
