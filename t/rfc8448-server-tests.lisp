@@ -201,7 +201,7 @@
             (cl-tls-kit::tls13-server-driver-resumption-master-secret
              continuation-driver)
             resumption-master-secret
-            (cl-tls-kit::tls13-server-driver-ticket-key-store continuation-driver)
+            (cl-tls-kit::tls13-server-driver-ticket-key-store-internal continuation-driver)
             (make-tls13-server-ticket-key-store))
       (let ((finished
               (cl-tls-kit::%tls13-server-finish-flight

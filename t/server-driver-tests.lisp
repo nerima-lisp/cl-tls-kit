@@ -697,7 +697,7 @@
              (unless condition
                (error "Server driver close test failed: ~A" description))))
       (setf (cl-tls-kit::tls13-server-driver-provider driver) :provider
-            (cl-tls-kit::tls13-server-driver-ticket-key-store driver) :ticket-key-store
+            (cl-tls-kit::tls13-server-driver-ticket-key-store-internal driver) :ticket-key-store
             (cl-tls-kit::tls13-server-driver-sni-callback driver) (lambda () nil)
             (cl-tls-kit::tls13-server-driver-clock driver) (lambda () 0)
             (cl-tls-kit::tls13-server-driver-random driver) (lambda (length) (declare (ignore length)))
@@ -729,7 +729,7 @@
                   "close zeroes retained buffers and clears driver references")
       (check-case (every #'null
                          (list (cl-tls-kit::tls13-server-driver-provider driver)
-                               (cl-tls-kit::tls13-server-driver-ticket-key-store driver)
+                               (cl-tls-kit::tls13-server-driver-ticket-key-store-internal driver)
                                (cl-tls-kit::tls13-server-driver-sni-callback driver)
                                (cl-tls-kit::tls13-server-driver-clock driver)
                                (cl-tls-kit::tls13-server-driver-random driver)
@@ -2006,7 +2006,7 @@
                    (cl-tls-kit::tls13-server-driver-private-key server)
                    (cl-tls-kit::tls13-server-driver-initial-client-hello server)
                    (cl-tls-kit::tls13-server-driver-cookie server)
-                   (cl-tls-kit::tls13-server-driver-ticket-key-store server)))
+                   (cl-tls-kit::tls13-server-driver-ticket-key-store-internal server)))
           (eq identity-private-key private-key)
           (or (null identity-private-key-bytes)
               (equalp identity-private-key-bytes identity-private-key)))
@@ -2117,7 +2117,7 @@
                (cl-tls-kit::%tls13-server-open-ticket
                 server (getf ticket :identity)))
              (ticket-store
-               (cl-tls-kit::tls13-server-driver-ticket-key-store server))
+               (cl-tls-kit::tls13-server-driver-ticket-key-store-internal server))
              (disabled-server
                (%server-driver-test-server
                 provider chain private-key ticket-store (lambda () now)
@@ -2134,7 +2134,7 @@
             (let ((send-events (%server-driver-test-events response-events :send)))
               (check-case
                (and ticket-store
-                    (eq (cl-tls-kit::tls13-server-driver-ticket-key-store disabled-server)
+                    (eq (cl-tls-kit::tls13-server-driver-ticket-key-store-internal disabled-server)
                         ticket-store)
                     (eq returned disabled-server)
                     (null (%server-driver-test-event response-events :alert))
@@ -2185,7 +2185,7 @@
             (not (member :ticket-issued events :key (lambda (event) (getf event :type))))
             (not (sent-type-p events 4))
             (zerop (tls13-ticket-store-count client-store))
-            (null (cl-tls-kit::tls13-server-driver-ticket-key-store server)))
+            (null (cl-tls-kit::tls13-server-driver-ticket-key-store-internal server)))
        "ticket-disabled handshake emits and stores no NewSessionTicket")
       (clear-tls13-ticket-store client-store)
       (tls13-server-driver-close server))
@@ -2193,7 +2193,7 @@
     (let* ((driver
             (%server-driver-test-server
              provider chain private-key nil (lambda () now)))
-           (store (cl-tls-kit::tls13-server-driver-ticket-key-store driver)))
+           (store (tls13-server-driver-ticket-key-store driver)))
       (check-case
        (and store (not (tls13-server-ticket-key-store-destroyed-p store)))
        "default server starts with a live ticket-key store")
@@ -2212,7 +2212,7 @@
     (let* ((driver
              (%server-driver-test-server
               provider chain private-key nil (lambda () now)))
-           (store (cl-tls-kit::tls13-server-driver-ticket-key-store driver)))
+           (store (tls13-server-driver-ticket-key-store driver)))
       (multiple-value-bind (returned events)
           (tls13-server-driver-step driver #(1 0 0 0) :level :initial)
         (check-case
@@ -2231,6 +2231,7 @@
            (driver
              (%server-driver-test-server
               provider chain private-key store (lambda () now)))
+           (driver-store (tls13-server-driver-ticket-key-store driver))
            (usable nil))
       (unwind-protect
            (progn
@@ -2243,6 +2244,8 @@
                      (tls13-server-driver-error () nil)))
              (check-case
               (and usable
+                   (eq store driver-store)
+                   (not (fboundp (quote (setf cl-tls-kit:tls13-server-driver-ticket-key-store))))
                    (not (tls13-server-ticket-key-store-destroyed-p store)))
               "closing a server preserves its caller-supplied ticket-key store"))
         (destroy-tls13-server-ticket-key-store store)))

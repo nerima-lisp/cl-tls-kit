@@ -171,7 +171,7 @@
    #:tls13-client-driver-hostname
    #:tls13-client-driver-provider
    #:tls13-client-driver-signature-algorithms
-   #:tls13-client-driver-verify-signature))
+   #:tls13-client-driver-verify-signature #:tls13-server-driver-ticket-key-store))
 
 (defpackage #:cl-tls-kit.x509
   (:use #:cl #:cl-tls-kit)
