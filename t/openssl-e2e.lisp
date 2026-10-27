@@ -349,7 +349,7 @@
                                     (%openssl-e2e-read-application first-driver)))
                        "OpenSSL completes the SHA384 HRR handshake and sends a ticket")
                 (incf assertions)
-                (check (plusp (cl-tls-kit::%tls13-ticket-store-count store))
+                (check (plusp (tls13-ticket-store-count store))
                        "SHA384 NewSessionTicket is stored for the next connection"))
            (cl-tls-kit:tls13-client-driver-close first-driver)))
        (let ((second-driver

@@ -207,6 +207,8 @@ stores shared by multiple drivers. Call
 `(destroy-tls13-server-ticket-key-store store)` when the server stops to zero
 its current and previous keys and make the store unusable. Closing a driver
 releases its reference to a caller-owned store but leaves the store usable.
+`tls13-server-ticket-key-store-destroyed-p` reports whether a store has been
+destroyed.
 
 ## Listener resource limits
 

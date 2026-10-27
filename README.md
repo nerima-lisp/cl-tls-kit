@@ -127,6 +127,15 @@ For client resumption, create a store with `make-tls13-ticket-store` and pass it
 as `:ticket-store` to client drivers. `clear-tls13-ticket-store` removes all
 currently stored tickets and zeroizes each stored ticket PSK.
 
+`tls13-ticket-store-count` returns the number of tickets held by a store.
+The read-only `tls13-client-driver-hostname`, `tls13-client-driver-provider`,
+`tls13-client-driver-signature-algorithms`, and
+`tls13-client-driver-verify-signature` accessors expose the corresponding
+configured values for adapter integration.
+
+The separate `cl-tls-kit/test-support` ASDF system is a test-only, unstable API
+intended for test suites and carries no compatibility guarantee.
+
 After `tls13-client-driver-connect`, use
 the exported `tls13-client-driver-read-application-data` to read without
 inspecting the driver's state. It returns `(values :data octets)` for application data,
@@ -134,6 +143,11 @@ inspecting the driver's state. It returns `(values :data octets)` for applicatio
 callback returns that marker, or `:eof` after receiving `close_notify`. That
 callback must retain any partial record bytes when it returns `:would-block`.
 A raw transport EOF signals `tls13-client-driver-error` with reason `:eof`.
+
+For server-driver lifecycle, ticket-store ownership, and event details, see
+[`docs/tls13-server-driver.md`](docs/tls13-server-driver.md).
+`tls13-server-ticket-key-store-destroyed-p` reports whether a server ticket-key
+store has been destroyed.
 
 `make-tls13-server-driver` accepts an optional `:quic-transport-parameters`
 octet vector. When supplied, the driver copies the opaque value into extension

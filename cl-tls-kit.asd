@@ -4,7 +4,7 @@
   :description "Small, strict DER and PEM building blocks for TLS certificate tooling."
   :author "nerima-lisp"
   :license "MIT"
-  :version "0.5.0"
+  :version "0.5.1"
   ;; Cryptographic operations are intentionally not part of this foundation.
   ;; A future certificate/crypto layer may add ironclad and cl-base64 here.
   :depends-on ("bordeaux-threads")
@@ -22,10 +22,10 @@
 
 (asdf:defsystem "cl-tls-kit/test"
   :description "Tests for cl-tls-kit."
-  :depends-on ("cl-tls-kit")
+  :depends-on ("cl-tls-kit" "cl-tls-kit/test-support")
   :pathname "t"
   :serial t
-  :components ((:file "package") (:file "tests")
+  :components ((:file "package") (:file "tests") (:file "test-support-tests")
                (:file "path-building-tests") (:file "trust-store-tests")
                (:file "key-schedule-tests") (:file "record-tests")
                (:file "handshake-tests") (:file "client-tests")
@@ -39,3 +39,10 @@
   :perform (asdf:test-op (op c)
              (declare (ignore op c))
              (uiop:symbol-call "CL-TLS-KIT/TEST" "RUN-TESTS")))
+(asdf:defsystem "cl-tls-kit/test-support"
+  :description "Unstable, test-only helpers for cl-tls-kit consumers."
+  :depends-on ("cl-tls-kit")
+  :pathname "t"
+  :serial t
+  :components ((:file "test-support-package")
+               (:file "test-support")))

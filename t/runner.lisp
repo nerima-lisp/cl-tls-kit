@@ -6,7 +6,7 @@
       (unless (eq (run-key-schedule-tests) t)
         (error "cl-tls-kit key schedule tests did not pass."))
       (incf passed))
-    (dolist (test '(run-basic-tests
+    (dolist (test '(run-basic-tests run-test-support-tests
                     run-path-building-tests
                     run-trust-store-tests
                     run-record-tests

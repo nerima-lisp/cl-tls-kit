@@ -25,7 +25,7 @@
                       :sha256 600 0))))
         (clear-tls13-ticket-store store)
         (%client-resumption-check
-         (and (zerop (cl-tls-kit::%tls13-ticket-store-count store))
+         (and (zerop (tls13-ticket-store-count store))
               (zerop (hash-table-count
                       (cl-tls-kit::tls13-ticket-store-entries store))))
          "clear removes all stored tickets")
@@ -778,7 +778,7 @@
                           :sha256 600 0)
             do (when (= index 1) (setf first-ticket ticket)))
       (%client-resumption-check
-       (= (cl-tls-kit::%tls13-ticket-store-count store) 4)
+       (= (tls13-ticket-store-count store) 4)
        "ticket store caps each hostname and ALPN at four tickets")
       (%client-resumption-check
        (every #'zerop (cl-tls-kit::%tls13-session-ticket-psk first-ticket))
@@ -811,7 +811,7 @@
                           :sha256 600 0)
             do (when (= index 1) (setf oldest ticket)))
       (%client-resumption-check
-       (= (cl-tls-kit::%tls13-ticket-store-count store) 64)
+       (= (tls13-ticket-store-count store) 64)
        "ticket store caps total live tickets at 64")
       (%client-resumption-check
        (= (hash-table-count (cl-tls-kit::tls13-ticket-store-entries store)) 64)
@@ -1281,7 +1281,7 @@
         (%client-resumption-check
          (and (= derivation-count 1)
               (= now 2001)
-              (zerop (cl-tls-kit::%tls13-ticket-store-count store)))
+              (zerop (tls13-ticket-store-count store)))
          "one-second ticket expires during PSK derivation from receipt time"))
       (incf selected)
       (let* ((store (make-tls13-ticket-store :clock (lambda () 1000)))
@@ -1295,7 +1295,7 @@
           (tls13-client-driver-start driver)
           (%client-resumption-check
            (and (not (%client-resumption-has-psk-p driver))
-                (= (cl-tls-kit::%tls13-ticket-store-count store) 1)
+                (= (tls13-ticket-store-count store) 1)
                 (not (every #'zerop
                             (cl-tls-kit::%tls13-session-ticket-psk stored))))
            "nil hostname neither offers nor consumes another host ticket"))
@@ -1312,7 +1312,7 @@
                600 (%client-resumption-hex "0000")
                (%client-resumption-hex "090807") nil 3)))
           (%client-resumption-check
-           (= (cl-tls-kit::%tls13-ticket-store-count store) 1)
+           (= (tls13-ticket-store-count store) 1)
            "NewSessionTicket is not stored when hostname is unknown"))
         (multiple-value-bind (driver ignored)
             (%client-resumption-driver
