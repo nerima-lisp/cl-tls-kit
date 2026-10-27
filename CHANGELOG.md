@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.5.1
+
+### Added
+
+- Export read-only TLS client-driver configuration readers and ticket-store lifecycle readers.
+- Add the separate, unstable `cl-tls-kit/test-support` ASDF system for consumer test suites.
+
 ## 0.5.0
 
 ### Added

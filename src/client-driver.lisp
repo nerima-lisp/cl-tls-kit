@@ -103,6 +103,11 @@ store and does not put it back."
   (defun %tls13-ticket-store-count (store)
     (loop for tickets being the hash-values of (tls13-ticket-store-entries store)
           sum (length tickets)))
+  (defun tls13-ticket-store-count (store)
+    "Return the number of tickets currently held in STORE."
+    (%tls13-ticket-store-call
+     store
+     (lambda () (%tls13-ticket-store-count store))))
   (defun %tls13-ticket-store-trim-key (store key)
     (let* ((entries (tls13-ticket-store-entries store))
            (tickets (gethash key entries))
@@ -1358,7 +1363,7 @@ A transport reader must retain partial record bytes when returning :WOULD-BLOCK.
   tls13-client-driver-key-update make-tls13-client-driver-over-tcp
   tls13-client-driver-negotiated-alpn tls13-client-driver-error
   tls13-client-driver-error-reason make-tls13-ticket-store
-  tls13-ticket-store tls13-ticket-store-p tls13-client-driver-resumed-p))
+  tls13-ticket-store tls13-ticket-store-p tls13-ticket-store-count tls13-client-driver-resumed-p))
 (progn
   (defun tls13-client-driver-closed-p (driver)
     (eq (tls13-client-driver-state driver) :closed))

@@ -165,7 +165,13 @@
    #:tls13-server-ticket-key-store #:tls13-server-ticket-key-store-p
    #:make-tls13-server-ticket-key-store
    #:rotate-tls13-server-ticket-key-store #:tls13-client-driver-read-application-data
-   #:destroy-tls13-server-ticket-key-store))
+   #:destroy-tls13-server-ticket-key-store
+   #:tls13-ticket-store-count
+   #:tls13-server-ticket-key-store-destroyed-p
+   #:tls13-client-driver-hostname
+   #:tls13-client-driver-provider
+   #:tls13-client-driver-signature-algorithms
+   #:tls13-client-driver-verify-signature))
 
 (defpackage #:cl-tls-kit.x509
   (:use #:cl #:cl-tls-kit)

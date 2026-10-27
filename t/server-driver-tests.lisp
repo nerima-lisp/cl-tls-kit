@@ -424,7 +424,7 @@
                       (not (gethash :resumed full)))
                  "full handshake delivers NewSessionTicket after client Finished")
         (funcall check-case
-                 (= (cl-tls-kit::%tls13-ticket-store-count ticket-store) 1)
+                 (= (tls13-ticket-store-count ticket-store) 1)
                  "client driver stores the received session ticket")
         (funcall check-case
                  (= (gethash :certificate-verify-count full) 1)
@@ -860,7 +860,7 @@
                       (null (cl-tls-kit::tls13-server-ticket-key-store-current store))
                       (null (cl-tls-kit::tls13-server-ticket-key-store-previous store))
                       (null (cl-tls-kit::tls13-server-ticket-key-store-random store))
-                      (cl-tls-kit::tls13-server-ticket-key-store-destroyed-p store))
+                      (tls13-server-ticket-key-store-destroyed-p store))
                  "destroy wipes current and previous keys and clears store references")
         (funcall check-case
                  (eq store (destroy-tls13-server-ticket-key-store store))
@@ -2110,7 +2110,7 @@
             (eq (cl-tls-kit::tls13-server-driver-state server) :complete)
             ticket
             (getf ticket :identity)
-            (= (cl-tls-kit::%tls13-ticket-store-count client-store) 1))
+            (= (tls13-ticket-store-count client-store) 1))
        "default server settings issue a ticket received by the in-memory client")
       (clear-tls13-ticket-store client-store)
       (let* ((ticket-fields
@@ -2184,7 +2184,7 @@
        (and (null ticket)
             (not (member :ticket-issued events :key (lambda (event) (getf event :type))))
             (not (sent-type-p events 4))
-            (zerop (cl-tls-kit::%tls13-ticket-store-count client-store))
+            (zerop (tls13-ticket-store-count client-store))
             (null (cl-tls-kit::tls13-server-driver-ticket-key-store server)))
        "ticket-disabled handshake emits and stores no NewSessionTicket")
       (clear-tls13-ticket-store client-store)
@@ -2195,12 +2195,13 @@
               provider chain private-key nil (lambda () now)))
            (store (cl-tls-kit::tls13-server-driver-ticket-key-store driver)))
       (check-case
-       (and store (cl-tls-kit::tls13-server-driver-ticket-key-store-owned-p driver))
-       "default server owns its internally created ticket-key store")
+       (and store (not (tls13-server-ticket-key-store-destroyed-p store)))
+       "default server starts with a live ticket-key store")
       (tls13-server-driver-close driver)
       (tls13-server-driver-close driver)
       (check-case
-       (destroyed-store-p store)
+       (and (tls13-server-ticket-key-store-destroyed-p store)
+            (destroyed-store-p store))
        "closing a server destroys its internal ticket-key store idempotently"))
     (incf selected)
     (let* ((driver
@@ -2215,7 +2216,8 @@
               (eq (cl-tls-kit::tls13-server-driver-state driver) :failed))
          "fatal alert fails the server driver"))
       (check-case
-       (destroyed-store-p store)
+       (and (tls13-server-ticket-key-store-destroyed-p store)
+            (destroyed-store-p store))
        "fatal alert cleanup destroys the internal ticket-key store"))
     (incf selected)
     (let* ((store
@@ -2234,8 +2236,10 @@
                            (rotate-tls13-server-ticket-key-store
                             store :clock (lambda () now)))
                      (tls13-server-driver-error () nil)))
-             (check-case usable
-                         "closing a server preserves its caller-supplied ticket-key store"))
+             (check-case
+              (and usable
+                   (not (tls13-server-ticket-key-store-destroyed-p store)))
+              "closing a server preserves its caller-supplied ticket-key store"))
         (destroy-tls13-server-ticket-key-store store)))
   (check-case
    (plusp assertions)
