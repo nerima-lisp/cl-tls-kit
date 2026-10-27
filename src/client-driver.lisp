@@ -1368,8 +1368,57 @@ A transport reader must retain partial record bytes when returning :WOULD-BLOCK.
         (%driver-close-transport driver)
         (error condition)))))
 
+(defun tls13-client-driver-replace-last-transcript-message
+    (driver previous-wire replacement-wire)
+  "Replace DRIVER's trailing transcript message with REPLACEMENT-WIRE.
+PREVIOUS-WIRE and REPLACEMENT-WIRE must be non-empty octet vectors. If the
+transcript does not end with PREVIOUS-WIRE, signal
+TLS13-CLIENT-DRIVER-ERROR."
+  (unless (tls13-client-driver-p driver)
+    (%driver-fail :driver))
+  (unless (and (%octets-p previous-wire)
+               (plusp (length previous-wire))
+               (%octets-p replacement-wire)
+               (plusp (length replacement-wire)))
+    (%driver-fail :invalid-transcript-message))
+  (let* ((transcript (tls13-client-driver-transcript driver))
+         (previous-length (length previous-wire)))
+    (unless (and (<= previous-length (length transcript))
+                 (equalp (subseq transcript (- (length transcript) previous-length))
+                         previous-wire))
+      (%driver-fail :transcript-mismatch))
+    (setf (tls13-client-driver-transcript driver)
+          (concatenate '(vector (unsigned-byte 8))
+                       (subseq transcript 0 (- (length transcript) previous-length))
+                       replacement-wire)))
+  driver)
+
+(defun tls13-client-driver-traffic-secret (driver phase direction)
+  "Return DRIVER's secret for PHASE and DIRECTION, or NIL while unavailable.
+PHASE is :HANDSHAKE or :APPLICATION; DIRECTION is :READ or :WRITE. The
+returned vector is owned by DRIVER and valid only until it closes. Do not
+modify, log, or print this key material. A copy is the caller's responsibility."
+  (unless (tls13-client-driver-p driver)
+    (%driver-fail :driver))
+  (let ((state
+          (case phase
+            (:handshake
+             (case direction
+               (:read (tls13-client-driver-handshake-read-state driver))
+               (:write (tls13-client-driver-handshake-write-state driver))
+               (otherwise (%driver-fail :invalid-traffic-secret-direction))))
+            (:application
+             (case direction
+               (:read (tls13-client-driver-application-read-state driver))
+               (:write (tls13-client-driver-application-write-state driver))
+               (otherwise (%driver-fail :invalid-traffic-secret-direction))))
+            (otherwise (%driver-fail :invalid-traffic-secret-phase)))))
+    (and state (tls13-traffic-state-secret state))))
+
 (export '(tls13-client-driver tls13-client-driver-p
-  make-tls13-client-driver tls13-client-driver-start tls13-client-driver-step
+  make-tls13-client-driver tls13-client-driver-start
+  tls13-client-driver-replace-last-transcript-message
+  tls13-client-driver-traffic-secret tls13-client-driver-step
   tls13-client-driver-connect tls13-client-driver-read-record
   tls13-client-driver-read-application-data
   tls13-client-driver-write tls13-client-driver-close

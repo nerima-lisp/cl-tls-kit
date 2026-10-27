@@ -36,7 +36,7 @@
         system: pkgs: {
           default = pkgs.stdenvNoCC.mkDerivation {
             pname = "cl-tls-kit";
-            version = "0.5.1";
+            version = "0.5.2";
             src = self;
             dontBuild = true;
             installPhase = ''
@@ -69,7 +69,7 @@
         system: pkgs: {
           default = pkgs.stdenvNoCC.mkDerivation {
             pname = "cl-tls-kit-tests";
-            version = "0.5.1";
+            version = "0.5.2";
             src = self;
             nativeBuildInputs = [
               pkgs.sbcl

@@ -1,5 +1,76 @@
 (in-package #:cl-tls-kit/test)
 
+(defun run-client-driver-public-api-tests ()
+  (labels ((octets (&rest values)
+             (coerce values '(vector (unsigned-byte 8))))
+           (secret-octets (value)
+             (make-array 32 :element-type '(unsigned-byte 8)
+                         :initial-element value))
+           (traffic-state (secret)
+             (cl-tls-kit::%make-tls13-traffic-state
+              nil :sha256 :aes-128-gcm secret nil nil 0)))
+    (let* ((prefix (octets 1 2 3))
+           (previous (octets 4 5 6 7))
+           (replacement (octets 8 9 10))
+           (driver
+             (cl-tls-kit::%make-tls13-client-driver
+              :transcript (concatenate '(vector (unsigned-byte 8))
+                                       prefix previous)))
+           (result
+             (cl-tls-kit:tls13-client-driver-replace-last-transcript-message
+              driver previous replacement)))
+      (check (and (eq result driver)
+                  (equalp
+                   (concatenate '(vector (unsigned-byte 8)) prefix replacement)
+                   (cl-tls-kit::tls13-client-driver-transcript driver)))
+             "client driver replaces a matching trailing transcript message")
+      (let ((transcript-before
+              (copy-seq (cl-tls-kit::tls13-client-driver-transcript driver))))
+        (check (handler-case
+                   (progn
+                     (cl-tls-kit:tls13-client-driver-replace-last-transcript-message
+                      driver (octets 99) (octets 11))
+                     nil)
+                 (cl-tls-kit:tls13-client-driver-error (condition)
+                   (eq (cl-tls-kit:tls13-client-driver-error-reason condition)
+                       :transcript-mismatch)))
+               "client driver rejects a mismatched trailing transcript message")
+        (check (equalp transcript-before
+                       (cl-tls-kit::tls13-client-driver-transcript driver))
+               "client driver leaves transcript unchanged after a mismatch")))
+    (let ((driver (cl-tls-kit::%make-tls13-client-driver)))
+      (check (and
+              (null (cl-tls-kit:tls13-client-driver-traffic-secret
+                     driver :handshake :read))
+              (null (cl-tls-kit:tls13-client-driver-traffic-secret
+                     driver :handshake :write))
+              (null (cl-tls-kit:tls13-client-driver-traffic-secret
+                     driver :application :read))
+              (null (cl-tls-kit:tls13-client-driver-traffic-secret
+                     driver :application :write)))
+             "client driver traffic-secret returns NIL before derivation"))
+    (let* ((handshake-read-secret (secret-octets 1))
+           (handshake-write-secret (secret-octets 2))
+           (application-read-secret (secret-octets 3))
+           (application-write-secret (secret-octets 4))
+           (driver
+             (cl-tls-kit::%make-tls13-client-driver
+              :handshake-read-state (traffic-state handshake-read-secret)
+              :handshake-write-state (traffic-state handshake-write-secret)
+              :application-read-state (traffic-state application-read-secret)
+              :application-write-state (traffic-state application-write-secret)))
+           (check-secret
+             (lambda (phase direction secret)
+               (eq (cl-tls-kit:tls13-client-driver-traffic-secret
+                    driver phase direction)
+                   secret))))
+      (check (and (funcall check-secret :handshake :read handshake-read-secret)
+                  (funcall check-secret :handshake :write handshake-write-secret)
+                  (funcall check-secret :application :read application-read-secret)
+                  (funcall check-secret :application :write application-write-secret))
+             "client driver traffic-secret maps phase and direction"))
+    t))
+
 (defun run-client-driver-tests ()
   (let* ((sent nil)
          (provider
