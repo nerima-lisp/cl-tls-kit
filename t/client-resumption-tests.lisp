@@ -713,7 +713,7 @@
              "7df235f2031d2a051287d02b0241b0bfdaf86cc856231f2d5aba46c434ec196c"))
        (driver
          (cl-tls-kit::%make-tls13-client-driver
-          :provider provider :ticket-store store :hostname "example.test"
+          :provider-internal provider :ticket-store store :hostname-internal "example.test"
           :hash :sha256 :suite #x1301 :state :connected
           :negotiated-alpn "h2" :resumption-master-secret rms)))
   (dolist (lifetime (list 0 604801))
@@ -1216,8 +1216,8 @@
              (store (make-tls13-ticket-store :clock (lambda () now)))
              (driver
                (cl-tls-kit::%make-tls13-client-driver
-                :provider clocked-provider :ticket-store store
-                :hostname "receipt.example.test" :hash :sha256 :suite #x1301
+                :provider-internal clocked-provider :ticket-store store
+                :hostname-internal "receipt.example.test" :hash :sha256 :suite #x1301
                 :state :connected :negotiated-alpn "h2"
                 :resumption-master-secret (ticket-psk 32))))
         (tls13-client-driver-step
@@ -1268,8 +1268,8 @@
              (store (make-tls13-ticket-store :clock (lambda () now)))
              (driver
                (cl-tls-kit::%make-tls13-client-driver
-                :provider clocked-provider :ticket-store store
-                :hostname "expiry.example.test" :hash :sha256 :suite #x1301
+                :provider-internal clocked-provider :ticket-store store
+                :hostname-internal "expiry.example.test" :hash :sha256 :suite #x1301
                 :state :connected :negotiated-alpn "h2"
                 :resumption-master-secret (ticket-psk 32))))
         (tls13-client-driver-step
@@ -1301,7 +1301,7 @@
            "nil hostname neither offers nor consumes another host ticket"))
         (let ((producer
                 (cl-tls-kit::%make-tls13-client-driver
-                 :provider provider :ticket-store store :hostname nil
+                 :provider-internal provider :ticket-store store :hostname-internal nil
                  :hash :sha256 :suite #x1301 :state :connected
                  :negotiated-alpn "h2"
                  :resumption-master-secret (ticket-psk 32))))

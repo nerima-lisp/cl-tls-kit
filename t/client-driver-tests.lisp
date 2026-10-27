@@ -51,6 +51,38 @@
                       (declare (ignore ignored))
                       (push wire sent)))))
     (cl-tls-kit:tls13-client-driver-start driver)
+    (let* ((signature-algorithms #( #x0804 #x0403))
+             (verify-signature (lambda (&rest arguments)
+                                 (declare (ignore arguments))
+                                 t))
+             (configured-driver
+               (cl-tls-kit:make-tls13-client-driver
+                :provider provider
+                :hostname "reader.example.test"
+                :signature-algorithms signature-algorithms
+                :verify-signature verify-signature)))
+        (check (equal "reader.example.test"
+                      (cl-tls-kit:tls13-client-driver-hostname configured-driver))
+               "client driver hostname reader preserves its configured value")
+        (check (eq provider
+                   (cl-tls-kit:tls13-client-driver-provider configured-driver))
+               "client driver provider reader preserves its configured value")
+        (check (eq signature-algorithms
+                       (cl-tls-kit:tls13-client-driver-signature-algorithms
+                        configured-driver))
+               "client driver signature-algorithms reader preserves its configured value")
+        (check (eq verify-signature
+                   (cl-tls-kit:tls13-client-driver-verify-signature
+                    configured-driver))
+               "client driver verify-signature reader preserves its configured value")
+        (check (and
+                (not (fboundp '(setf cl-tls-kit:tls13-client-driver-hostname)))
+                (not (fboundp '(setf cl-tls-kit:tls13-client-driver-provider)))
+                (not (fboundp
+                      '(setf cl-tls-kit:tls13-client-driver-signature-algorithms)))
+                (not (fboundp
+                      '(setf cl-tls-kit:tls13-client-driver-verify-signature))))
+               "client driver configuration readers have no setters"))
     (check (null (cl-tls-kit:tls13-client-driver-negotiated-alpn driver))
            "driver exposes no negotiated ALPN before EncryptedExtensions")
     (check (= (length sent) 1) "driver emits ClientHello")
@@ -1611,11 +1643,11 @@
     (setf driver
           (cl-tls-kit::%make-tls13-client-driver
            :state :connected
-           :provider provider
+           :provider-internal provider
            :key-exchange key-exchange
            :on-send (lambda (&rest ignored) (declare (ignore ignored)))
            :verify-certificate-verify (lambda (&rest ignored) (declare (ignore ignored)))
-           :verify-signature (lambda (&rest ignored) (declare (ignore ignored)))
+           :verify-signature-internal (lambda (&rest ignored) (declare (ignore ignored)))
            :transport-read (lambda (ignored) (declare (ignore ignored)) peer-wire)
            :transport-close
            (lambda (current)
@@ -1681,7 +1713,7 @@
     (setf driver
           (cl-tls-kit::%make-tls13-client-driver
            :state :connected
-           :provider provider
+           :provider-internal provider
            :transport-read (lambda (ignored)
                              (declare (ignore ignored))
                              (error read-error))
@@ -1718,7 +1750,7 @@
                             :initial-element 17))
            (driver
              (cl-tls-kit::%make-tls13-client-driver
-              :provider provider
+              :provider-internal provider
               :hash :sha256
               :early-secret (make-array 32 :element-type '(unsigned-byte 8))
               :selected-group #x001d
@@ -1736,7 +1768,7 @@
            (bad-provider (cl-tls-kit::copy-tls13-crypto-provider provider))
            (driver
              (cl-tls-kit::%make-tls13-client-driver
-              :provider bad-provider
+              :provider-internal bad-provider
               :hash :sha256
               :early-secret (make-array 32 :element-type '(unsigned-byte 8))
               :selected-group #x001d

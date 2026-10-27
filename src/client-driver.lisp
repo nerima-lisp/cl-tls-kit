@@ -6,22 +6,35 @@
              (format stream "TLS 1.3 client driver error: ~A"
                      (tls13-client-driver-error-reason condition)))))
 
-(defstruct (tls13-client-driver (:constructor %make-tls13-client-driver))
-  provider key-exchange on-send verify-certificate-verify
-  transport-read transport-write transport-close
-  hostname alpn negotiated-alpn cipher-suites supported-groups signature-algorithms
-  ticket-store offered-ticket resumed-p resumption-master-secret
-  client-hello private-key selected-group last-sent-key-share-group
-  hello-retry-request-received hash suite state
-  certificate-chain peer-certificate trust-anchors now verify-signature
-  (transcript (make-array 0 :element-type '(unsigned-byte 8)))
-  early-secret handshake-secret master-secret handshake-traffic-secret
-  client-finished-key server-finished-key
-  handshake-read-state handshake-write-state
-  application-read-state application-write-state
-  compatibility-ccs-flight (compatibility-ccs-count 0)
-  (pending-handshake (make-array 0 :element-type '(unsigned-byte 8)))
-  close-notify-received)
+(progn
+  (defstruct (tls13-client-driver (:constructor %make-tls13-client-driver))
+    provider-internal
+    key-exchange on-send verify-certificate-verify
+    transport-read transport-write transport-close
+    hostname-internal
+    alpn negotiated-alpn cipher-suites supported-groups
+    signature-algorithms-internal
+    ticket-store offered-ticket resumed-p resumption-master-secret
+    client-hello private-key selected-group last-sent-key-share-group
+    hello-retry-request-received hash suite state
+    certificate-chain peer-certificate trust-anchors now
+    verify-signature-internal
+    (transcript (make-array 0 :element-type (quote (unsigned-byte 8))))
+    early-secret handshake-secret master-secret handshake-traffic-secret
+    client-finished-key server-finished-key
+    handshake-read-state handshake-write-state
+    application-read-state application-write-state
+    compatibility-ccs-flight (compatibility-ccs-count 0)
+    (pending-handshake (make-array 0 :element-type (quote (unsigned-byte 8))))
+    close-notify-received)
+  (defun tls13-client-driver-hostname (driver)
+    (tls13-client-driver-hostname-internal driver))
+  (defun tls13-client-driver-provider (driver)
+    (tls13-client-driver-provider-internal driver))
+  (defun tls13-client-driver-signature-algorithms (driver)
+    (tls13-client-driver-signature-algorithms-internal driver))
+  (defun tls13-client-driver-verify-signature (driver)
+    (tls13-client-driver-verify-signature-internal driver)))
 
 ;; Certificate chains and their per-certificate extensions fit within this
 ;; policy limit while fragmented input cannot consume the uint24 wire maximum.
@@ -247,11 +260,11 @@ store and does not put it back."
                                              (tls13-client-driver-application-read-state driver)
                                              (tls13-client-driver-application-write-state driver)))
                                 (clear-traffic-state state))
-                              (setf (tls13-client-driver-provider driver) nil
+                              (setf (tls13-client-driver-provider-internal driver) nil
                                     (tls13-client-driver-key-exchange driver) nil
                                     (tls13-client-driver-on-send driver) nil
                                     (tls13-client-driver-verify-certificate-verify driver) nil
-                                    (tls13-client-driver-verify-signature driver) nil
+                                    (tls13-client-driver-verify-signature-internal driver) nil
                                     (tls13-client-driver-transport-read driver) nil
                                     (tls13-client-driver-transport-write driver) nil
                                     (tls13-client-driver-transport-close driver) nil
@@ -703,18 +716,18 @@ for unoffered groups, a retry of the initial group, and a second HelloRetryReque
                      (aref offered-suites 0))))
     (unless suite (%driver-fail :unsupported-cipher-suite))
     (let ((driver (%make-tls13-client-driver
-                   :provider provider
+                   :provider-internal provider
                    :key-exchange (or key-exchange (%driver-default-key-exchange))
                    :on-send on-send
                    :transport-read (or transport-read (getf transport :read))
                    :transport-write (or transport-write (getf transport :write))
                    :transport-close (or transport-close (getf transport :close))
                    :verify-certificate-verify verify-certificate-verify
-                   :hostname hostname :alpn alpn :ticket-store ticket-store
+                   :hostname-internal hostname :alpn alpn :ticket-store ticket-store
                    :cipher-suites offered-suites :supported-groups supported-groups
-                   :signature-algorithms signature-algorithms
+                   :signature-algorithms-internal signature-algorithms
                    :trust-anchors trust-anchors :now now
-                   :verify-signature verify-signature :suite suite
+                   :verify-signature-internal verify-signature :suite suite
                    :hash (tls13-cipher-suite-hash suite) :state :new)))
       (setf (tls13-client-driver-early-secret driver)
             (tls13-early-secret provider (tls13-client-driver-hash driver)))
