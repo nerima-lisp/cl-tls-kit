@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.5.2
+
+### Added
+
+- Expose client-driver transcript replacement and phase/direction traffic-secret readers for QUIC adapters.
+
 ## 0.5.1
 
 ### Added

@@ -13,6 +13,7 @@
                     run-handshake-tests
                     run-client-tests
                     run-client-driver-tests
+                    run-client-driver-public-api-tests
                     run-client-resumption-tests
                     run-client-resumption-security-tests
                     run-server-driver-tests
