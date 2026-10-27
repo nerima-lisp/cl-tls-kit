@@ -25,7 +25,7 @@
 
 (defstruct (tls13-server-driver (:constructor %make-tls13-server-driver))
   provider certificate-chain private-key alpn-protocols sni-callback
-  ticket-key-store (session-tickets-p nil) ticket-key-store-owned-p
+  ticket-key-store-internal (session-tickets-p nil) ticket-key-store-owned-p
   supported-groups cipher-suites clock random key-exchange
   quic-transport-parameters
   (state :awaiting-client-hello)
@@ -38,6 +38,10 @@
   client-handshake-secret server-handshake-secret client-finished-key
   master-secret resumption-master-secret
   client-application-secret server-application-secret)
+
+(defun tls13-server-driver-ticket-key-store (driver)
+  "Return the configured ticket-key store for DRIVER. The returned object contains key material; do not log or print it."
+  (tls13-server-driver-ticket-key-store-internal driver))
 
 (defmethod print-object ((driver tls13-server-driver) stream)
   (print-unreadable-object (driver stream :type t)
@@ -491,7 +495,7 @@ CLOCK and the store RANDOM callback run under STORE's lock and must not re-enter
     (%make-tls13-server-driver
      :provider provider :certificate-chain chain :private-key private-key
      :alpn-protocols alpn
-     :sni-callback sni-callback :ticket-key-store store
+     :sni-callback sni-callback :ticket-key-store-internal store
      :session-tickets-p (not (null session-tickets))
      :ticket-key-store-owned-p store-owned-p
      :supported-groups (copy-list supported-groups)
@@ -705,7 +709,7 @@ CLOCK and the store RANDOM callback run under STORE's lock and must not re-enter
     (%tls13-server-fail :malformed-ticket 47))
   (when (< (length identity) 4)
     (return-from %tls13-server-open-ticket nil))
-  (let* ((store (tls13-server-driver-ticket-key-store driver))
+  (let* ((store (tls13-server-driver-ticket-key-store-internal driver))
          (key-id (subseq identity 0 4))
          (now (%tls13-server-clock-unix driver))
          (key (%tls13-server-find-ticket-key store key-id now)))
@@ -763,7 +767,7 @@ CLOCK and the store RANDOM callback run under STORE's lock and must not re-enter
         (unless (member 1 (getf fields :modes))
           (%tls13-server-fail :psk-dhe-ke-not-offered 40))
         (unless (and (tls13-server-driver-session-tickets-p driver)
-                     (tls13-server-driver-ticket-key-store driver))
+                     (tls13-server-driver-ticket-key-store-internal driver))
           (return-from %tls13-server-validate-psk nil))
         (let* ((ticket (%tls13-server-open-ticket
                         driver (getf psk-fields :identity)))
@@ -946,7 +950,7 @@ CLOCK and the store RANDOM callback run under STORE's lock and must not re-enter
 
 (defun %tls13-server-seal-ticket (driver payload)
   (multiple-value-bind (key-id key)
-      (%tls13-server-current-ticket-key (tls13-server-driver-ticket-key-store driver))
+      (%tls13-server-current-ticket-key (tls13-server-driver-ticket-key-store-internal driver))
     (unwind-protect
          (let* ((nonce (%tls13-server-random driver 12))
                 (ciphertext (tls13-aead-seal (tls13-server-driver-provider driver)
@@ -956,7 +960,7 @@ CLOCK and the store RANDOM callback run under STORE's lock and must not re-enter
       (%tls13-server-zero-octets key))))
 
 (defun %tls13-server-issue-ticket (driver resumption-master-secret)
-  (let* ((store (tls13-server-driver-ticket-key-store driver))
+  (let* ((store (tls13-server-driver-ticket-key-store-internal driver))
          (issued (%tls13-server-clock-unix driver))
          (lifetime (tls13-server-ticket-key-store-ticket-lifetime store))
          (age-add (%tls13-server-read-u32 (%tls13-server-random driver 4) 0))
@@ -1007,12 +1011,12 @@ CLOCK and the store RANDOM callback run under STORE's lock and must not re-enter
   (%tls13-server-zero-octets (tls13-server-driver-transcript driver))
   (%tls13-server-zero-octets (tls13-server-driver-server-flight-prefix driver))
   (%tls13-server-zero-octets (tls13-server-driver-private-key-share driver))
-  (let ((store (tls13-server-driver-ticket-key-store driver)))
+  (let ((store (tls13-server-driver-ticket-key-store-internal driver)))
     (when (and store
                (tls13-server-driver-ticket-key-store-owned-p driver))
       (destroy-tls13-server-ticket-key-store store)))
   (setf (tls13-server-driver-provider driver) nil
-        (tls13-server-driver-ticket-key-store driver) nil
+        (tls13-server-driver-ticket-key-store-internal driver) nil
         (tls13-server-driver-session-tickets-p driver) nil
         (tls13-server-driver-ticket-key-store-owned-p driver) nil
         (tls13-server-driver-sni-callback driver) nil

@@ -148,6 +148,8 @@ For server-driver lifecycle, ticket-store ownership, and event details, see
 [`docs/tls13-server-driver.md`](docs/tls13-server-driver.md).
 `tls13-server-ticket-key-store-destroyed-p` reports whether a server ticket-key
 store has been destroyed.
+The read-only `tls13-server-driver-ticket-key-store` function returns the store
+object itself; it contains ticket key material, so do not log or print it.
 
 `make-tls13-server-driver` accepts an optional `:quic-transport-parameters`
 octet vector. When supplied, the driver copies the opaque value into extension
