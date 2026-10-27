@@ -1371,9 +1371,9 @@ A transport reader must retain partial record bytes when returning :WOULD-BLOCK.
 (defun tls13-client-driver-replace-last-transcript-message
     (driver previous-wire replacement-wire)
   "Replace DRIVER's trailing transcript message with REPLACEMENT-WIRE.
-PREVIOUS-WIRE and REPLACEMENT-WIRE must be non-empty octet vectors. If the
-transcript does not end with PREVIOUS-WIRE, signal
-TLS13-CLIENT-DRIVER-ERROR."
+PREVIOUS-WIRE and REPLACEMENT-WIRE must be complete encoded handshake messages
+as non-empty octet vectors. If the transcript does not end with PREVIOUS-WIRE,
+signal TLS13-CLIENT-DRIVER-ERROR."
   (unless (tls13-client-driver-p driver)
     (%driver-fail :driver))
   (unless (and (%octets-p previous-wire)

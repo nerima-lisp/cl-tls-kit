@@ -134,8 +134,9 @@ The read-only `tls13-client-driver-hostname`, `tls13-client-driver-provider`,
 configured values for adapter integration.
 
 `tls13-client-driver-replace-last-transcript-message` replaces the trailing
-handshake message only when `previous-wire` matches the transcript suffix; a
-mismatch signals `tls13-client-driver-error`.
+handshake message only when `previous-wire` is the complete encoded message at
+the transcript end. Pass complete encoded handshake messages for both wire
+arguments. A mismatch signals `tls13-client-driver-error`.
 `tls13-client-driver-traffic-secret` selects `:handshake` or
 `:application` and `:read` or `:write`, where read is peer-to-client and
 write is client-to-peer. It returns `nil` until the selected secret is
