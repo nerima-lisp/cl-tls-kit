@@ -2191,18 +2191,23 @@
       (tls13-server-driver-close server))
     (incf selected)
     (let* ((driver
-             (%server-driver-test-server
-              provider chain private-key nil (lambda () now)))
+            (%server-driver-test-server
+             provider chain private-key nil (lambda () now)))
            (store (cl-tls-kit::tls13-server-driver-ticket-key-store driver)))
       (check-case
        (and store (not (tls13-server-ticket-key-store-destroyed-p store)))
        "default server starts with a live ticket-key store")
-      (tls13-server-driver-close driver)
+      (progn
+        (tls13-server-driver-close driver)
+        (check-case
+         (and (tls13-server-ticket-key-store-destroyed-p store)
+              (destroyed-store-p store))
+         "closing a server destroys its internally created ticket-key store"))
       (tls13-server-driver-close driver)
       (check-case
        (and (tls13-server-ticket-key-store-destroyed-p store)
             (destroyed-store-p store))
-       "closing a server destroys its internal ticket-key store idempotently"))
+       "closing the server twice leaves its internally created ticket-key store destroyed"))
     (incf selected)
     (let* ((driver
              (%server-driver-test-server
